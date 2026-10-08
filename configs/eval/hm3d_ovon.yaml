@@ -1,0 +1,10 @@
+manifests:
+  - runtime/data/manifests/hm3d_ovon_val_seen.json
+  - runtime/data/manifests/hm3d_ovon_val_seen_synonyms.json
+  - runtime/data/manifests/hm3d_ovon_val_unseen.json
+episodes: 100
+max_steps: 500
+video: true
+num_envs: 12
+stratified: true
+video_episodes: 1

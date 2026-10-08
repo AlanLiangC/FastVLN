@@ -1,0 +1,8 @@
+scene_repeat: 16
+sources:
+  - manifest: runtime/data/manifests/hm3d_v1_train_ovon_safe.json
+    weight: 0.25
+  - manifest: runtime/data/manifests/hm3d_v2_train_ovon_safe.json
+    weight: 0.25
+  - manifest: runtime/data/manifests/hm3d_ovon_train.json
+    weight: 0.50

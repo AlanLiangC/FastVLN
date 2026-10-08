@@ -1,0 +1,51 @@
+num_updates: 10000
+num_envs: 8
+rollout_steps: 16
+sequence_length: 4
+sequence_batch_size: 8
+update_epochs: 2
+revision: 3
+backbone_lr: 0.000003
+vision_lr: 0.000001
+il_class_weights: [8.0, 1.0, 1.0, 1.0]
+head_lr: 0.0001
+weight_decay: 0.01
+fused_optimizer: true
+max_grad_norm: 1.0
+checkpoint_interval: 25
+keep_checkpoints: 3
+eval_interval: 100
+eval_first_update: true
+early_eval_updates: [25, 50]
+eval_episodes: 48
+eval_max_steps: 500
+verify_data_hashes: true
+dagger:
+  beta_start: 0.9
+  beta_end: 0.05
+  decay_updates: 10000
+ppo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+ealm:
+  enabled: true
+  entropy_low: 0.2
+  entropy_high: 1.2
+  fixed_alpha: 0.5
+loss:
+  value_coef: 0.5
+  entropy_coef: 0.01
+collapse_window: 10
+collapse_threshold: 0.95
+curriculum:
+  enabled: true
+  probability: 0.5
+  start_distance: 1.5
+  end_distance: 6.0
+  duration_updates: 2000
+supervision:
+  stop_on_failure: true
+  min_updates: 500
+  zero_sr_patience: 5
+  stale_seconds: 3600

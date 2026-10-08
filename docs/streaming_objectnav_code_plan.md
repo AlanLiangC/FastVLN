@@ -1835,30 +1835,32 @@ backward
 
 # 64. MVP Definition
 
+工程闭环已实现，但导航质量尚未达标。2026-10-01 审计发现旧主实验 / 对照运行至 5,640 / 5,600 updates 仍无自主成功，已停止并标记失败；修复确定性动作监控、验证取样、网页权重刷新和日志防混写后启动 revision 2 恢复实验，另有后台质量监控自动保存停训。见 [训练审计](training_audit_20261001.md)、[初始工程验收](validation_report.md) 和 [传感器更新](sensor_update_20260930.md)。以下勾选代表工程功能已验证，不代表自主导航成功率达标；KDA 转换不是无损变换。
+
 ```text
-[ ] Qwen3.5-0.8B successfully KDA-converted
-[ ] current RGB only
-[ ] one-time instruction prefill
-[ ] persistent KDA state
-[ ] STOP/FORWARD/LEFT/RIGHT categorical policy
-[ ] actor + critic
-[ ] HM3D-v1
-[ ] HM3D-v2
-[ ] HM3D-OVON
-[ ] online oracle labels
-[ ] DAgger action mixing
-[ ] PPO
-[ ] entropy-adaptive IL/RL loss
-[ ] single unified trainer
-[ ] no segmentation loss
-[ ] no RVQ
-[ ] no autoregressive action generation
-[ ] recurrent rollout buffer
-[ ] cache reset safety
-[ ] 500-step bounded-state test
-[ ] SR/SPL evaluation
-[ ] P50/P95/P99 latency evaluation
-[ ] Agent-facing session API
+[x] Qwen3.5-0.8B successfully KDA-converted
+[x] current RGB only
+[x] one-time instruction prefill
+[x] persistent KDA state
+[x] STOP/FORWARD/LEFT/RIGHT categorical policy
+[x] actor + critic
+[x] HM3D-v1
+[x] HM3D-v2
+[x] HM3D-OVON
+[x] online oracle labels
+[x] DAgger action mixing
+[x] PPO
+[x] entropy-adaptive IL/RL loss
+[x] single unified trainer
+[x] no segmentation loss
+[x] no RVQ
+[x] no autoregressive action generation
+[x] recurrent rollout buffer
+[x] cache reset safety
+[x] 500-step bounded-state test
+[x] SR/SPL evaluation
+[x] P50/P95/P99 latency evaluation
+[x] Agent-facing session API
 ```
 
 ---

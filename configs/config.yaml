@@ -1,0 +1,42 @@
+defaults:
+  - model: qwen35_0p8b_kda
+  - data: mixed_hm3d
+  - trainer: ovsegdt_e2e
+  - eval: hm3d_ovon
+  - serving: policy_server
+  - _self_
+seed: 17
+device: cuda:0
+checkpoint: null
+run_dir: runs/streamnav_active/ealm
+habitat:
+  python: runtime/habitat-env/bin/python
+  gpu_device_id: 0
+  width: 480
+  height: 270
+  sensor_height: 0.88
+  sensor_pitch_deg: 0.0
+  hfov: 120
+  agent_height: 0.88
+  agent_radius: 0.18
+  navmesh_cache: runtime/cache/navmesh
+  forward_step: 0.25
+  turn_angle: 30
+  success_distance: 0.25
+  max_episode_steps: 500
+  timeout_s: 120
+  reward:
+    success_reward: 10.0
+    slack_penalty: 0.01
+    progress_scale: 1.0
+    collision_penalty: 0.0
+    false_stop_penalty: 0.2
+distributed:
+  gpu_offset: 0
+  world_size: 1
+  gradient_sync: ddp
+hydra:
+  run:
+    dir: runtime/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false

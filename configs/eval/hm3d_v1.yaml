@@ -1,0 +1,7 @@
+manifests: [runtime/data/manifests/hm3d_v1_val.json]
+episodes: 100
+max_steps: 500
+video: true
+num_envs: 12
+stratified: true
+video_episodes: 1

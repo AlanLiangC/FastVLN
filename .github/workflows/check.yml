@@ -1,0 +1,15 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e '.[dev]'
+      - run: ruff check src services tools tests
+      - run: ruff format --check src services tools tests
+      - run: mypy src
+      - run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/unit tests/regression -q

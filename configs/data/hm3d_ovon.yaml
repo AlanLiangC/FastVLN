@@ -1,0 +1,4 @@
+scene_repeat: 16
+sources:
+  - manifest: runtime/data/manifests/hm3d_ovon_train.json
+    weight: 1.0

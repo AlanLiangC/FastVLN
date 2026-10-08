@@ -1,0 +1,7 @@
+host: 127.0.0.1
+port: 8765
+max_sessions: 16
+session_ttl_s: 900
+max_batch_size: 8
+reload_on_demo_reset: true
+demo_episodes: ${trainer.eval_episodes}
