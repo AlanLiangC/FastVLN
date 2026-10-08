@@ -1,0 +1,5 @@
+defaults:
+  - qwen35_0p8b_kda
+  - _self_
+# Fixed-size per-step text-conditioned NAV query; RGB + text inputs only.
+goal_conditioning: nav_query

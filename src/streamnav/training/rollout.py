@@ -20,6 +20,10 @@ class RolloutCollector:
         self.warmup_steps = 0
         self.curriculum_fallbacks = 0
         self.reset_elapsed = 0.0
+        self.cache_vision = config.get("cache_frozen_vision", False)
+        self.last_visual_embeddings = None
+        if self.cache_vision and any(p.requires_grad for p in policy.backbone.vision.parameters()):
+            raise ValueError("Frozen-vision caching requires a fully frozen visual encoder")
 
     def record_reset(self, observation):
         self.warmup_steps += observation.get("curriculum_warmup_steps", 0)
@@ -40,6 +44,28 @@ class RolloutCollector:
                 )
         return episode
 
+    def forward_observations(self, rgb, states):
+        # BF16 vision/GEMM kernels may differ with batch size. Match the replay
+        # batch width without changing four environments or their trajectories.
+        size = self.config.get("rollout_inference_batch_size", len(states))
+        outputs, visual = [], []
+        for start in range(0, len(states), size):
+            frames, batch_states = rgb[start : start + size], states[start : start + size]
+            if self.cache_vision:
+                embeddings = self.policy.backbone.encode_vision(frames)
+                outputs.append(
+                    self.policy.forward_batch(frames, batch_states, visual_embeddings=embeddings)
+                )
+                visual.append(embeddings)
+            else:
+                outputs.append(self.policy.forward_batch(frames, batch_states))
+        self.last_visual_embeddings = torch.cat(visual) if visual else None
+        return (
+            torch.cat([output[0] for output in outputs]),
+            torch.cat([output[1] for output in outputs]),
+            [state for output in outputs for state in output[2]],
+        )
+
     @torch.no_grad()
     def reset(self):
         episodes = [self.sample_episode(i) for i in range(len(self.sources))]
@@ -59,6 +85,16 @@ class RolloutCollector:
         self.reset_elapsed = 0.0
         if self.states is None:
             self.reset()
+        else:
+            # A reset on the last rollout step prefills under the old weights.
+            # Optimization happens before its first RGB frame. Refresh this
+            # unused prefix so collection matches differentiable replay, which
+            # recomputes episode starts with the current weights. Preserve all
+            # ongoing episode memories across update boundaries.
+            self.states = [
+                self.policy.start_episode(s.episode_id, s.instruction) if s.step_index == 0 else s
+                for s in self.states
+            ]
         assert self.states is not None and self.observations is not None
         cfg = self.config
         buffer = RecurrentRolloutBuffer(
@@ -103,12 +139,24 @@ class RolloutCollector:
                     )
             buffer.save_boundary(t, self.states)
             rgb = torch.stack([o["rgb"] for o in self.observations])
-            logits, values, states = self.policy.forward_batch(rgb, self.states)
+            logits, values, states = self.forward_observations(rgb, self.states)
+            if self.last_visual_embeddings is not None:
+                # Store only frozen visual outputs. Text/markers/NAV are rebuilt
+                # under the current trainable parameters during every replay.
+                if buffer.visual_embeddings is None:
+                    buffer.visual_embeddings = torch.empty(
+                        (buffer.steps, *self.last_visual_embeddings.shape),
+                        dtype=self.last_visual_embeddings.dtype,
+                    )
+                buffer.visual_embeddings[t].copy_(self.last_visual_embeddings.cpu())
             dist = self.policy.distribution.build(logits)
             actions = dist.sample()
             expert = torch.tensor(experts, device=logits.device)
             executed, used_expert = select_env_action(actions, expert, beta)
             results = self.envs.step([NavigationAction(a) for a in executed.tolist()])
+            for source in self.sources:
+                if hasattr(source, "step_taken"):
+                    source.step_taken()
             buffer.observations[t].copy_(rgb)
             for name, value in (
                 ("actions", actions),
@@ -118,6 +166,7 @@ class RolloutCollector:
                 ("used_expert", used_expert),
                 ("old_values", values),
                 ("entropies", dist.entropy()),
+                ("stop_probabilities", dist.probs[:, int(NavigationAction.STOP)]),
                 ("old_policy_log_probs", dist.log_prob(actions)),
                 ("old_log_probs", behavior_log_prob(logits, executed, expert, beta)),
             ):
@@ -127,7 +176,7 @@ class RolloutCollector:
                 buffer.rewards[t, i] = result["reward"]
                 buffer.dones[t, i] = result["done"]
                 buffer.collisions += int(result["collision"])
-                if result["truncated"]:
+                if result["truncated"] and cfg.get("ppo", {}).get("bootstrap_time_limits", False):
                     # Bootstrap from the final frame of this episode, before reset.
                     buffer.timeout_bootstrap[t, i] = self.policy.forward_step(
                         result["rgb"], states[i]
@@ -146,7 +195,7 @@ class RolloutCollector:
                     self.record_reset(observation)
                 self.reset_elapsed += time.monotonic() - reset_start
             self.states, self.observations = states, results
-        _, final_values, _ = self.policy.forward_batch(
+        _, final_values, _ = self.forward_observations(
             torch.stack([o["rgb"] for o in self.observations]), self.states
         )
         buffer.last_values = final_values.cpu()
@@ -160,6 +209,10 @@ class RolloutCollector:
 
 
 def replay_sequences(policy, buffer, sequences):
+    if buffer.visual_embeddings is not None and any(
+        p.requires_grad for p in policy.backbone.vision.parameters()
+    ):
+        raise ValueError("Cannot replay cached embeddings after unfreezing vision")
     states = [clone_state(buffer.initial_states[(s.env, s.start)]) for s in sequences]
     logits, values = [], []
     for offset in range(sequences[0].stop - sequences[0].start):
@@ -172,7 +225,15 @@ def replay_sequences(policy, buffer, sequences):
             if reset is not None:
                 states[i] = policy.start_episode(*reset)
             frames.append(buffer.observations[step, seq.env])
-        step_logits, step_values, states = policy.forward_batch(torch.stack(frames), states)
+        if buffer.visual_embeddings is None:
+            step_logits, step_values, states = policy.forward_batch(torch.stack(frames), states)
+        else:
+            visual = torch.stack(
+                [buffer.visual_embeddings[s.start + offset, s.env] for s in sequences]
+            ).to(policy.backbone.device)
+            step_logits, step_values, states = policy.forward_batch(
+                torch.stack(frames), states, visual_embeddings=visual
+            )
         logits.append(step_logits)
         values.append(step_values)
     return torch.stack(logits), torch.stack(values)

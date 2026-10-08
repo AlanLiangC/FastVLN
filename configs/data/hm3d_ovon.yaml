@@ -1,4 +1,6 @@
-scene_repeat: 16
+iterator_options:
+  max_scene_repeat_steps: 50000
+  step_repetition_range: 0.2
 sources:
   - manifest: runtime/data/manifests/hm3d_ovon_train.json
     weight: 1.0

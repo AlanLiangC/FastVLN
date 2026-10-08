@@ -1,5 +1,6 @@
 import gzip
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -114,3 +115,24 @@ def test_limited_validation_is_reproducible_and_covers_scenes(tmp_path):
     assert len({e.scene_id for e in first}) == 4
     exhausted = list(source.evaluation_episodes(30, stratified=True))
     assert len(exhausted) == len({e.uid for e in exhausted}) == 20
+    # Reference training iterator: scene grouping, a step-based rotation, no
+    # replacement until cycle end, and exact sampler continuation after restore.
+    options = {"max_scene_repeat_steps": 4, "step_repetition_range": 0}
+    training = HabitatEpisodeSource(manifest, seed=9, iterator_options=options)
+    draws = []
+    for _ in range(3):
+        draws.append(training.sample_episode())
+        training.step_taken()
+        training.step_taken()
+    assert draws[0].scene_id == draws[1].scene_id != draws[2].scene_id
+    saved = deepcopy(training.state_dict())
+    restored = HabitatEpisodeSource(manifest, seed=100, iterator_options=options)
+    restored.load_state_dict(saved)
+    for _ in range(17):
+        episode = training.sample_episode()
+        assert episode.uid == restored.sample_episode().uid
+        draws.append(episode)
+        for source in (training, restored):
+            source.step_taken()
+            source.step_taken()
+    assert len({episode.uid for episode in draws}) == 20

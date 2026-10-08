@@ -1,0 +1,5 @@
+defaults:
+  - qwen35_0p8b_kda_goal_norm
+  - _self_
+# Sparse-reward value targets start near zero; avoid a random large readout.
+critic_gain: 0.0

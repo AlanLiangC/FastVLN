@@ -7,15 +7,76 @@ def build_optimizer(policy, config):
     backbone = [
         p for p in policy.backbone.parameters() if p.requires_grad and id(p) not in vision_ids
     ]
-    return torch.optim.AdamW(
+    # The selected upstream finetune configuration has critic-only update 1,
+    # then actor/state encoder LR 2.5e-4 from update 2 onward. No weight decay.
+    initial_freeze = config.get("actor_warmup_updates", 0)
+    if initial_freeze:
+        for p in backbone + list(policy.actor_critic.actor.parameters()):
+            p.requires_grad_(False)
+    optimizer_type = (
+        torch.optim.Adam if config.get("optimizer", "adam") == "adam" else torch.optim.AdamW
+    )
+    return optimizer_type(
         [
-            {"params": backbone, "lr": config["backbone_lr"]},
-            {"params": vision, "lr": config.get("vision_lr", config["backbone_lr"])},
-            {"params": policy.actor_critic.parameters(), "lr": config["head_lr"]},
+            {
+                "params": policy.actor_critic.critic.parameters(),
+                "lr": config.get("critic_lr", config["head_lr"]),
+                "role": "critic",
+            },
+            {
+                "params": backbone,
+                "lr": 0.0 if initial_freeze else config["backbone_lr"],
+                "role": "backbone",
+            },
+            {
+                "params": policy.actor_critic.actor.parameters(),
+                "lr": 0.0 if initial_freeze else config["head_lr"],
+                "role": "actor",
+            },
+            {
+                "params": vision,
+                "lr": config.get("vision_lr", config["backbone_lr"]),
+                "role": "vision",
+            },
         ],
         weight_decay=config["weight_decay"],
+        eps=config.get("optimizer_eps", 1e-5),
         fused=config.get("fused_optimizer", True) and backbone[0].is_cuda,
     )
+
+
+class OVSegDTLRScheduler:
+    """PIRLNav schedule for start_warmup=start_update=1 in the reference YAML."""
+
+    def __init__(self, optimizer, config):
+        self.optimizer, self.config, self.update = optimizer, config, 0
+
+    def step(self):
+        self.update += 1
+        self._apply()
+
+    def _apply(self):
+        if self.update < self.config.get("actor_warmup_updates", 0):
+            return
+        for group in self.optimizer.param_groups:
+            if group["role"] in ("backbone", "actor"):
+                for parameter in group["params"]:
+                    parameter.requires_grad_(True)
+                group["lr"] = (
+                    self.config["backbone_lr"]
+                    if group["role"] == "backbone"
+                    else self.config["head_lr"]
+                )
+
+    def state_dict(self):
+        return {"update": self.update}
+
+    def load_state_dict(self, state):
+        self.update = state["update"]
+        self._apply()
+
+    def get_last_lr(self):
+        return [group["lr"] for group in self.optimizer.param_groups]
 
 
 def gradient_norm(parameters):

@@ -13,12 +13,18 @@ from streamnav.models.qwen35_kda.cache import stack_caches, unstack_cache
 class StreamingObjectNavPolicy(nn.Module):
     loaded_checkpoint: str
 
-    def __init__(self, backbone, value_hidden_dim=512):
+    def __init__(
+        self, backbone, value_hidden_dim=512, action_dim=6, critic_type="linear", critic_gain=1.0
+    ):
         super().__init__()
         self.backbone = backbone
         self.pooling = NavigationPooling()
         self.actor_critic = NavigationActorCritic(
-            backbone.config.text_config.hidden_size, value_hidden_dim
+            backbone.config.text_config.hidden_size,
+            value_hidden_dim,
+            action_dim,
+            critic_type,
+            critic_gain,
         )
         self.actor_critic.to(device=backbone.device, dtype=backbone.nav_token.dtype)
         self.distribution = ObjectNavActionDistribution()
@@ -32,10 +38,18 @@ class StreamingObjectNavPolicy(nn.Module):
 
     reset = start_episode
 
-    def forward_batch(self, rgb, states):
-        hidden, cache = self.backbone.recurrent_forward(
-            self.backbone.encode_rgb(rgb), stack_caches(states)
+    def forward_batch(self, rgb, states, visual_embeddings=None):
+        instructions = (
+            [s.instruction for s in states]
+            if getattr(self.backbone, "goal_conditioning", "episode") == "nav_query"
+            else None
         )
+        tokens = (
+            self.backbone.encode_rgb(rgb, instructions=instructions)
+            if visual_embeddings is None
+            else self.backbone.encode_visual_tokens(visual_embeddings, instructions=instructions)
+        )
+        hidden, cache = self.backbone.recurrent_forward(tokens, stack_caches(states))
         logits, values = self.actor_critic(self.pooling(hidden))
         caches = unstack_cache(cache, len(states))
         return (

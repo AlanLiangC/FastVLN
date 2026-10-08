@@ -14,6 +14,7 @@ if [[ ! -x runtime/habitat-env/bin/python ]]; then
   "$conda_binary" create -y -p "$STREAMNAV_RUNTIME/habitat-env" --override-channels \
     -c conda-forge -c aihabitat python=3.9 habitat-sim=0.3.3 headless numpy=1.26 pyzmq pillow pyyaml
 fi
+bash scripts/setup_ovsegdt_oracle.sh
 python -m pip freeze > runtime/learner-installed.txt
 "$conda_binary" list -p "$STREAMNAV_RUNTIME/habitat-env" --explicit > runtime/habitat-explicit.txt
 echo "Environments ready. Source scripts/env.sh before running commands."

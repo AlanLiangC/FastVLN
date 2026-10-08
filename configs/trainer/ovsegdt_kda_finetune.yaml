@@ -1,0 +1,7 @@
+defaults:
+  - ovsegdt_e2e
+  - _self_
+revision: 6
+# Revision 5 lost input sensitivity; a lower pretrained-backbone LR tests
+# optimizer adaptation separately from the randomly initialized heads.
+backbone_lr: 0.00001

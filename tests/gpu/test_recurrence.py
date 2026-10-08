@@ -13,7 +13,7 @@ pytestmark = [
 ]
 
 
-def small_kda():
+def small_kda(output_norm=False):
     attn = nn.Module()
     attn.head_dim = 32
     attn.config = SimpleNamespace(num_attention_heads=2, num_key_value_heads=1, hidden_size=64)
@@ -24,14 +24,14 @@ def small_kda():
         nn.Linear(64, 64),
     )
     attn.q_norm, attn.k_norm = nn.Identity(), nn.Identity()
-    return KDAAdapter(attn).cuda().bfloat16()
+    return KDAAdapter(attn, output_norm=output_norm).cuda().bfloat16()
 
 
-@pytest.mark.parametrize("kind", ["kda", "gdn"])
+@pytest.mark.parametrize("kind", ["kda", "kda_norm", "gdn"])
 def test_chunk_recurrent_reference_and_initial_state_gradient(kind):
     torch.manual_seed(19)
-    if kind == "kda":
-        layer = small_kda()
+    if kind in ("kda", "kda_norm"):
+        layer = small_kda(output_norm=kind == "kda_norm")
     else:
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
             Qwen3_5GatedDeltaNet,

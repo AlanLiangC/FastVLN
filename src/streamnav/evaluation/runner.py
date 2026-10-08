@@ -77,7 +77,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                 if i % parallel.world_size() == parallel.rank()
             )
             scene_ids, categories = set(), set()
-            action_counts = [0] * 4
+            action_counts = [0] * config["model"]["action_dim"]
             cache_bytes = 0
             while batch := list(islice(iterator, count)):
                 for _, episode in batch:
@@ -94,6 +94,15 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                     states = [policy.start_episode(e.uid, e.goal_text) for _, e in batch]
                 writers = []
                 active = list(range(len(batch)))
+                stop_diagnostics: list[dict[str, Any]] = [
+                    {
+                        "near_goal_steps": 0,
+                        "near_goal_stop_probability_sum": 0.0,
+                        "near_goal_stop_probability_max": None,
+                        "false_stop": False,
+                    }
+                    for _ in batch
+                ]
                 try:
                     for index, _ in batch:
                         writers.append(
@@ -120,6 +129,28 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                         duration = time.perf_counter() - start
                         times.extend([duration] * len(active))
                         batch_times.append(duration)
+                        # Privileged distance is used only for diagnostics.
+                        # Decisions above remain unconditional policy argmax.
+                        stop_probabilities = logits.softmax(-1)[:, 0].tolist()
+                        for i, action, probability in zip(
+                            active, actions, stop_probabilities, strict=True
+                        ):
+                            observation = observations[i]
+                            distance = (
+                                observation["geodesic_distance"]
+                                if "geodesic_distance" in observation
+                                else observation["distance"]
+                            )
+                            near = distance < env_config.get("success_distance", 0.1)
+                            diagnostics = stop_diagnostics[i]
+                            if near:
+                                diagnostics["near_goal_steps"] += 1
+                                diagnostics["near_goal_stop_probability_sum"] += probability
+                                diagnostics["near_goal_stop_probability_max"] = max(
+                                    diagnostics["near_goal_stop_probability_max"] or 0, probability
+                                )
+                            if action == NavigationAction.STOP and not near:
+                                diagnostics["false_stop"] = True
                         next_observations = list(
                             envs.executor.map(
                                 lambda pair: envs.clients[pair[0]].step(pair[1]),
@@ -145,6 +176,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                                     "episode_id": episode.uid,
                                     "goal": episode.goal_text,
                                     **observation["metrics"],
+                                    **stop_diagnostics[i],
                                 }
                                 append_json(worker_output / f"{split}_episodes.jsonl", record)
                                 metrics.append(record)
@@ -171,7 +203,9 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
             times = [t for p in payloads for t in p["times"]]
             scene_ids = set().union(*(p["scenes"] for p in payloads))
             categories = set().union(*(p["categories"] for p in payloads))
-            action_counts = [sum(p["actions"][i] for p in payloads) for i in range(4)]
+            action_counts = [
+                sum(p["actions"][i] for p in payloads) for i in range(len(action_counts))
+            ]
             if parallel.rank() == 0 and parallel.world_size() > 1:
                 for record in metrics:
                     append_json(output / f"{split}_episodes.jsonl", record)
@@ -184,6 +218,10 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                 "evaluation_batch_size": count * parallel.world_size(),
                 "world_size": parallel.world_size(),
                 "success_distance": env_config.get("success_distance", 0.1),
+                "inference_mode": config["model"].get("inference_mode", "auto"),
+                "compute_dtype": config["model"]["dtype"],
+                "loaded_checkpoint": str(getattr(policy, "loaded_checkpoint", "unknown")),
+                "evaluated_model_update": update,
                 "scene_count": len(scene_ids),
                 "category_count": len(categories),
                 "selection": "scene_stratified" if stratified else "sequential",
@@ -211,11 +249,16 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
 @hydra.main(version_base=None, config_path="../../../configs", config_name="config")
 def main(cfg):
     config = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
-    seed_everything(config["seed"])
-    policy = load_policy(config, preserve_master_weights=True)
-    manifest = Path(policy.loaded_checkpoint) / "manifest.json"
-    update = json.loads(manifest.read_text()).get("update", 0) if manifest.exists() else 0
-    evaluate(policy, config, update=update, video=config["eval"]["video"])
+    parallel.initialize(config)
+    try:
+        seed_everything(config["seed"])
+        policy = load_policy(config, preserve_master_weights=True)
+        manifest = Path(policy.loaded_checkpoint) / "manifest.json"
+        update = json.loads(manifest.read_text()).get("update", 0) if manifest.exists() else 0
+        evaluate(policy, config, update=update, video=config["eval"]["video"])
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

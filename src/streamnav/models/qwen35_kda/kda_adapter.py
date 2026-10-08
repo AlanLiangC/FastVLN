@@ -39,9 +39,10 @@ class KDAAdapter(nn.Module):
     and delta update gates are newly initialized, not pretrained KDA weights.
     """
 
-    def __init__(self, attention):
+    def __init__(self, attention, output_norm=False):
         super().__init__()
         self.head_dim = attention.head_dim
+        self.output_norm = output_norm
         self.num_heads = attention.config.num_attention_heads
         self.num_kv_heads = attention.config.num_key_value_heads
         self.q_proj: nn.Module = attention.q_proj
@@ -85,6 +86,12 @@ class KDAAdapter(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
+        if self.output_norm:
+            # FLA KimiDeltaAttention normalizes each value head before its
+            # sigmoid output gate. Raw delta outputs differ in scale from
+            # softmax attention, so copied O weights need this normalization.
+            # A separate affine scale is redundant with the trainable O matrix.
+            o = F.rms_norm(o, (self.head_dim,), eps=1e-5)
         out = self.o_proj((o * gate.sigmoid()).reshape(b, t, -1))
         return out, LayerState(None, recurrent)
 

@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -18,15 +19,19 @@ from habitat_sim.utils.common import quat_from_coeffs
 
 from streamnav.contracts.action import NavigationAction
 from streamnav.errors import OracleUnavailableError
+from streamnav.training.oracle_progress import OracleProgressTracker
 from streamnav.training.rewards import ObjectNavReward, RewardConfig
 
 
 class HabitatObjectNavEnv:
     def __init__(self, config):
         self.config = config
+        random.seed(config.get("seed", 2025))
+        np.random.seed(config.get("seed", 2025))
         self.sim = None
         self.scene = None
         self.reward = ObjectNavReward(RewardConfig(**config.get("reward", {})))
+        self.explorer = None
 
     def _make_sim(self, scene):
         if self.sim is not None:
@@ -60,8 +65,17 @@ class HabitatObjectNavEnv:
                 "turn_right",
                 habitat_sim.agent.ActuationSpec(amount=self.config.get("turn_angle", 30)),
             ),
+            "look_up": habitat_sim.agent.ActionSpec(
+                "look_up",
+                habitat_sim.agent.ActuationSpec(amount=self.config.get("tilt_angle", 30)),
+            ),
+            "look_down": habitat_sim.agent.ActionSpec(
+                "look_down",
+                habitat_sim.agent.ActuationSpec(amount=self.config.get("tilt_angle", 30)),
+            ),
         }
         self.sim = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent]))
+        self.sim.seed(self.config.get("seed", 2025))
         if not self.sim.pathfinder.is_loaded:
             raise RuntimeError(f"Scene has no navigable mesh: {scene}")
         self._configure_navmesh(scene, agent)
@@ -80,13 +94,20 @@ class HabitatObjectNavEnv:
         # The supplied meshes were baked for height=1.5/radius=0.1; rebuild and
         # share a cached robot-specific navmesh across workers without races.
         settings = self.sim.pathfinder.nav_mesh_settings
-        if np.isclose(settings.agent_height, agent.height) and np.isclose(
-            settings.agent_radius, agent.radius
-        ):
+        expected = {
+            "agent_height": agent.height,
+            "agent_radius": agent.radius,
+            "agent_max_climb": self.config.get("navmesh_agent_max_climb", 0.10),
+            "cell_height": self.config.get("navmesh_cell_height", 0.05),
+            "include_static_objects": False,
+        }
+        if all(np.isclose(getattr(settings, key), value) for key, value in expected.items()):
             return
         source = Path(scene).with_suffix(".navmesh")
         signature = hashlib.sha256(source.read_bytes())
-        signature.update(f"{agent.height}:{agent.radius}:habitat-0.3.3".encode())
+        signature.update(
+            json.dumps({**expected, "sim_version": "habitat-0.3.3"}, sort_keys=True).encode()
+        )
         root = Path(self.config.get("navmesh_cache", "runtime/cache/navmesh"))
         root.mkdir(parents=True, exist_ok=True)
         cache = root / f"{signature.hexdigest()}.navmesh"
@@ -96,17 +117,17 @@ class HabitatObjectNavEnv:
                 if not self.sim.pathfinder.load_nav_mesh(str(cache)):
                     raise RuntimeError(f"Invalid cached navmesh: {cache}")
             else:
-                settings.agent_height, settings.agent_radius = agent.height, agent.radius
+                settings = habitat_sim.NavMeshSettings()
+                settings.set_defaults()
+                for key, value in expected.items():
+                    setattr(settings, key, value)
                 if not self.sim.recompute_navmesh(self.sim.pathfinder, settings):
                     raise RuntimeError(f"Cannot build robot-specific navmesh: {scene}")
                 temporary = cache.with_suffix(f".{os.getpid()}.navmesh")
                 self.sim.pathfinder.save_nav_mesh(str(temporary))
                 temporary.replace(cache)
         actual = self.sim.pathfinder.nav_mesh_settings
-        if not (
-            np.isclose(actual.agent_height, agent.height)
-            and np.isclose(actual.agent_radius, agent.radius)
-        ):
+        if not all(np.isclose(getattr(actual, key), value) for key, value in expected.items()):
             raise RuntimeError("Navmesh collision geometry differs from robot configuration")
 
     def robot_configuration(self):
@@ -123,6 +144,8 @@ class HabitatObjectNavEnv:
             "agent_radius": float(agent.radius),
             "navmesh_height": float(navmesh.agent_height),
             "navmesh_radius": float(navmesh.agent_radius),
+            "navmesh_agent_max_climb": float(navmesh.agent_max_climb),
+            "navmesh_cell_height": float(navmesh.cell_height),
         }
 
     def distance(self):
@@ -158,8 +181,11 @@ class HabitatObjectNavEnv:
         self.min_distance = self.initial_distance
         self.oracle_goal = self.closest_goal.copy()
         self.oracle_recoveries = 0
-        self.oracle_best_distance = self.initial_distance
-        self.oracle_progress_step = 0
+        self.oracle_progress = OracleProgressTracker(self.initial_distance)
+        if self.config.get("oracle", "greedy") == "objnav_explorer":
+            from ovsegdt_oracle import OVSegDTOracle
+
+            self.explorer = OVSegDTOracle(self)
         warmup_steps = 0
         warm_distance = episode.get("metadata", {}).get("training_warm_start_distance")
         if warm_distance is not None:
@@ -167,36 +193,39 @@ class HabitatObjectNavEnv:
                 raise ValueError("Warm starts are allowed only for training, at 0.1–20 m")
             # Physical oracle steps move to an easier start, before any learner
             # observation/reward. Evaluation episodes never carry this metadata.
-            while self.previous_distance > warm_distance and warmup_steps < 250:
-                try:
+            try:
+                while self.previous_distance > warm_distance and warmup_steps < 250:
                     action = self.oracle()
-                except OracleUnavailableError as exc:
-                    # Curriculum is optional. Restore the original legal start
-                    # rather than letting a failed warmup terminate the learner.
-                    metadata = dict(episode.get("metadata", {}))
-                    metadata.pop("training_warm_start_distance", None)
-                    image, info = self.reset({**episode, "metadata": metadata})
-                    info["curriculum_warmup_steps"] = warmup_steps
-                    info["curriculum_fallback"] = str(exc)
-                    print(
-                        json.dumps({"curriculum_fallback": str(exc), "episode": self.uid}),
-                        flush=True,
+                    if action == NavigationAction.STOP:
+                        break
+                    self.step(action)
+                    warmup_steps += 1
+                    if self.ended:
+                        break
+                if self.distance() > warm_distance:
+                    raise OracleUnavailableError(
+                        f"Warmup did not reach {warm_distance:.3f} m after {warmup_steps} steps"
                     )
-                    return image, info
-                if action == NavigationAction.STOP:
-                    break
-                self.step(action)
-                warmup_steps += 1
-                if self.ended:
-                    break
+            except OracleUnavailableError as exc:
+                # Failed or exhausted warmups must not silently publish an
+                # intermediate pose as a successful near-goal training start.
+                metadata = dict(episode.get("metadata", {}))
+                metadata.pop("training_warm_start_distance", None)
+                image, info = self.reset({**episode, "metadata": metadata})
+                info["curriculum_warmup_steps"] = warmup_steps
+                info["curriculum_fallback"] = str(exc)
+                print(
+                    json.dumps({"curriculum_fallback": str(exc), "episode": self.uid}),
+                    flush=True,
+                )
+                return image, info
             self.steps, self.path_length, self.collisions = 0, 0.0, 0
             self.ended = False
             self.initial_distance = self.previous_distance = self.distance()
             self.min_distance = self.initial_distance
             self.follower.reset()
             self.oracle_goal = self.closest_goal.copy()
-            self.oracle_best_distance = self.initial_distance
-            self.oracle_progress_step = 0
+            self.oracle_progress = OracleProgressTracker(self.initial_distance)
         return self._observation(), {
             "episode_id": self.uid,
             "goal_text": episode["goal_text"],
@@ -218,17 +247,18 @@ class HabitatObjectNavEnv:
     def oracle(self):
         if self.ended:
             raise RuntimeError("Reset required after episode termination")
+        if self.explorer is not None:
+            # Exploration can legitimately move away from the object. Do not
+            # apply the old greedy follower's distance-progress heuristic.
+            return self.explorer.action()
         # reset()/step() already computed distance for this exact position.
         # Oracle queries never move the agent; avoid a duplicate multi-goal search.
         distance = self.previous_distance
         if distance < self.config.get("success_distance", 0.1):
             return NavigationAction.STOP
-        if distance < self.oracle_best_distance - 0.02:
-            self.oracle_best_distance = distance
-            self.oracle_progress_step = self.steps
-        elif self.steps - self.oracle_progress_step >= 64:
+        if self.oracle_progress.stalled:
             raise OracleUnavailableError(
-                f"Oracle made no geodesic progress for 64 steps; episode={self.uid}, distance={distance:.4f}"
+                f"Oracle made no geodesic progress for 64 followed advice steps; episode={self.uid}, distance={distance:.4f}"
             )
         try:
             # A stable target preserves the follower's anti-thrashing state.
@@ -271,7 +301,9 @@ class HabitatObjectNavEnv:
             "turn_left": NavigationAction.TURN_LEFT,
             "turn_right": NavigationAction.TURN_RIGHT,
         }
-        return mapping[action]
+        advice = mapping[action]
+        self.oracle_progress.record_advice(advice)
+        return advice
 
     def step(self, action):
         if self.ended:
@@ -286,6 +318,8 @@ class HabitatObjectNavEnv:
                     NavigationAction.MOVE_FORWARD: "move_forward",
                     NavigationAction.TURN_LEFT: "turn_left",
                     NavigationAction.TURN_RIGHT: "turn_right",
+                    NavigationAction.LOOK_UP: "look_up",
+                    NavigationAction.LOOK_DOWN: "look_down",
                 }[action]
             )
         after = self.sim.get_agent(0).get_state().position
@@ -296,6 +330,7 @@ class HabitatObjectNavEnv:
         self.collisions += int(collision)
         # Turning and fully blocked motion preserve geodesic distance.
         distance = self.distance() if moved > 0 else self.previous_distance
+        self.oracle_progress.record_step(action, distance)
         success = stopped and distance < self.config.get("success_distance", 0.1)
         self.min_distance = min(self.min_distance, distance)
         truncated = self.steps >= self.config.get("max_episode_steps", 500) and not stopped

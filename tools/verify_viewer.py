@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
@@ -9,7 +10,7 @@ from playwright.sync_api import sync_playwright
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8765")
-    parser.add_argument("--screenshot", default="docs/assets/viewer.png")
+    parser.add_argument("--screenshot", default="runtime/reports/viewer.png")
     args = parser.parse_args()
     errors = []
     with sync_playwright() as p:
@@ -27,6 +28,7 @@ def main():
         assert page.locator("#error").inner_text() == ""
         assert "480×270" in page.locator("#sensor").inner_text()
         assert page.locator("#frame").evaluate("i=>[i.naturalWidth,i.naturalHeight]") == [480, 270]
+        Path(args.screenshot).parent.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=args.screenshot, full_page=True)
         print(
             json.dumps(

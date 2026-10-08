@@ -1,0 +1,7 @@
+defaults:
+  - ovsegdt_kda_stable
+  - _self_
+revision: 9
+# Explicit ablation: STOP is about 0.4% of on-policy teacher labels in rev8.
+# Preserve the existing normalized weighted-IL objective and all other settings.
+il_class_weights: [8.0, 1.0, 1.0, 1.0, 1.0, 1.0]

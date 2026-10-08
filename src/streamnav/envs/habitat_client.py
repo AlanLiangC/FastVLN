@@ -33,7 +33,13 @@ class HabitatClient:
                 "--endpoint",
                 self.endpoint,
                 "--config",
-                json.dumps(dict(config)),
+                json.dumps(
+                    {
+                        **config,
+                        "seed": config.get("seed", 2025)
+                        + (worker_id if isinstance(worker_id, int) else 0),
+                    }
+                ),
             ],
             stdout=self.log,
             stderr=subprocess.STDOUT,

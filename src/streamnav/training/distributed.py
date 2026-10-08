@@ -1,5 +1,6 @@
 """Synchronous data parallel training for the explicit recurrent policy API."""
 
+import math
 import os
 from datetime import timedelta
 
@@ -106,6 +107,10 @@ def combine_metrics(rows):
         "curriculum_fallbacks",
     }
     for key, value in result.items():
+        if key in {"stop_probability_on_teacher_stop", "stop_probability_on_teacher_nonstop"}:
+            # Nullable conditional means must be combined with their class
+            # counts below; a rank can have no examples of the conditioning class.
+            continue
         if isinstance(value, bool):
             result[key] = any(r[key] for r in rows)
         elif isinstance(value, (float, int)):
@@ -117,17 +122,18 @@ def combine_metrics(rows):
                 "rollout_seconds",
                 "reset_seconds",
                 "gpu_memory_bytes",
+                "preupdate_replay_log_prob_error_max",
             }:
                 result[key] = max(r[key] for r in rows)
             elif key != "update":
                 result[key] = sum(r[key] for r in rows) / len(rows)
         elif key.endswith("action_histogram"):
-            result[key] = [sum(r[key][a] for r in rows) / len(rows) for a in range(4)]
+            result[key] = [sum(r[key][a] for r in rows) / len(rows) for a in range(len(value))]
     completed = sum(r["episodes_completed"] for r in rows)
     for key in ("success", "spl"):
         result[key] = sum(r[key] * r["episodes_completed"] for r in rows) / max(completed, 1)
     result["oracle_class_recall"] = []
-    for action in range(4):
+    for action in range(len(result["expert_action_histogram"])):
         weight = sum(r["expert_action_histogram"][action] for r in rows)
         result["oracle_class_recall"].append(
             sum(
@@ -138,4 +144,43 @@ def combine_metrics(rows):
             if weight
             else None
         )
+    if all("expert_action_counts" in r and "greedy_action_confusion" in r for r in rows):
+        actions = len(result["expert_action_histogram"])
+        counts = [sum(r["expert_action_counts"][a] for r in rows) for a in range(actions)]
+        confusion = [
+            [sum(r["greedy_action_confusion"][a][p] for r in rows) for p in range(actions)]
+            for a in range(actions)
+        ]
+        result["expert_action_counts"] = counts
+        result["greedy_action_confusion"] = confusion
+        result["expert_action_histogram"] = [n / sum(counts) for n in counts]
+        result["oracle_class_recall"] = [
+            confusion[a][a] / counts[a] if counts[a] else None for a in range(actions)
+        ]
+        result["teacher_stop_count"] = counts[0]
+        result["greedy_stop_count"] = sum(row[0] for row in confusion)
+        result["greedy_stop_precision"] = (
+            confusion[0][0] / result["greedy_stop_count"] if result["greedy_stop_count"] else None
+        )
+        for key, positive in (
+            ("stop_probability_on_teacher_stop", True),
+            ("stop_probability_on_teacher_nonstop", False),
+        ):
+            weights = [
+                r["expert_action_counts"][0]
+                if positive
+                else sum(r["expert_action_counts"]) - r["expert_action_counts"][0]
+                for r in rows
+            ]
+            result[key] = (
+                sum((r[key] or 0) * n for r, n in zip(rows, weights, strict=True)) / sum(weights)
+                if sum(weights)
+                else None
+            )
+    # A global constant-action baseline uses the global label distribution,
+    # not the average entropy of independently estimated per-rank priors.
+    if "oracle_prior_cross_entropy" in result:
+        prior_ce = -sum(p * math.log(p) for p in result["expert_action_histogram"] if p > 0)
+        result["oracle_prior_cross_entropy"] = prior_ce
+        result["il_gain_over_prior"] = prior_ce - result["il_loss"]
     return result

@@ -25,9 +25,18 @@ def load_policy(config, training=False, preserve_master_weights=False):
     if device.type == "cuda":
         torch.cuda.set_device(device)
     path = Path(config.get("checkpoint") or config["model"]["checkpoint"]).resolve()
-    model_cfg = config["model"]
-    if model_cfg["action_dim"] != 4 or model_cfg["dtype"] not in ("bfloat16", "float32"):
-        raise ValueError("Only four actions and bf16/fp32 precision are supported")
+    model_cfg = dict(config["model"])
+    saved_config = path / "resolved_config.yaml"
+    if not training and saved_config.exists():
+        saved_model = yaml.safe_load(saved_config.read_text())["model"]
+        for key in ("action_dim", "value_hidden_dim"):
+            model_cfg[key] = saved_model[key]
+        model_cfg["critic_type"] = saved_model.get("critic_type", "mlp")
+        model_cfg["goal_conditioning"] = saved_model.get("goal_conditioning", "episode")
+        model_cfg["kda_output_norm"] = saved_model.get("kda_output_norm", False)
+        model_cfg["critic_gain"] = saved_model.get("critic_gain", 1.0)
+    if model_cfg["action_dim"] not in (4, 6) or model_cfg["dtype"] not in ("bfloat16", "float32"):
+        raise ValueError("Only six/legacy-four actions and bf16/fp32 precision are supported")
     # FP32 master parameters/moments for the optimizer, BF16 autocast compute.
     dtype = (
         torch.float32 if training or preserve_master_weights else getattr(torch, model_cfg["dtype"])
@@ -39,14 +48,22 @@ def load_policy(config, training=False, preserve_master_weights=False):
         image_size=model_cfg["image_size"],
         gradient_checkpointing=model_cfg["gradient_checkpointing"],
         inference_mode=model_cfg.get("inference_mode", "auto"),
+        goal_conditioning=model_cfg.get("goal_conditioning", "episode"),
+        kda_output_norm=model_cfg.get("kda_output_norm", False),
     )
     if model_cfg["freeze_vision_encoder"]:
         backbone.vision.requires_grad_(False)
-    if training and model_cfg["gradient_checkpointing"]:
+    if training and model_cfg["gradient_checkpointing"] and not model_cfg["freeze_vision_encoder"]:
         backbone.vision.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-    policy = StreamingObjectNavPolicy(backbone, model_cfg["value_hidden_dim"])
+    policy = StreamingObjectNavPolicy(
+        backbone,
+        model_cfg["value_hidden_dim"],
+        model_cfg["action_dim"],
+        model_cfg.get("critic_type", "mlp"),
+        model_cfg.get("critic_gain", 1.0),
+    )
     policy.inference_compute_dtype = getattr(torch, model_cfg["dtype"])
     policy.loaded_checkpoint = str(path)
     heads = Path(path) / "actor_critic.safetensors"
@@ -71,7 +88,14 @@ def provenance(config):
     serialized = json.dumps(config, sort_keys=True)
     source_hash = hashlib.sha256()
     source_files = []
-    for folder in ("src", "services", "tools", "configs"):
+    for folder in (
+        "src",
+        "services",
+        "tools",
+        "configs",
+        "scripts",
+        "runtime/vendor/frontier_exploration/frontier_exploration",
+    ):
         for path in sorted(Path(folder).rglob("*")):
             if path.is_file() and "__pycache__" not in str(path):
                 source_hash.update(str(path).encode())
@@ -91,6 +115,10 @@ def provenance(config):
     return {
         "git_sha": git("rev-parse", "HEAD"),
         "git_dirty": bool(git("status", "--porcelain")),
+        "ovsegdt_reference_commit": git("-C", "third_party/OVSegDT", "rev-parse", "HEAD"),
+        "frontier_exploration_commit": git(
+            "-C", "runtime/vendor/frontier_exploration", "rev-parse", "HEAD"
+        ),
         "source_tree_sha256": source_hash.hexdigest(),
         "source_archive": str(archive.resolve()),
         "source_archive_sha256": file_hash(archive),
@@ -203,7 +231,7 @@ def promote_best_checkpoint(run_dir, update, results):
     return True
 
 
-def restore_training(path, optimizer, scheduler, dagger, sources, config=None):
+def restore_training(path, optimizer, scheduler, dagger, sources, config=None, mixer=None):
     # Only load checkpoints created by this project and trusted by the user.
     if config is not None:
         previous = yaml.safe_load((Path(path) / "resolved_config.yaml").read_text())
@@ -221,17 +249,60 @@ def restore_training(path, optimizer, scheduler, dagger, sources, config=None):
             "sensor_pitch_deg",
             "agent_height",
             "agent_radius",
+            "navmesh_agent_max_climb",
+            "navmesh_cell_height",
             "success_distance",
             "forward_step",
             "turn_angle",
         ):
             if previous["habitat"].get(key) != config["habitat"].get(key):
                 raise ValueError(f"Resume robot configuration changed: {key}; start a new run")
-        for key in ("image_size", "freeze_vision_encoder", "action_dim", "value_hidden_dim"):
+        for key in (
+            "image_size",
+            "freeze_vision_encoder",
+            "action_dim",
+            "value_hidden_dim",
+            "critic_type",
+            "inference_mode",
+        ):
             if previous["model"][key] != config["model"][key]:
                 raise ValueError(f"Resume model configuration changed: {key}")
+        if previous["model"].get("goal_conditioning", "episode") != config["model"].get(
+            "goal_conditioning", "episode"
+        ):
+            raise ValueError("Resume model configuration changed: goal_conditioning")
+        if previous["model"].get("kda_output_norm", False) != config["model"].get(
+            "kda_output_norm", False
+        ):
+            raise ValueError("Resume model configuration changed: kda_output_norm")
         if previous["trainer"]["dagger"] != config["trainer"]["dagger"]:
             raise ValueError("Resume requires the same DAgger schedule")
+        for key in (
+            "ppo",
+            "ealm",
+            "loss",
+            "optimizer",
+            "optimizer_eps",
+            "backbone_lr",
+            "head_lr",
+            "critic_lr",
+            "vision_lr",
+            "weight_decay",
+            "max_grad_norm",
+            "il_class_weights",
+            "curriculum",
+            "actor_warmup_updates",
+            "num_envs",
+            "rollout_steps",
+            "sequence_length",
+            "sequence_batch_size",
+            "update_epochs",
+        ):
+            if previous["trainer"].get(key) != config["trainer"].get(key):
+                raise ValueError(f"Resume training recipe changed: {key}")
+        for key in ("oracle", "oracle_config", "reward", "tilt_angle", "max_episode_steps"):
+            if previous["habitat"].get(key) != config["habitat"].get(key):
+                raise ValueError(f"Resume environment recipe changed: {key}")
         saved_manifest = json.loads((Path(path) / "manifest.json").read_text())
         for item in config["data"]["sources"]:
             manifest_path = item["manifest"]
@@ -246,6 +317,10 @@ def restore_training(path, optimizer, scheduler, dagger, sources, config=None):
     scheduler.load_state_dict(saved["scheduler"])
     dagger.update = json.loads((Path(path) / "dagger_scheduler.json").read_text())["update"]
     per_rank = saved["rank_states"][rank()] if saved.get("rank_states") else saved
+    if mixer is not None:
+        if "mixer" not in per_rank:
+            raise ValueError("Checkpoint lacks the per-rank EALM entropy EMA")
+        mixer.load_state_dict(per_rank["mixer"])
     for source, state in zip(sources, per_rank["sources"], strict=True):
         source.load_state_dict(state)
     restore_rng(per_rank["rng"])

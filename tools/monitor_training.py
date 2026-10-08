@@ -11,7 +11,7 @@ from pathlib import Path
 import yaml
 
 from streamnav.training.health import learning_health
-from streamnav.utils.process_health import process_alive
+from streamnav.utils.process_health import training_process_alive
 
 
 def read_rows(path):
@@ -34,7 +34,7 @@ def write_status(path, data):
 
 
 def worker_alive(pid):
-    return process_alive(pid, "streamnav.training.trainer")
+    return training_process_alive(pid)
 
 
 def main():
@@ -48,7 +48,7 @@ def main():
     stopped_for_health = False
     start_time = time.time()
     while True:
-        alive = process_alive(args.pid, "streamnav.training.trainer")
+        alive = worker_alive(args.pid)
         now = time.time()
         rows = read_rows(output / "train_metrics.jsonl")
         evaluations = read_rows(output / "eval_metrics.jsonl")
@@ -69,6 +69,11 @@ def main():
         workers = [w for w in workers if w.get("launcher_pid") == args.pid or w["pid"] == args.pid]
         health["workers"] = [{**w, "alive": worker_alive(w["pid"])} for w in workers]
         health["expected_workers"] = cfg.get("distributed", {}).get("world_size", 1)
+        if alive and not workers:
+            # During resume, config/metrics still belong to the prior run until
+            # this launcher registers its workers. Do not terminate torchrun
+            # using the old run's stopping rule before initialization finishes.
+            health["status"] = "starting"
         if alive and workers and not all(w["alive"] for w in health["workers"]):
             health["warnings"].append("training_worker_exited")
             health["stop_recommended"] = True
@@ -93,16 +98,15 @@ def main():
         if (
             health["stop_recommended"]
             and not stopped_for_health
+            and (workers or "training_has_stopped_advancing" in health["warnings"])
             and supervision.get("stop_on_failure", True)
         ):
-            cmd = Path(f"/proc/{args.pid}/cmdline")
-            if cmd.exists() and b"streamnav.training.trainer" in cmd.read_bytes():
+            if worker_alive(args.pid):
                 # Signal workers, not torchrun: torchrun escalates to SIGKILL
                 # after a short timeout, possibly interrupting checkpoint I/O.
                 targets = [w["pid"] for w in workers] or [args.pid]
                 for pid in targets:
-                    command = Path(f"/proc/{pid}/cmdline")
-                    if command.exists() and b"streamnav.training.trainer" in command.read_bytes():
+                    if worker_alive(pid):
                         try:
                             os.kill(pid, signal.SIGTERM)
                         except ProcessLookupError:

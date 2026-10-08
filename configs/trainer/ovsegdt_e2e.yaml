@@ -1,17 +1,23 @@
-num_updates: 10000
-num_envs: 8
-rollout_steps: 16
-sequence_length: 4
-sequence_batch_size: 8
-update_epochs: 2
-revision: 3
-backbone_lr: 0.000003
-vision_lr: 0.000001
-il_class_weights: [8.0, 1.0, 1.0, 1.0]
-head_lr: 0.0001
-weight_decay: 0.01
+num_updates: 312500
+total_num_steps: 1000000000
+num_envs: 4
+rollout_steps: 100
+sequence_length: 100
+sequence_batch_size: 2
+rollout_inference_batch_size: 2
+update_epochs: 1
+revision: 5
+backbone_lr: 0.00025
+vision_lr: 0.0
+il_class_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+head_lr: 0.00025
+optimizer: adam
+optimizer_eps: 0.00001
+actor_warmup_updates: 1
+weight_decay: 0.0
 fused_optimizer: true
-max_grad_norm: 1.0
+cache_frozen_vision: false
+max_grad_norm: 0.2
 checkpoint_interval: 25
 keep_checkpoints: 3
 eval_interval: 100
@@ -21,17 +27,22 @@ eval_episodes: 48
 eval_max_steps: 500
 verify_data_hashes: true
 dagger:
-  beta_start: 0.9
-  beta_end: 0.05
+  beta_start: 0.0
+  beta_end: 0.0
   decay_updates: 10000
 ppo:
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
+  replay_log_prob_tolerance: 0.05
+  use_normalized_advantage: false
+  use_clipped_value_loss: true
+  bootstrap_time_limits: false
 ealm:
   enabled: true
-  entropy_low: 0.2
-  entropy_high: 1.2
+  entropy_low: 0.35
+  entropy_high: 0.75
+  entropy_ema_decay: 0.95
   fixed_alpha: 0.5
 loss:
   value_coef: 0.5
@@ -39,7 +50,7 @@ loss:
 collapse_window: 10
 collapse_threshold: 0.95
 curriculum:
-  enabled: true
+  enabled: false
   probability: 0.5
   start_distance: 1.5
   end_distance: 6.0

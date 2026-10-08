@@ -1,0 +1,4 @@
+defaults:
+  - ovsegdt_kda_finetune
+  - _self_
+revision: 7

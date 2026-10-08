@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 @dataclass
 class RewardConfig:
-    success_reward: float = 10.0
-    slack_penalty: float = 0.01
-    progress_scale: float = 1.0
-    collision_penalty: float = 0.0
+    success_reward: float = 5.0
+    slack_penalty: float = 0.001
+    progress_scale: float = 0.0
+    collision_penalty: float = 0.003
     false_stop_penalty: float = 0.0
 
 

@@ -1,0 +1,5 @@
+defaults:
+  - ovsegdt_kda_stable
+  - _self_
+# Numerically identical recipe; reuse rollout vision outputs during replay.
+cache_frozen_vision: true

@@ -13,12 +13,13 @@ def append_json(path, record):
 
 
 class ActionHistogramMetric:
-    def __init__(self, window=10, threshold=0.95):
+    def __init__(self, window=10, threshold=0.95, action_dim=6):
         self.history: deque[torch.Tensor] = deque(maxlen=window)
         self.threshold = threshold
+        self.action_dim = action_dim
 
     def update(self, actions):
-        histogram = torch.bincount(actions.flatten().cpu(), minlength=4).float()
+        histogram = torch.bincount(actions.flatten().cpu(), minlength=self.action_dim).float()
         self.history.append(histogram)
         window = torch.stack(list(self.history)).sum(0)
         proportions = window / window.sum()

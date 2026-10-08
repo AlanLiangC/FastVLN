@@ -20,6 +20,13 @@ def process_alive(pid, marker, parent=None, proc_root=Path("/proc")):
         return False
 
 
+def training_process_alive(pid, parent=None, proc_root=Path("/proc")):
+    return any(
+        process_alive(pid, marker, parent=parent, proc_root=proc_root)
+        for marker in ("streamnav.training.trainer", "tools/check_ovsegdt_training.py")
+    )
+
+
 def current_health(run_dir, *, now=None, stale_seconds=120, proc_root=Path("/proc")):
     path = Path(run_dir) / "health_status.json"
     if not path.exists():
@@ -29,13 +36,10 @@ def current_health(run_dir, *, now=None, stale_seconds=120, proc_root=Path("/pro
     result["checked_at"] = time.time() if now is None else now
     result["snapshot_age_seconds"] = max(0, result["checked_at"] - result.get("time", 0))
     launcher = result.get("training_pid")
-    result["process_alive"] = process_alive(
-        launcher, "streamnav.training.trainer", proc_root=proc_root
-    )
+    result["process_alive"] = training_process_alive(launcher, proc_root=proc_root)
     for worker in result.get("workers", []):
-        worker["alive"] = process_alive(
+        worker["alive"] = training_process_alive(
             worker.get("pid"),
-            "streamnav.training.trainer",
             parent=launcher if worker.get("pid") != launcher else None,
             proc_root=proc_root,
         )

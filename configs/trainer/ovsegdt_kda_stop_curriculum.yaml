@@ -1,0 +1,13 @@
+defaults:
+  - ovsegdt_kda_cached
+  - _self_
+revision: 10
+# Training-only reset distribution; keep upstream equal-weight IL/PPO/EALM.
+# The existing oracle warmup moves physically before the first policy frame.
+# Validation always uses the dataset's original start positions.
+curriculum:
+  enabled: true
+  probability: 0.5
+  start_distance: 0.22
+  end_distance: 1.0
+  duration_updates: 500

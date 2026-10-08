@@ -22,7 +22,7 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         result["stop_recommended"] = True
     greedy = [r["greedy_action_histogram"] for r in recent if "greedy_action_histogram" in r]
     if greedy:
-        means = [statistics.mean(r[a] for r in greedy) for a in range(4)]
+        means = [statistics.mean(r[a] for r in greedy) for a in range(len(greedy[0]))]
         result["greedy_distribution"] = means
         if max(means) >= 0.95:
             result["warnings"].append("deterministic_action_collapse")

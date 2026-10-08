@@ -20,17 +20,20 @@ def test_action_contract():
         ("MOVE_FORWARD", 1),
         ("TURN_LEFT", 2),
         ("TURN_RIGHT", 3),
+        ("LOOK_UP", 4),
+        ("LOOK_DOWN", 5),
     ]
     with pytest.raises(ValueError):
-        NavigationAction(4)
+        NavigationAction(6)
 
 
 def test_actor_critic_distribution():
     head = NavigationActorCritic(16, 8)
     logits, values = head(torch.randn(3, 16))
-    assert logits.shape == (3, 4) and values.shape == (3,)
-    dist = ObjectNavActionDistribution().build(torch.zeros(3, 4))
-    torch.testing.assert_close(dist.entropy(), torch.full((3,), math.log(4)))
+    assert logits.shape == (3, 6) and values.shape == (3,)
+    assert isinstance(head.critic, torch.nn.Linear)
+    dist = ObjectNavActionDistribution().build(torch.zeros(3, 6))
+    torch.testing.assert_close(dist.entropy(), torch.full((3,), math.log(6)))
     with pytest.raises(ValueError):
         ObjectNavActionDistribution().build(torch.zeros(3, 5))
 
@@ -95,22 +98,29 @@ def test_dagger_ppo_uses_executed_behavior_probability():
     assert logits.grad.abs().sum() > 0
 
 
-def test_ealm_entropy_weights_detached_and_monotonic():
+def test_ealm_uses_previous_batch_entropy_ema_and_detaches_weights():
     entropy = torch.tensor([0.0, 0.7, 1.4], requires_grad=True)
     il = torch.ones(3, requires_grad=True)
     rl = torch.zeros(3, requires_grad=True)
-    loss, alpha = EntropyAdaptiveLossMixer()(il, rl, entropy)
-    torch.testing.assert_close(alpha, torch.tensor([0.0, 0.5, 1.0]))
+    mixer = EntropyAdaptiveLossMixer()
+    loss, alpha = mixer(il, rl, entropy)
+    torch.testing.assert_close(alpha, torch.ones(3))
     loss.sum().backward()
     assert entropy.grad is None
+    mixer.observe_entropy(0.55)
+    _, alpha = mixer(il, rl, entropy)
+    torch.testing.assert_close(alpha, torch.full((3,), 0.5))
+    mixer.observe_entropy(0.0)
+    assert mixer.entropy_ema.item() == pytest.approx(0.55 * 0.95)
     fixed, _ = EntropyAdaptiveLossMixer(enabled=False, fixed_alpha=0.25)(il, rl, entropy)
     torch.testing.assert_close(fixed, torch.full((3,), 0.25))
 
 
 def test_reward_success_and_bad_distance():
     reward = ObjectNavReward()
-    assert reward.compute(2, 1, False, False) == pytest.approx(0.99)
-    assert reward.compute(0, 0, True, False, True) == pytest.approx(9.99)
+    assert reward.compute(2, 1, False, False) == pytest.approx(-0.001)
+    assert reward.compute(0, 0, True, False, True) == pytest.approx(4.999)
+    assert reward.compute(2, 1, False, True) == pytest.approx(-0.004)
     with pytest.raises(ValueError):
         reward.compute(float("inf"), 0, False, False)
 

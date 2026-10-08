@@ -1,0 +1,5 @@
+defaults:
+  - qwen35_0p8b_kda_goal
+  - _self_
+# Match KDA's per-value-head RMS normalization before the sigmoid output gate.
+kda_output_norm: true

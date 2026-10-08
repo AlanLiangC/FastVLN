@@ -55,3 +55,14 @@ def test_stale_monitor_and_wrong_worker_parent(tmp_path):
     assert current_health(run, now=1201, proc_root=proc)["status"] == "monitor_unavailable"
     fake_process(proc, 11, "streamnav.training.trainer", parent=99)
     assert current_health(run, now=1050, proc_root=proc)["status"] == "needs_review"
+
+
+def test_checked_trainer_is_monitored_with_parent_identity(tmp_path):
+    run = status(tmp_path)
+    proc = tmp_path / "proc"
+    fake_process(proc, 10, "torch.distributed.run tools/check_ovsegdt_training.py")
+    fake_process(proc, 11, "tools/check_ovsegdt_training.py", parent=10)
+    fake_process(proc, 12, "tools/monitor_training.py")
+    assert current_health(run, now=1050, proc_root=proc)["status"] == "training"
+    fake_process(proc, 11, "tools/check_ovsegdt_training.py", parent=99)
+    assert current_health(run, now=1050, proc_root=proc)["status"] == "needs_review"

@@ -43,7 +43,7 @@ class DemoReset(BaseModel):
 
 
 class DemoStep(BaseModel):
-    action: int | None = Field(default=None, ge=0, le=3)
+    action: int | None = Field(default=None, ge=0, le=5)
 
 
 def decode_rgb(encoded):
@@ -116,6 +116,7 @@ def create_app(policy, config):
             "splits": [Path(p).stem for p in config["eval"]["manifests"]],
             "demo_episode_count": serving.get("demo_episodes", 48),
             "demo_selection": "scene_stratified",
+            "inference_mode": config.get("model", {}).get("inference_mode", "auto"),
             "parameter_dtype": str(
                 getattr(
                     getattr(getattr(manager.policy, "backbone", None), "nav_token", None),

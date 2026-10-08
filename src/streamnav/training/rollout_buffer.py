@@ -30,6 +30,8 @@ class RecurrentRolloutBuffer:
         self.old_policy_log_probs = torch.empty_like(self.rewards)
         self.old_values = torch.empty_like(self.rewards)
         self.entropies = torch.empty_like(self.rewards)
+        self.stop_probabilities = torch.empty_like(self.rewards)
+        self.visual_embeddings = None
         self.timeout_bootstrap = torch.zeros_like(self.rewards)
         self.initial_states = {}
         self.resets = {}

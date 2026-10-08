@@ -11,7 +11,7 @@ import yaml
 from omegaconf import OmegaConf
 
 from streamnav.data.manifest import check_leakage, verify_manifest
-from streamnav.data.mixture import make_source
+from streamnav.data.mixture import make_source, partition_scenes
 from streamnav.data.schema import read_json
 from streamnav.envs.habitat_client import VectorHabitatEnvs
 from streamnav.evaluation.runner import evaluate
@@ -26,8 +26,8 @@ from streamnav.training.checkpoint import (
 from streamnav.training.dagger import DaggerBetaScheduler, behavior_log_prob
 from streamnav.training.ealm import EntropyAdaptiveLossMixer
 from streamnav.training.gae import compute_gae
-from streamnav.training.optimizer import build_optimizer, gradient_norm
-from streamnav.training.ppo import clipped_ppo_loss
+from streamnav.training.optimizer import OVSegDTLRScheduler, build_optimizer, gradient_norm
+from streamnav.training.ppo import clipped_ppo_loss, ovsegdt_value_loss, replay_consistency_metrics
 from streamnav.training.rollout import RolloutCollector, SequenceReplay
 from streamnav.utils.logging import ActionHistogramMetric, append_json
 from streamnav.utils.seed import rng_state, seed_everything
@@ -77,15 +77,15 @@ class EndToEndObjectNavTrainer:
         self.dtype = getattr(torch, config["model"]["dtype"])
         self.optimizer = build_optimizer(self.policy, self.cfg)
         seed_everything(config["seed"] + parallel.rank() * 1000003)
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lambda step: max(0.1, 1 - step / self.cfg["num_updates"])
-        )
+        self.scheduler = OVSegDTLRScheduler(self.optimizer, self.cfg)
         self.dagger = DaggerBetaScheduler(**self.cfg["dagger"])
         self.mixer = EntropyAdaptiveLossMixer(**self.cfg["ealm"])
         self.sources = [
             make_source(config["data"], config["seed"] + i * 1009 + parallel.rank() * 1000003)
             for i in range(self.cfg["num_envs"])
         ]
+        if config["data"].get("iterator_options") is not None:
+            partition_scenes(self.sources, config["seed"] + parallel.rank() * 1000003)
         if config.get("checkpoint"):
             self.update_index = restore_training(
                 config["checkpoint"],
@@ -94,24 +94,23 @@ class EndToEndObjectNavTrainer:
                 self.dagger,
                 self.sources,
                 config,
+                mixer=self.mixer,
             )
         self.replay: torch.nn.Module = SequenceReplay(self.policy)
         self.ddp = (
             parallel.world_size() > 1
             and config.get("distributed", {}).get("gradient_sync", "ddp") == "ddp"
         )
-        if self.ddp:
-            self.replay = torch.nn.parallel.DistributedDataParallel(
-                self.replay,
-                device_ids=[self.device.index],
-                broadcast_buffers=False,
-                gradient_as_bucket_view=True,
-                find_unused_parameters=True,
-            )
+        self._configure_replay()
         self.histogram = ActionHistogramMetric(
-            self.cfg["collapse_window"], self.cfg["collapse_threshold"]
+            self.cfg["collapse_window"],
+            self.cfg["collapse_threshold"],
+            config["model"]["action_dim"],
         )
-        self.envs = VectorHabitatEnvs(config["habitat"], self.cfg["num_envs"])
+        self.envs = VectorHabitatEnvs(
+            {**config["habitat"], "seed": config["seed"] + parallel.rank() * 1000003},
+            self.cfg["num_envs"],
+        )
         self.collector = RolloutCollector(self.policy, self.envs, self.sources, self.cfg)
         workers = parallel.gather(
             {
@@ -123,6 +122,19 @@ class EndToEndObjectNavTrainer:
         )
         if parallel.rank() == 0:
             (self.run_dir / "training_workers.json").write_text(json.dumps(workers, indent=2))
+
+    def _configure_replay(self):
+        # Rebuild after PIRLNav's first update unfreezes actor/backbone, so DDP
+        # registers all newly trainable parameters, not just the initial critic.
+        self.replay = SequenceReplay(self.policy)
+        if self.ddp:
+            self.replay = torch.nn.parallel.DistributedDataParallel(
+                self.replay,
+                device_ids=[self.device.index],
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+                find_unused_parameters=True,
+            )
 
     def autocast(self):
         return torch.autocast(
@@ -142,9 +154,10 @@ class EndToEndObjectNavTrainer:
         il_loss = F.cross_entropy(logits.flatten(0, 1), expert.flatten(), reduction="none").view_as(
             expert
         )
-        class_weights = logits.new_tensor(self.cfg.get("il_class_weights", [1.0] * 4))
-        if class_weights.shape != (4,) or not bool((class_weights > 0).all()):
-            raise ValueError("Four positive IL class weights are required")
+        action_dim = logits.shape[-1]
+        class_weights = logits.new_tensor(self.cfg.get("il_class_weights", [1.0] * action_dim))
+        if class_weights.shape != (action_dim,) or not bool((class_weights > 0).all()):
+            raise ValueError("One positive IL class weight per action is required")
         weights = class_weights[expert]
         weighted_il = il_loss * weights / parallel.average_scalar(weights.mean())
         new_log_prob = behavior_log_prob(logits, actions, expert, buffer.beta)
@@ -155,7 +168,13 @@ class EndToEndObjectNavTrainer:
             self.cfg["ppo"]["clip_eps"],
         )
         policy_loss, alpha = self.mixer(weighted_il, ppo_loss, entropy)
-        value_loss = 0.5 * (values - buffer.gather("returns", sequences, self.device)).square()
+        value_loss = ovsegdt_value_loss(
+            values,
+            buffer.gather("old_values", sequences, self.device),
+            buffer.gather("returns", sequences, self.device),
+            self.cfg["ppo"]["clip_eps"],
+            self.cfg["ppo"].get("use_clipped_value_loss", True),
+        )
         total = (
             policy_loss.mean()
             + self.cfg["loss"]["value_coef"] * value_loss.mean()
@@ -173,6 +192,9 @@ class EndToEndObjectNavTrainer:
             .float()
             .mean()
             .item(),
+            **replay_consistency_metrics(
+                new_log_prob, buffer.gather("old_log_probs", sequences, self.device)
+            ),
         }
         return total, metrics
 
@@ -187,9 +209,14 @@ class EndToEndObjectNavTrainer:
             cfg["ppo"]["gae_lambda"],
             buffer.timeout_bootstrap,
         )
-        buffer.advantages = parallel.normalize_advantages(advantages, self.device)
+        buffer.advantages = (
+            parallel.normalize_advantages(advantages, self.device)
+            if cfg["ppo"].get("use_normalized_advantage", False)
+            else advantages
+        )
         self.policy.train()
-        all_metrics = []
+        all_metrics: list[dict[str, float]] = []
+        replay_check = {}
         start = time.monotonic()
         for _ in range(cfg["update_epochs"]):
             for sequences in buffer.sequence_batches(cfg["sequence_batch_size"]):
@@ -197,6 +224,23 @@ class EndToEndObjectNavTrainer:
                 with self.autocast():
                     logits, values = self.replay(buffer, sequences)
                     loss, metrics = self.compute_losses(logits, values, buffer, sequences)
+                if not all_metrics:
+                    # Before the first optimizer step, the behavior probabilities
+                    # must match collection. Kernel/precision drift is not PPO
+                    # learning and must never be hidden by clipping the ratio.
+                    replay_check = {
+                        "preupdate_" + key: value
+                        for key, value in metrics.items()
+                        if key.startswith("replay_") or key == "clip_fraction"
+                    }
+                    tolerance = cfg["ppo"].get("replay_log_prob_tolerance", 0.05)
+                    error = metrics["replay_log_prob_error_max"]
+                    if parallel.any_rank(error > tolerance, self.device):
+                        raise RuntimeError(
+                            "Rollout/replay probabilities differ before any optimizer step "
+                            f"(local max log-prob error={error:.6f}, tolerance={tolerance}). "
+                            "Use matching recurrence kernels and precision; checkpoint not updated."
+                        )
                 if parallel.any_rank(not bool(torch.isfinite(loss)), self.device):
                     raise FloatingPointError("Nonfinite loss; refusing to update checkpoint")
                 loss.backward()
@@ -224,8 +268,11 @@ class EndToEndObjectNavTrainer:
                 )
                 metrics["grad_norm"] = norm.item()
                 self.optimizer.step()
+                self.mixer.observe_entropy(metrics["entropy"])
                 all_metrics.append(metrics)
         metrics = {k: sum(m[k] for m in all_metrics) / len(all_metrics) for k in all_metrics[0]}
+        metrics.update(replay_check)
+        metrics["entropy_ema"] = self.mixer.entropy_ema.item()
         metrics["optimization_seconds"] = time.monotonic() - start
         metrics["training_fps"] = (
             buffer.steps * buffer.num_envs * cfg["update_epochs"] / metrics["optimization_seconds"]
@@ -250,7 +297,11 @@ class EndToEndObjectNavTrainer:
 
     def save_checkpoint(self):
         states = parallel.gather(
-            {"rng": rng_state(), "sources": [s.state_dict() for s in self.sources]}
+            {
+                "rng": rng_state(),
+                "sources": [s.state_dict() for s in self.sources],
+                "mixer": self.mixer.state_dict(),
+            }
         )
         result = None
         if parallel.rank() == 0:
@@ -283,16 +334,28 @@ class EndToEndObjectNavTrainer:
                 metrics = self.update(buffer)
                 self.update_index += 1
                 self.scheduler.step()
+                if self.update_index == self.cfg.get("actor_warmup_updates", 0):
+                    self._configure_replay()
                 self.dagger.step()
                 histogram, collapsed = self.histogram.update(buffer.greedy_actions)
-                sampled_hist = torch.bincount(buffer.actions.flatten(), minlength=4).float()
-                expert_hist = torch.bincount(buffer.expert_actions.flatten(), minlength=4).float()
+                action_dim = self.config["model"]["action_dim"]
+                sampled_hist = torch.bincount(
+                    buffer.actions.flatten(), minlength=action_dim
+                ).float()
+                expert_hist = torch.bincount(
+                    buffer.expert_actions.flatten(), minlength=action_dim
+                ).float()
                 matches = buffer.greedy_actions == buffer.expert_actions
+                confusion = torch.bincount(
+                    (buffer.expert_actions * action_dim + buffer.greedy_actions).flatten(),
+                    minlength=action_dim * action_dim,
+                ).view(action_dim, action_dim)
+                stop_labels = buffer.expert_actions == 0
                 recalls = [
                     matches[buffer.expert_actions == a].float().mean().item()
                     if (buffer.expert_actions == a).any()
                     else None
-                    for a in range(4)
+                    for a in range(action_dim)
                 ]
                 prior = expert_hist / expert_hist.sum()
                 prior_ce = -(prior * prior.clamp_min(1e-8).log()).sum().item()
@@ -306,11 +369,27 @@ class EndToEndObjectNavTrainer:
                         "greedy_action_histogram": histogram,
                         "greedy_oracle_accuracy": matches.float().mean().item(),
                         "oracle_class_recall": recalls,
+                        "expert_action_counts": expert_hist.long().tolist(),
+                        "greedy_action_confusion": confusion.tolist(),
+                        "stop_probability_on_teacher_stop": buffer.stop_probabilities[stop_labels]
+                        .mean()
+                        .item()
+                        if stop_labels.any()
+                        else None,
+                        "stop_probability_on_teacher_nonstop": buffer.stop_probabilities[
+                            ~stop_labels
+                        ]
+                        .mean()
+                        .item()
+                        if (~stop_labels).any()
+                        else None,
                         "oracle_prior_cross_entropy": prior_ce,
                         "il_gain_over_prior": prior_ce - metrics["il_loss"],
                         "curriculum_warmup_steps": buffer.curriculum_warmup_steps,
                         "curriculum_fallbacks": buffer.curriculum_fallbacks,
-                        "rollout_behavior": "dagger_mixture_not_autonomous_evaluation",
+                        "rollout_behavior": "policy_on_policy_expert_labels_only"
+                        if buffer.beta == 0
+                        else "dagger_mixture_not_autonomous_evaluation",
                         "success": sum(m["success"] for m in buffer.episode_metrics)
                         / max(len(buffer.episode_metrics), 1),
                         "spl": sum(m["spl"] for m in buffer.episode_metrics)

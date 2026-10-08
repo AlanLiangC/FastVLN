@@ -24,6 +24,8 @@ class DaggerBetaScheduler:
 
 
 def select_env_action(policy_action, expert_action, beta, generator=None):
+    if beta == 0:
+        return policy_action, torch.zeros_like(policy_action, dtype=torch.bool)
     use_expert = (
         torch.rand(policy_action.shape, device=policy_action.device, generator=generator) < beta
     )
@@ -39,5 +41,7 @@ def behavior_log_prob(logits, executed_actions, expert_actions, beta):
     log_pi = (
         logits.float().log_softmax(-1).gather(-1, executed_actions.long().unsqueeze(-1)).squeeze(-1)
     )
+    if beta == 0:
+        return log_pi
     probability = (1.0 - beta) * log_pi.exp() + beta * (executed_actions == expert_actions).float()
     return probability.clamp_min(torch.finfo(torch.float32).tiny).log()

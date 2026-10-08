@@ -1,0 +1,3 @@
+[submodule "third_party/OVSegDT"]
+        path = third_party/OVSegDT
+        url = https://github.com/CognitiveAISystems/OVSegDT.git
