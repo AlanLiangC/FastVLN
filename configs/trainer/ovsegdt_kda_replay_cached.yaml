@@ -1,0 +1,5 @@
+defaults:
+  - ovsegdt_kda_cached
+  - _self_
+# Same objective/weights; share differentiable token lookups within each replay.
+cache_replay_embeddings: true

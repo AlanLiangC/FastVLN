@@ -57,15 +57,18 @@ def average_scalar(value):
     return result
 
 
-def normalize_advantages(values, device):
+def normalize_advantages(values, device, mask=None):
+    eligible = values if mask is None else values[mask]
     stats = torch.stack(
-        (values.sum(), values.square().sum(), values.new_tensor(values.numel()))
+        (eligible.sum(), eligible.square().sum(), values.new_tensor(eligible.numel()))
     ).to(device)
     if world_size() > 1:
         dist.all_reduce(stats)
-    mean = stats[0] / stats[2]
-    std = (stats[1] / stats[2] - mean.square()).clamp_min(0).sqrt().clamp_min(1e-8)
-    return (values - mean.cpu()) / std.cpu()
+    count = stats[2].clamp_min(1)
+    mean = stats[0] / count
+    std = (stats[1] / count - mean.square()).clamp_min(0).sqrt().clamp_min(1e-8)
+    normalized = (values - mean.cpu()) / std.cpu()
+    return normalized if mask is None else torch.where(mask, normalized, 0)
 
 
 def average_gradients(parameters):
@@ -103,8 +106,17 @@ def combine_metrics(rows):
     count_fields = {
         "episodes_completed",
         "oracle_skipped_episodes",
+        "invalid_forward_labels_filtered",
+        "oracle_navigation_repairs",
         "curriculum_warmup_steps",
         "curriculum_fallbacks",
+        "auxiliary_episodes_completed",
+        "auxiliary_expert_steps",
+        "auxiliary_recovery_triggers",
+        "on_policy_transitions",
+        "auxiliary_il_transitions",
+        "teacher_stop_count_on_policy",
+        "teacher_stop_count_auxiliary",
     }
     for key, value in result.items():
         if key in {"stop_probability_on_teacher_stop", "stop_probability_on_teacher_nonstop"}:
@@ -123,6 +135,8 @@ def combine_metrics(rows):
                 "reset_seconds",
                 "gpu_memory_bytes",
                 "preupdate_replay_log_prob_error_max",
+                "preupdate_replay_initial_error_max",
+                "replay_preflight_seconds",
             }:
                 result[key] = max(r[key] for r in rows)
             elif key != "update":
@@ -132,6 +146,11 @@ def combine_metrics(rows):
     completed = sum(r["episodes_completed"] for r in rows)
     for key in ("success", "spl"):
         result[key] = sum(r[key] * r["episodes_completed"] for r in rows) / max(completed, 1)
+    if "auxiliary_success" in result:
+        count = sum(r["auxiliary_episodes_completed"] for r in rows)
+        result["auxiliary_success"] = sum(
+            r["auxiliary_success"] * r["auxiliary_episodes_completed"] for r in rows
+        ) / max(count, 1)
     result["oracle_class_recall"] = []
     for action in range(len(result["expert_action_histogram"])):
         weight = sum(r["expert_action_histogram"][action] for r in rows)

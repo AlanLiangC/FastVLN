@@ -17,6 +17,7 @@ actor_warmup_updates: 1
 weight_decay: 0.0
 fused_optimizer: true
 cache_frozen_vision: false
+cache_replay_embeddings: false
 max_grad_norm: 0.2
 checkpoint_interval: 25
 keep_checkpoints: 3

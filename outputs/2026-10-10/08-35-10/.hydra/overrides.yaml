@@ -1,0 +1,9 @@
+- device=cuda:7
+- habitat.gpu_device_id=7
+- run_dir=runtime/reports/pointing_eval_smoke_20261010
+- eval.episodes=2
+- eval.max_steps=6
+- eval.num_envs=1
+- eval.video=true
+- eval.video_episodes=2
+- eval.video_selection=first

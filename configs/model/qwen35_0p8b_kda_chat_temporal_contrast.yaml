@@ -1,0 +1,6 @@
+defaults:
+  - qwen35_0p8b_kda_chat_calibrated
+  - _self_
+# Six converted mixers adapted to native Qwen RGB/text responses at 1/4/16 frames.
+# No action/semantic labels or navigation optimizer are included in initialization.
+checkpoint: checkpoints/qwen35_0p8b_kda_temporal_contrast_20261008

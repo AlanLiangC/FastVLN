@@ -1,0 +1,5 @@
+defaults:
+  - ovsegdt_kda_chat_calibrated
+  - _self_
+# Matched navigation recipe; independently tracked initialization experiment.
+revision: 12

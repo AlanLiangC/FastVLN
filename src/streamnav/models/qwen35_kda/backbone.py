@@ -1,5 +1,5 @@
 import json
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -25,8 +25,10 @@ class RecurrentDecoderLayer(nn.Module):
             else StreamingGatedDeltaNet(layer.linear_attn)
         )
 
-    def forward(self, x, conv, recurrent, mode="auto"):
-        y, state = self.mixer(self.input_layernorm(x), LayerState(conv, recurrent), mode)
+    def forward(self, x, conv, recurrent, mode="auto", cu=None, cu_cpu=None, lengths=None):
+        y, state = self.mixer(
+            self.input_layernorm(x), LayerState(conv, recurrent), mode, cu, cu_cpu, lengths
+        )
         x = x + y
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x, state.conv, state.recurrent
@@ -59,38 +61,63 @@ class Qwen35KDABackbone(nn.Module):
         if inference_mode not in ("auto", "chunk", "recurrent"):
             raise ValueError("inference_mode must be auto, chunk or recurrent")
         self.inference_mode = inference_mode
-        if goal_conditioning not in ("episode", "nav_query"):
-            raise ValueError("goal_conditioning must be episode or nav_query")
+        if goal_conditioning not in ("episode", "nav_query", "chat_query"):
+            raise ValueError("goal_conditioning must be episode, nav_query or chat_query")
         self.goal_conditioning = goal_conditioning
         self._goal_ids_cache: dict[str, tuple[int, ...]] = {}
+        self._chat_ids_cache: dict[str, tuple[tuple[int, ...], ...]] = {}
+        self._assistant_close_ids: tuple[int, ...] | None = None
+        self._replay_embeddings: dict[tuple[int, ...], torch.Tensor] | None = None
         hidden = self.config.text_config.hidden_size
-        self.nav_token = nn.Parameter(torch.empty(1, 1, hidden))
+        # Retain checkpoint compatibility; chat_query reads the assistant prefix.
+        self.nav_token = nn.Parameter(
+            torch.empty(1, 1, hidden), requires_grad=goal_conditioning != "chat_query"
+        )
         nn.init.normal_(self.nav_token, std=0.02)
 
     @property
     def device(self):
         return self.nav_token.device
 
-    def recurrent_forward(self, tokens, cache=None, mode="auto"):
+    def recurrent_forward(self, tokens, cache=None, mode="auto", lengths=None):
         if mode == "auto" and not torch.is_grad_enabled():
             mode = self.inference_mode
         if cache is None:
             cache = tuple(LayerState(None, None) for _ in self.layers)
         if len(cache) != len(self.layers):
             raise KDACompatibilityError("Cache depth differs from converted model")
+        cu, cu_cpu = None, None
+        if lengths is not None:
+            if tokens.shape[0] != 1 or sum(lengths) != tokens.shape[1] or min(lengths) < 1:
+                raise ValueError("Variable chat batches require positive lengths and flat tokens")
+            cu_cpu = torch.tensor([0, *lengths], dtype=torch.int32).cumsum(0).to(torch.int32)
+            cu = cu_cpu.to(tokens.device)
         x = tokens
         updated = []
         for layer, state in zip(self.layers, cache, strict=True):
             if self.gradient_checkpointing and torch.is_grad_enabled():
                 x, conv, recurrent = checkpoint(
-                    layer, x, state.conv, state.recurrent, mode, use_reentrant=False
+                    layer,
+                    x,
+                    state.conv,
+                    state.recurrent,
+                    mode,
+                    cu,
+                    cu_cpu,
+                    lengths,
+                    use_reentrant=False,
                 )
             else:
-                x, conv, recurrent = layer(x, state.conv, state.recurrent, mode)
+                x, conv, recurrent = layer(
+                    x, state.conv, state.recurrent, mode, cu, cu_cpu, lengths
+                )
             updated.append(LayerState(conv, recurrent))
         return self.norm(x), tuple(updated)
 
     def prefill(self, instruction):
+        if self.goal_conditioning == "chat_query":
+            system, _, _ = self.chat_token_ids(instruction)
+            return self.recurrent_forward(self.token_embeddings(system).unsqueeze(0))[1]
         prompt = self.tokenizer.apply_chat_template(
             [
                 {
@@ -106,6 +133,42 @@ class Qwen35KDABackbone(nn.Module):
         ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
         return self.recurrent_forward(self.embeddings(ids))[1]
 
+    def chat_token_ids(self, instruction):
+        """Split the official multimodal chat without padding or GPU ID caches."""
+        cached = self._chat_ids_cache.get(instruction)
+        if cached is None:
+            self.goal_token_ids(instruction)  # Reject empty goals consistently.
+            prompt = self.tokenizer.apply_chat_template(
+                [
+                    {
+                        "role": "system",
+                        "content": "You are a fast object navigation policy. Navigate to the requested object.",
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "image"}, {"type": "text", "text": instruction}],
+                    },
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            ids = tuple(self.tokenizer(prompt, add_special_tokens=False).input_ids)
+            positions = [i for i, token in enumerate(ids) if token == self.config.image_token_id]
+            if len(positions) != 1:
+                raise ValueError("Chat frame must contain exactly one image placeholder")
+            image = positions[0]
+            message_start = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+            starts = [i for i, token in enumerate(ids[:image]) if token == message_start]
+            if len(starts) != 2:
+                raise ValueError("Chat frame must begin with a system message and a user message")
+            user = starts[1]
+            cached = (ids[:user], ids[user:image], ids[image + 1 :])
+            if len(self._chat_ids_cache) >= 256:
+                self._chat_ids_cache.pop(next(iter(self._chat_ids_cache)))
+            self._chat_ids_cache[instruction] = cached
+        return cached
+
     def goal_token_ids(self, instruction):
         ids = self._goal_ids_cache.get(instruction)
         if ids is None:
@@ -117,6 +180,29 @@ class Qwen35KDABackbone(nn.Module):
             self._goal_ids_cache[instruction] = ids
         return ids
 
+    @contextmanager
+    def reuse_token_embeddings(self):
+        """Share differentiable lookups during exactly one replay forward.
+
+        Weights cannot change within that forward. Clearing on exit lets every
+        subsequent minibatch read new weights and build a new autograd graph.
+        """
+        if self._replay_embeddings is not None:
+            raise RuntimeError("Token embedding reuse contexts cannot be nested")
+        self._replay_embeddings = {}
+        try:
+            yield
+        finally:
+            self._replay_embeddings = None
+
+    def token_embeddings(self, ids):
+        cache = self._replay_embeddings
+        if cache is None:
+            return self.embeddings(torch.tensor(ids, device=self.device))
+        if ids not in cache:
+            cache[ids] = self.embeddings(torch.tensor(ids, device=self.device))
+        return cache[ids]
+
     def encode_vision(self, rgb):
         pixels, grid = patchify(rgb.to(self.device), self.image_size)
         visual = self.vision(pixels.to(self.nav_token.dtype), grid_thw=grid).pooler_output
@@ -126,13 +212,16 @@ class Qwen35KDABackbone(nn.Module):
         return self.encode_visual_tokens(self.encode_vision(rgb), instructions)
 
     def encode_visual_tokens(self, visual, instructions=None):
+        if self.goal_conditioning == "chat_query":
+            raise ValueError(
+                "chat_query frames require encode_chat_visual_tokens and episode state"
+            )
         if visual.ndim != 3 or visual.shape[-1] != self.config.text_config.hidden_size:
             raise ValueError("Visual embeddings must be batch x tokens x hidden_size")
         # Explicit NAV readout token; image boundary embeddings preserve pretrained conventions.
-        special_ids = torch.tensor(
-            [self.config.vision_start_token_id, self.config.vision_end_token_id], device=self.device
+        markers = self.token_embeddings(
+            (self.config.vision_start_token_id, self.config.vision_end_token_id)
         )
-        markers = self.embeddings(special_ids)
         b = visual.shape[0]
         query = self.nav_token.expand(b, -1, -1)
         if self.goal_conditioning == "nav_query":
@@ -145,9 +234,7 @@ class Qwen35KDABackbone(nn.Module):
             # Cache only immutable CPU token IDs. Embeddings must be read anew
             # on every forward so optimizer updates and autograd remain valid.
             ids = [self.goal_token_ids(instruction) for instruction in instructions]
-            goals = torch.stack(
-                [self.embeddings(torch.tensor(row, device=self.device)).mean(0) for row in ids]
-            )
+            goals = torch.stack([self.token_embeddings(row).mean(0) for row in ids])
             query = query + goals[:, None, :]
         return torch.cat(
             (
@@ -158,6 +245,28 @@ class Qwen35KDABackbone(nn.Module):
             ),
             dim=1,
         )
+
+    def encode_chat_visual_tokens(self, visual, instructions, first_frames):
+        if visual.ndim != 3 or visual.shape[-1] != self.config.text_config.hidden_size:
+            raise ValueError("Visual embeddings must be batch x tokens x hidden_size")
+        if len(instructions) != visual.shape[0] or len(first_frames) != visual.shape[0]:
+            raise ValueError("chat_query requires one goal and episode position per frame")
+        # The previous readout is an empty assistant turn, with no action text.
+        # Close it before the next user observation. First frames follow the
+        # system prefill directly and match the single-frame diagnostic prompt.
+        if self._assistant_close_ids is None:
+            self._assistant_close_ids = tuple(
+                self.tokenizer("<|im_end|>\n", add_special_tokens=False).input_ids
+            )
+        close = self._assistant_close_ids
+        sequences = []
+        for frame, instruction, first in zip(visual, instructions, first_frames, strict=True):
+            _, before, after = self.chat_token_ids(instruction)
+            prefix = before if first else close + before
+            sequences.append(
+                torch.cat((self.token_embeddings(prefix), frame, self.token_embeddings(after)))
+            )
+        return sequences
 
     @classmethod
     def from_converted(cls, path, device="cuda:0", dtype=torch.bfloat16, **kwargs):

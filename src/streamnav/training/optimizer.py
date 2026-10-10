@@ -1,4 +1,14 @@
+import math
+
 import torch
+
+
+def optimizer_epsilon(config, role):
+    value = config.get("backbone_optimizer_eps") if role == "backbone" else None
+    value = config.get("optimizer_eps", 1e-5) if value is None else value
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Adam epsilon must be finite and positive")
+    return value
 
 
 def build_optimizer(policy, config):
@@ -16,31 +26,41 @@ def build_optimizer(policy, config):
     optimizer_type = (
         torch.optim.Adam if config.get("optimizer", "adam") == "adam" else torch.optim.AdamW
     )
+    groups = [
+        {
+            "params": policy.actor_critic.critic.parameters(),
+            "lr": config.get("critic_lr", config["head_lr"]),
+            "role": "critic",
+        },
+        {
+            "params": backbone,
+            "lr": 0.0 if initial_freeze else config["backbone_lr"],
+            "role": "backbone",
+            "eps": optimizer_epsilon(config, "backbone"),
+        },
+        {
+            "params": policy.actor_critic.actor.parameters(),
+            "lr": 0.0 if initial_freeze else config["head_lr"],
+            "role": "actor",
+        },
+        {
+            "params": vision,
+            "lr": config.get("vision_lr", config["backbone_lr"]),
+            "role": "vision",
+        },
+    ]
+    if getattr(policy, "perception", None) is not None:
+        groups.append(
+            {
+                "params": policy.perception.parameters(),
+                "lr": config.get("perception_lr", config["head_lr"]),
+                "role": "perception",
+            }
+        )
     return optimizer_type(
-        [
-            {
-                "params": policy.actor_critic.critic.parameters(),
-                "lr": config.get("critic_lr", config["head_lr"]),
-                "role": "critic",
-            },
-            {
-                "params": backbone,
-                "lr": 0.0 if initial_freeze else config["backbone_lr"],
-                "role": "backbone",
-            },
-            {
-                "params": policy.actor_critic.actor.parameters(),
-                "lr": 0.0 if initial_freeze else config["head_lr"],
-                "role": "actor",
-            },
-            {
-                "params": vision,
-                "lr": config.get("vision_lr", config["backbone_lr"]),
-                "role": "vision",
-            },
-        ],
+        groups,
         weight_decay=config["weight_decay"],
-        eps=config.get("optimizer_eps", 1e-5),
+        eps=optimizer_epsilon(config, "actor"),
         fused=config.get("fused_optimizer", True) and backbone[0].is_cuda,
     )
 

@@ -1,61 +1,68 @@
 # 架构与状态约定
 
-本文描述 [revision 5](current_version.md)。策略输入固定为 RGB＋目标文本，使用六动作输出，不读取语义 mask、GPS/compass 或上一动作，不使用 semantic loss。
+当前模型为 KDA-converted Qwen3.5-0.8B，策略输入只有 RGB＋目标文本，输出六动作；semantic mask、GPS/compass、上一动作及教师信息不进入策略。任务与固定节点见 [当前版本](current_version.md)。
 
-## 模型与数据流
+代码支持可选的双通道 pointing 与到达监督：感知预测参与六动作 logits 的修正，保持同一流式主干和输入约定。固定节点保留无感知分支的实现，感知配置及弱标签限制见 [轻量感知监督](perception.md)。
 
-Qwen3.5-0.8B 的 6 个 full-attention 层转换为 KDA，18 个 Gated DeltaNet 保留。转换独立于导航训练；新增 KDA gate 未额外蒸馏，转换前后不保证数值等价。视觉编码器在当前导航配方中冻结。
+## 流式模型
+
+Qwen 的六个 full-attention 层（3/7/11/15/19/23）转换为 KDA，18 个 Gated DeltaNet 保留。转换后的 KDA 使用输出 RMS normalization。导航初始化只额外适配六层 KDA mixer 的 60 个张量，以原生 Qwen 的 RGB／文本时序特征及换目标／换图差异为监督；这部分不使用动作或 semantic 标签。转换不保证与原生 Qwen 等价。
 
 ```mermaid
 flowchart LR
-    I[目标文本] --> P[Episode 起点预填]
-    P --> C[固定大小递归状态]
-    R[当前 RGB] --> V[冻结的 Qwen 视觉编码器]
-    V --> K[KDA 与原生 GDN]
+    S[Episode 起点 system 预填] --> C[固定大小递归状态]
+    R[当前 RGB] --> V[冻结视觉编码器]
+    V --> K[KDA 与 GDN 语言主干]
+    G[目标文本与对话前缀] --> K
     C --> K
     K --> C
-    K --> N[NAV token]
-    N --> A[六动作 actor]
-    N --> B[线性 critic]
-    A --> E[Habitat 进程]
+    K --> H[Assistant 前缀 hidden]
+    H --> A[六动作 actor]
+    H --> P[可选点位与到达预测]
+    P --> A
+    H --> B[线性 critic]
+    A --> E[Habitat]
     E --> R
-    E --> O[教师标签与环境奖励]
-    O --> T[IL + PPO + value + entropy]
-    T --> K
+    E --> T[教师标签与奖励]
+    T --> L[IL / PPO / value / entropy]
+    L --> K
+    L --> P
 ```
 
-RGB 为 uint8 HWC/BHWC，传感器输出 480×270（宽×高），HFOV 120°。上下各补 9 行到 480×288，执行 mean/std=0.5 normalization、temporal repeat 和 spatial merge ordering，得到 135 个视觉 token。非目标尺寸的服务输入等比 letterbox，不裁剪或拉伸；当前默认路径使用上述长宽配置。
+Episode 起点预填 system。每帧使用官方 `user(image + goal)` 消息和关闭 thinking 的 assistant 前缀，读取最后 token 的 hidden，送入 actor 与线性 critic。后续帧关闭上一空 assistant 消息后继续输入，不生成文本，不把上一动作写进消息。旧 NAV 参数仅用于兼容其他配置，当前读出路径不使用且不训练。
 
-视觉 token 前后添加图像边界 embeddings，最后追加可学习 NAV token。actor 和线性 critic 共用 NAV hidden state。动作顺序为 STOP、MOVE_FORWARD、TURN_LEFT、TURN_RIGHT、LOOK_UP、LOOK_DOWN，ID 为 0–5。动作几何和机体参数以 [主配置](../configs/config.yaml) 为准。
+RGB 是 uint8 HWC/BHWC，传感器输出 480×270，HFOV 120°。上下各补 9 行到 480×288，执行 mean/std=0.5 normalization、temporal repeat 和 spatial merge ordering，得到 135 个视觉 token。服务端其他尺寸使用等比 letterbox。
 
-`LayerState` 为 functional `(conv, recurrent)` tensor 对。KDA 不保留增长的 KV history；GDN 保留长度 3 的卷积历史与矩阵状态。当前配置的单环境状态实测为 32,120,832 bytes，大小不随 episode 步数增加。clone/detach 创建独立 storage，重放不能原地修改 rollout snapshot。
+## 递归状态与梯度
 
-目标在 episode 起点预填，重置或换目标时清空状态并重新预填。训练在完整 100 步序列内保留梯度，序列起点 detach；episode 边界应用新目标状态。采样和重放使用相同 recurrence 路径与 batch 宽度，并在更新前检查 log-prob 一致性。
+`LayerState` 是 functional `(conv, recurrent)` tensor 对。KDA 不保存增长的 KV history；GDN 保存卷积历史和矩阵状态。当前单环境状态为 32,120,832 bytes，大小不随 episode 步数增长。clone/detach 创建独立 storage，重放不能原地修改 rollout snapshot。
 
-revision 6 起的诊断配置（当前 `qwen35_0p8b_kda_stable`） 另外将每个目标文本的 token embeddings 独立取均值，加到每步的 NAV query。这样序列起点 detach 后，当前动作仍有显式目标输入及其 embedding 梯度；每步 token 数和递归状态大小保持原值。episode 预填仍执行。revision 5 checkpoint 保持原路径；具体实验差异和证据见训练文档。
+重置 episode 或更换目标时清空状态并重新预填。训练在完整 100 步序列内保留梯度，序列起点 detach；这截断反向传播，不清空模型历史状态。Episode 边界应用新状态。
 
-revision 7 起在转换 KDA 的各 value head 输出增加 RMS normalization，然后执行原 sigmoid gate 与 O 投影；该选项保存于 checkpoint，旧模型继续使用原计算路径。revision 8 的线性 critic 从零初始化，并单独使用较低学习率；结构与动作接口不变。具体试运行与自主评估见 [训练说明](training.md)。
+当前加速训练把独立环境的变长 token 序列拼接，并向 FLA 显式传入长度，各环境状态保持独立，不补零 padding。重放最多合并 64 帧的因果计算，在 episode 边界拆分；不缩短 100 步 BPTT。采集与重放的 batch 宽度匹配，更新前校验动作 log-prob。误差过大时所有 rank 一起减小合并数量，必要时回退逐帧／逐环境计算。详见 [加速与数值保护](training.md#加速与数值保护)。
 
-`ovsegdt_kda_cached` 保持 revision 8 的数值配方，启用冻结视觉编码器的 rollout 输出缓存：每卡 100×4×135×1024 个 BF16 元素，增加 110,592,000 bytes CPU 内存。重放使用该视觉输出，重新读取当前图像边界、目标和 NAV embeddings；不缓存可训练 embeddings 或递归状态的梯度图。原始 RGB 仍保留，便于诊断。视觉参数可训练时拒绝开启缓存，解冻后拒绝使用已有缓存。目标 token IDs 另有容量 256 的 CPU 缓存，目标 embeddings 每次重新计算，保留更新与梯度。
+视觉编码器冻结，其 rollout 输出可缓存；token IDs 可跨步骤缓存，可训练 embedding 的查表结果仅在一次 replay 内复用。下一 minibatch 读取当前参数并新建梯度图。模型服务默认使用独立会话递归状态。
 
-## 仿真与并行
+## 仿真与教师
 
-学习器通过本地 ZeroMQ IPC 与独立 Python 3.9 Habitat 进程通信。协议为 JSON header＋原始 uint8 图像 multipart；环境命令为 `RESET`、`STEP`、`GET_ORACLE_ACTION`、`CLOSE`、`PING`。episode uid 包含 dataset/split/scene/episode，客户端核对响应 uid。
+学习器通过 ZeroMQ IPC 与独立 Python 3.9 Habitat 进程通信，使用 JSON header＋uint8 图像 multipart。命令为 `RESET`、`STEP`、`GET_ORACLE_ACTION`、`CLOSE`、`PING`。Episode uid 包含 dataset/split/scene/episode，客户端核对响应 uid。
 
-单机八卡使用一个同步 DDP 进程组，每 rank 4 个仿真环境。模型解冻后重建 DDP reducer，保证新解冻参数参与梯度同步。训练不复刻上游 VER 的异步调度；具体配方和这一差异见 [训练说明](training.md)。
+每个 GPU rank 使用四个训练环境，同步 DDP rollout/replay。语言主干和 actor 解冻后重新建立 DDP reducer，使全部可训练参数参与同步。本实现没有复刻 OVSegDT VER 的异步经验调度。
 
-教师直接调用固定版本 ObjNavExplorer，通过 Habitat 适配层访问地图、位姿、目标视点。特权信息只供教师、奖励和指标使用，不进入策略。导航网格按机体高 0.88 m、半径 0.18 m、max_climb 0.10 m、cell_height 0.05 m 重建并缓存。
+教师调用固定版本 ObjNavExplorer。地图、位姿与目标视点仅用于教师、奖励和评估。Navmesh 按机体高 0.88 m、半径 0.18 m、max climb 0.10 m、cell height 0.05 m 重建；前进 0.25 m，转向／上下看 30°，`allow_sliding=False`。
 
-模型服务使用 session manager 管理指令与递归状态，提供容量、TTL 和互斥访问。显式 batch API 不允许一个 session 在同一批重复出现。Habitat 网页通过该服务调用策略；详见 [部署说明](deployment.md)。
+当前训练启用 `oracle_execution=collision_safe`。保留上游 frontier／目标选择与 EXPLORE／BEELINE／PIVOT／STOP；用真实 navmesh 检查前进终点，阻塞时使用离散跟随器，并持续跟随同一目标，避免上游朝向规则撤销纠正转向。局部跟随器的 STOP 不转换为物体成功标签。没有可执行动作时记录 oracle unavailable，截断当前有效前缀并重置。
+
+`filter_blocked_forward_labels=true` 只过滤“教师和实际执行都为前进、碰撞且位移不超过步长 5%”的 IL 标签，保留实际转移、PPO、奖励和递归状态。默认 `upstream` 教师执行方式保留用于对照。
 
 ## 实现入口
 
 | 路径 | 职责 |
 |---|---|
-| [models/qwen35_kda](../src/streamnav/models/qwen35_kda/) | 转换、FLA kernel adapter、functional cache、backbone |
-| [models/policy](../src/streamnav/models/policy/) | NAV pooling、actor/critic、streaming API |
-| [training](../src/streamnav/training/) | rollout/replay、GAE、PPO、EALM、DDP、保存与监控 |
-| [habitat_server](../services/habitat_server/) | 仿真服务、机器人参数与上游教师适配 |
-| [serving](../src/streamnav/serving/) | 会话 API、batch step、浏览器 viewer |
+| [models/qwen35_kda](../src/streamnav/models/qwen35_kda/) | 转换、FLA adapter、functional cache、backbone |
+| [models/policy](../src/streamnav/models/policy/) | 流式消息读出、actor/critic、动作分布 |
+| [training](../src/streamnav/training/) | rollout/replay、GAE、PPO、EALM、DDP、保存 |
+| [habitat_server](../services/habitat_server/) | 仿真、机器人参数、教师执行适配 |
+| [serving](../src/streamnav/serving/) | 会话 API、batch step、网页回放 |
 
-节点环境为 Transformers 5.3.0、FLA 0.4.2、Torch 2.10.0+cu126。升级这些依赖后需重新验证 GPU 数值、状态梯度与完整序列训练；环境快照位置见 [当前版本](current_version.md)。
+当前依赖为 Transformers 5.3.0、FLA 0.4.2、Torch 2.10.0+cu126；准确环境版本见节点记录。依赖升级需重新检查 recurrence、梯度、重放概率和完整序列训练。

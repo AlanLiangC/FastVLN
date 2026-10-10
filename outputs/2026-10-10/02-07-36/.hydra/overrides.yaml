@@ -1,0 +1,2 @@
+- checkpoint=/inspire/qb-ilm2/project/spatiotemporal-intelligence-research/ky26298/Projects/Active_Navigation/FastVLN/runs/streamnav_executable_teacher_long_20261009/ealm/checkpoints/update_0002106
+- trainer.fork_recipe_changes=[]

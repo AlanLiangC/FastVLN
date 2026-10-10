@@ -1,0 +1,5 @@
+defaults:
+  - ovsegdt_kda_replay_cached
+  - _self_
+# Architecture experiment; preserve the revision-8 navigation recipe.
+revision: 11

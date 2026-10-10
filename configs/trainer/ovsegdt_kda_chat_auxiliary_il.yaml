@@ -1,0 +1,14 @@
+defaults:
+  - ovsegdt_kda_chat_temporal_fast
+  - _self_
+fork_recipe_changes: [auxiliary_il]
+# One of four existing slots supplies IL only. No extra environment steps.
+# Alternate full expert episodes and greedy episodes with bounded teacher
+# recovery after persistent turning. Evaluation always uses the raw policy.
+auxiliary_il:
+  num_envs: 1
+  expert_episode_period: 2
+  alternating_turn_limit: 8
+  consecutive_turn_limit: 16
+  recovery_steps: 32
+log_policy_gradient_terms: true

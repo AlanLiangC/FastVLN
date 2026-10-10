@@ -1,3 +1,6 @@
 [submodule "third_party/OVSegDT"]
         path = third_party/OVSegDT
         url = https://github.com/CognitiveAISystems/OVSegDT.git
+[submodule "third_party/LightNav-0"]
+        path = third_party/LightNav-0
+        url = https://github.com/lightorigins/LightNav-0.git

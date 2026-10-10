@@ -1,0 +1,12 @@
+defaults:
+  - ovsegdt_kda_chat_temporal_contrast
+  - _self_
+# Same navigation recipe and 100-frame BPTT. Concatenate up to 64 causal
+# frames per recurrent body call; split at every episode reset. BF16 chunk
+# boundaries differ, so keep the existing strict pre-update PPO check.
+replay_pack_frames: 64
+batch_chat_body: true
+ddp_find_unused_parameters: false
+# Check the same minibatch before DDP's training forward; retry smaller packs
+# on all ranks if BF16 rounding exceeds the unchanged behavior threshold.
+replay_preflight: true

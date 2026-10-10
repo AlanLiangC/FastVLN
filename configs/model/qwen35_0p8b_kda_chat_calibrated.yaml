@@ -1,0 +1,7 @@
+defaults:
+  - qwen35_0p8b_kda_stable
+  - _self_
+# Six KDA output projections calibrated on training images only.
+checkpoint: checkpoints/qwen35_0p8b_kda_calibrated_20261008
+# Official user(image + goal)/assistant-prefix readout on every streaming frame.
+goal_conditioning: chat_query

@@ -1,6 +1,8 @@
 import json
 
-from streamnav.utils.process_health import current_health, process_alive
+import pytest
+
+from streamnav.utils.process_health import current_health, process_alive, training_stop_targets
 
 
 def fake_process(root, pid, command, parent=1, state="S"):
@@ -57,12 +59,34 @@ def test_stale_monitor_and_wrong_worker_parent(tmp_path):
     assert current_health(run, now=1050, proc_root=proc)["status"] == "needs_review"
 
 
-def test_checked_trainer_is_monitored_with_parent_identity(tmp_path):
+@pytest.mark.parametrize(
+    "entrypoint", ["tools/check_ovsegdt_training.py", "tools/benchmark_training_recipes.py"]
+)
+def test_checked_trainer_is_monitored_with_parent_identity(tmp_path, entrypoint):
     run = status(tmp_path)
     proc = tmp_path / "proc"
-    fake_process(proc, 10, "torch.distributed.run tools/check_ovsegdt_training.py")
-    fake_process(proc, 11, "tools/check_ovsegdt_training.py", parent=10)
+    fake_process(proc, 10, f"torch.distributed.run {entrypoint}")
+    fake_process(proc, 11, entrypoint, parent=10)
     fake_process(proc, 12, "tools/monitor_training.py")
     assert current_health(run, now=1050, proc_root=proc)["status"] == "training"
-    fake_process(proc, 11, "tools/check_ovsegdt_training.py", parent=99)
+    assert training_stop_targets([{"pid": 11, "launcher_pid": 10}], 10, proc_root=proc) == [11]
+    fake_process(proc, 11, entrypoint, parent=99)
     assert current_health(run, now=1050, proc_root=proc)["status"] == "needs_review"
+
+
+def test_healthy_stop_signals_one_rank_and_broken_group_signals_survivors(tmp_path):
+    fake_process(tmp_path, 10, "torch.distributed.run streamnav.training.trainer")
+    workers = [{"pid": 11 + rank, "rank": rank, "launcher_pid": 10} for rank in range(3)]
+    for worker in workers:
+        fake_process(tmp_path, worker["pid"], "streamnav.training.trainer", parent=10)
+    assert training_stop_targets(list(reversed(workers)), 10, proc_root=tmp_path) == [11]
+    fake_process(tmp_path, 11, "streamnav.training.trainer", parent=10, state="Z")
+    assert training_stop_targets(workers, 10, proc_root=tmp_path) == [12, 13]
+    fake_process(tmp_path, 13, "streamnav.training.trainer", parent=99)
+    assert training_stop_targets(workers, 10, proc_root=tmp_path) == [12]
+
+
+def test_stop_never_signals_workers_owned_by_previous_launcher(tmp_path):
+    fake_process(tmp_path, 10, "torch.distributed.run streamnav.training.trainer")
+    fake_process(tmp_path, 11, "streamnav.training.trainer", parent=9)
+    assert training_stop_targets([{"pid": 11, "launcher_pid": 9}], 10, proc_root=tmp_path) == [10]

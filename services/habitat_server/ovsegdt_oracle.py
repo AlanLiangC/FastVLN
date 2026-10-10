@@ -1,8 +1,8 @@
-"""Run OVSegDT's pinned ObjNavExplorer unchanged behind the simulator RPC.
+"""Run OVSegDT's pinned ObjNavExplorer behind the simulator RPC.
 
-Only the Habitat-Lab simulator/episode interfaces are adapted. The actual
-frontier selection, EXPLORE/BEELINE/PIVOT state machine and action logic come
-from the upstream source at a8890d68cfa0d10254238abe9266a76856cb1f17.
+Frontier selection and EXPLORE/BEELINE/PIVOT come from the upstream source at
+a8890d68cfa0d10254238abe9266a76856cb1f17. The default action logic is unchanged;
+an explicit collision_safe fork repairs blocked navigation with discrete actions.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import importlib.util
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import habitat_sim
 import numpy as np
@@ -135,9 +135,37 @@ class OVSegDTOracle:
         self.explorer = upstream.ObjNavExplorer(
             sim=SimulatorBridge(env), config=OmegaConf.create(options), task=self.task
         )
+        execution = env.config.get("oracle_execution", "upstream")
+        if execution not in ("upstream", "collision_safe"):
+            raise ValueError(f"Unknown oracle_execution: {execution}")
+        self.navigation = None
+        self.current_navigation_target = None
+        if execution == "collision_safe":
+            from executable_oracle import ExecutableNavigation
+
+            self.navigation = ExecutableNavigation(env)
+        original = self.explorer._decide_action
+
+        def decide(explorer, target):
+            advice = original(target)
+            goal = (
+                explorer._pixel_to_map_coors(target)
+                if target is not None and len(target) == 2
+                else target
+            )
+            self.current_navigation_target = None if goal is None else np.array(goal, copy=True)
+            if self.navigation is not None:
+                repaired = self.navigation.action(goal, advice)
+                # Upstream compares [action] arrays to recognize exhausted
+                # frontiers. Preserve shape or scalar STOP bypasses that check.
+                return np.full_like(np.asarray(advice), int(repaired))
+            return advice
+
+        self.explorer._decide_action = MethodType(decide, self.explorer)
 
     def action(self):
         try:
+            self.current_navigation_target = None
             action = self.explorer.get_observation(task=self.task, episode=self.episode)
             if self.task.is_stop_called:
                 raise OracleUnavailableError(

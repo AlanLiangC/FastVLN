@@ -1,74 +1,51 @@
-# 当前版本：revision 5 · 2026-10-08
+# 当前版本节点
 
-本节点固定当前实现、上游参照和 update 50 检查点，用于后续训练对照与回放。当前自主导航效果仍未达标：该检查点在三个 OVON 诊断 split 各 48 条 episode 上均为 0 成功、SPL=0。代码验证通过不能替代导航效果验证。
+节点 **current_20261010** 固定 revision 12 的实现、配置和完整检查点。后续实验通过活动入口运行，固定节点不会随 latest/best 轮转。源码、节点信息和精简验证证据位于 `runtime/baselines/current_20261010/`。当前感知分支的配置与限制见 [轻量感知监督](perception.md)，它不属于此固定快照。
 
-## 当前诊断实验
+## 节点与保留路径
 
-revision 5 在 update 76 保存停训。随后 revision 6 在 update 5、10、25 自主验证均为 0/144，已保存至 update 30 并停止。活动目录为 `runs/streamnav_kda_stable_20261008/ealm`（revision 8）：每步目标查询、KDA 输出 RMS normalization、较低主干 LR、零初始化 / 较低 LR 的 critic。该实验在 update 50 按全零验证规则停止，SR=0/144，7 条轨迹进入成功距离但没有主动 STOP。update 50 另固定于 `checkpoints/revision8_stop_audit_20261008`，作为短对照的只读初始化锚点，禁止原地修改。
-
-STOP 加权和训练起点课程的短对照均为 0/144，未提升自主 SR。主实验已从 update 50 恢复八卡优化器 / sampler / EALM 状态，只启用等价视觉缓存（`ovsegdt_kda_cached`），上限为 200 updates，续训验证为 55、75、100、150、200。缓存与重算连续 8 次参数 SHA 完全一致，优化耗时观测约下降 6%，不是 SR 改善证据。当前检查通过单元/回归 63 项、GPU 6 项、真实 Habitat/训练集成 13 项（分批运行），Ruff、format、mypy 与 diff 检查通过；对照、失败记录和缓存开销见 [审计 JSON](../runtime/reports/stop_audit_20261008/audit.json)。固定 revision 5 节点与其历史证据保持原值；具体差异和实时验证见 [训练说明](training.md)。
-
-续训 update 55 的自主 SR 仍为 0/144，13 条轨迹进入成功距离，没有贪心 STOP。数值与更新前重放检查正常；网页已加载该检查点。训练继续在上述预算和后台监控范围内运行，状态工具从实际进程读取当前更新。
-
-## 节点定位
-
-| 项目 | 固定值或路径 |
+| 项目 | 路径或值 |
 |---|---|
-| 节点 ID | `revision5_20261008` |
-| 训练 revision / update | `5` / `50`，160,000 transitions |
-| 基线实验（已停止） | `runs/streamnav_ovsegdt_aligned_20261008/ealm`，最终保存 update 76 |
-| 完整检查点 | [checkpoints/revision5_20261008](../checkpoints/revision5_20261008/) |
-| 节点记录 | [baseline.json](../runtime/baselines/revision5_20261008/baseline.json) |
-| 本次整理后的源码与文档 | [source.zip](../runtime/baselines/revision5_20261008/source.zip)，SHA256 记录在节点 JSON |
-| 当时训练的实际源码 | [检查点内 source.zip](../checkpoints/revision5_20261008/source.zip) |
-| OVSegDT commit | `646a3d53e7eae5879a4ce28d3a4dbaacca52d2b7` |
-| frontier_exploration commit | `a8890d68cfa0d10254238abe9266a76856cb1f17` |
+| 活动入口 | `runs/streamnav_active/ealm` |
+| 节点建立时训练目录 | `runs/streamnav_executable_teacher_long_20261009/ealm` |
+| 节点训练目标 | update 5000，八卡，每卡四环境，100 步序列 |
+| 固定完整恢复节点 | [checkpoints/current_20261010/resume](../checkpoints/current_20261010/resume/)，update 2240 |
+| 固定最佳评估模型 | [checkpoints/current_20261010/best](../checkpoints/current_20261010/best/)，update 2000 |
+| 当前教师分支的对照起点 | [revision12_ablation_update1000_20261009](../checkpoints/revision12_ablation_update1000_20261009/)，update 1000 |
+| 导航初始化 | `checkpoints/qwen35_0p8b_kda_temporal_contrast_20261008` |
+| 基础转换／GPU 测试权重 | `checkpoints/qwen35_0p8b_kda`、`checkpoints/qwen35_0p8b_kda_calibrated_20261008` |
+| 节点记录／完整配方 | [node.json](../runtime/baselines/current_20261010/node.json)、[resolved_config.yaml](../runtime/baselines/current_20261010/resolved_config.yaml) |
+| 整理后的源码与文档 | [source.zip](../runtime/baselines/current_20261010/source.zip)，哈希见节点记录 |
+| 清理清单 | [cleanup.json](../runtime/baselines/current_20261010/cleanup.json) |
 
-训练源码树 SHA256 为 `943edfd8c5c5edd3ec9dc49d3ea6e7411b3ac6297c9a14c529b534acf6eeb381`。节点不是新的 Git commit；现有工作区改动通过源码快照固定，基础 commit 和 dirty 状态记录在 manifest 中。固定节点形成时的整理只修改文档和辅助工具默认路径。此后的 2026-10-08 训练审查已修改诊断分支并重启独立实验，见上节；不能把固定节点源码 SHA 当作新实验的源码 SHA。
+固定检查点保留 model、actor/critic、Adam、调度器、八 rank RNG／sampler／entropy EMA、tokenizer、配置和实际训练源码。大文件通过硬链接固定，不额外复制权重；禁止原地修改固定文件。日常续训使用活动实验 latest。较早节点不能直接接在已有更晚的日志后；需要独立分支目录。
 
-检查点完整保留模型、actor/critic、Adam、调度器、各 rank RNG / sampler / entropy EMA、tokenizer、配置与训练源码。通过已发布文件的硬链接保存，不额外复制大权重，并能独立于活动实验的自动轮转保留。禁止原地改写其中的文件。日常续训使用当前实验 latest；固定节点回放见 [部署说明](deployment.md)。
+本节点是工作区快照，不是新的 Git commit。基础 commit、工作区状态和源码 SHA256 写入 node.json；训练时的真实源码另保留于各检查点的 source.zip。
 
-## 当前约束和上游差异
+## 节点实现
 
-以用户最终确认的 RGB＋文本限制、六动作和机器人参数为准：480×270，HFOV 120°，相机高度 0.88 m / 初始俯仰 0°，机体高度 0.88 m / 半径 0.18 m。图像上下补齐到 480×288；导航网格按当前机体和上游爬升参数重建。
+策略仅读取 RGB＋目标文本。Qwen3.5-0.8B 的六个 full-attention 层转换为 KDA，18 个 GDN 保留，每帧输入官方 user 图像／目标消息并读取 assistant 前缀。递归状态大小固定。视觉冻结，语言主干、actor 和线性 critic 训练；采集与 BPTT 均为 100 步。
 
-| 项目 | 当前实现与上游关系 |
-|---|---|
-| backbone | 用 KDA-converted Qwen3.5-0.8B；目标文本预填递归模型，替代上游视觉/目标编码路径 |
-| 策略输入 | 保留 RGB＋文本限制；不采用上游 no_segm_loss 配置中的 mask、GPS/compass、上一动作输入 |
-| semantic loss | 关闭；无语义预测监督 |
-| 教师 | 直接执行 pinned ObjNavExplorer，适配 Habitat / episode 接口；特权信息不进入策略 |
-| 核心训练配方 | 六动作、on-policy 标签监督、EALM、PPO/value、奖励、Adam 与 PIRLNav 解冻调度对照上游实际代码 |
-| 运行时 | 同步八卡 DDP rollout/replay；没有复刻 VER 异步经验调度 |
-| 数据读取 | 惰性按场景加载，保留对应抽样分布；随机流不保证逐 episode 相同 |
-| 评估 | 用户机器人参数下的固定分层诊断子集，不能直接当成官方全量 benchmark |
+导航使用 on-policy 教师标签、EALM、PPO/value 和 entropy。当前训练教师显式启用 `collision_safe`：保留上游探索目标，用实际机器人离散动作修复不可执行的前进标签，另过滤实际无位移碰撞前进的 IL 监督。策略不读取修复用的特权信息。辅助 IL、STOP 加权、近目标课程、进度奖励和 PPO 权重下限均未启用。细节见 [架构](architecture.md) 和 [训练配方](training.md)。
 
-旧版的教师接管、STOP 加权、距离 shaping、近目标课程和混合训练数据已退出默认配方。当前完整参数见 [训练说明](training.md)。KDA 转换没有额外蒸馏，不是无损替换；输入和 backbone 差异仍可能影响导航能力，不保证复现 OVSegDT 的成绩。
+## 评估与验证
 
-## 验证证据与当前限制
+以下均为同一固定 144 条 episode 的自主 argmax 诊断评估，不是完整 benchmark；表中数值冻结于节点建立时。
 
-清理前完成的 revision 5 验证结果已保留在 [evidence](../runtime/baselines/revision5_20261008/evidence/)：
+| 模型 update | 成功数／144 | SR | SPL |
+|---|---:|---:|---:|
+| 对照起点 1000 | 20 | 13.89% | 0.0802 |
+| 节点最佳 2000 | 27 | 18.75% | 0.1098 |
+| 节点建立时最近完整评估 2200 | 22 | 15.28% | 0.0865 |
 
-- 单元与回归 49 项、GPU 4 项、真实 Habitat / 训练集成 6 项通过；Ruff 与 mypy 通过。
-- 差分测试直接执行本地上游 EALM、value clipping、PIRLNav 调度代码。
-- 完整 T=100 双卡检查覆盖 update 1–3 及恢复后的 update 4；各次更新全部参数 SHA 跨 rank 一致，更新前重放概率误差为 0。
-- 网页完成六动作控制和模型回放验收；相机与机体参数、重建网格也有检查记录。
-- [节点验证指标](../runtime/baselines/revision5_20261008/evidence/checkpoint50_evaluation.json) 为三个 split 各 0/48；当前进程状态由状态工具实时读取，不能用旧截图代替。
+最佳模型按宏平均 SR、再按 SPL 选择。结果仍有明显波动，到达目标后不停车与持续左右交替尚未解决。节点建立时 EALM alpha 仍为 1，PPO 策略梯度未参与，value 与 entropy 项仍存在。不能仅凭 IL loss、训练采样成功率或低碰撞率判断自主能力改善。
 
-本次整理后的链接、脚本、环境导入与服务检查单独记录在 [workspace_checks.json](../runtime/baselines/revision5_20261008/workspace_checks.json)，不将历史训练测试写成此次重新执行。后续修改训练代码需重新运行相应验证。
+保留的证据包括 [最佳评估](../runtime/baselines/current_20261010/evidence/current_best_evaluation.json)、[评估记录](../runtime/baselines/current_20261010/evidence/evaluation_at_snapshot.jsonl)、[训练诊断](../runtime/baselines/current_20261010/evidence/training_analysis_update2000.json)、[进度图](../runtime/baselines/current_20261010/evidence/training_progress_update2000.png)。原起点的 [视频](../runtime/baselines/current_20261010/reference_evaluation/update_0001000/index.html) 保留用于对照，活动实验全部评估视频保留。
 
-## 空间整理与保留规则
+完整八卡、100 步、两次更新验证中，各 rank 参数哈希相同、语言主干／actor 有梯度、视觉梯度为零，更新前最大重放误差约 0.02217，原阈值为 0.05。见 [八卡验证摘要](../runtime/baselines/current_20261010/evidence/distributed_canary.json)。同一 32 条训练 episode 的教师执行验证由 7 次成功变为 22 次；这是教师质量检查，不是策略 SR。见 [教师验证摘要](../runtime/baselines/current_20261010/evidence/teacher_validation.json)。这些是已完成验证的留存证据，本次文档整理不重新占用 GPU 测试。
 
-2026-10-08 清理 20 个停用实验、9 份过时文档及旧截图、历史诊断目录、关闭的仿真日志、无用临时文件、pip/uv/conda 下载缓存和可选浏览器资源。已删除旧实验大权重与视频；当前实验、初始化权重、数据、已安装环境和必要上游源码完整保留。
+## 空间保留规则
 
-清理瞬间项目分配空间从约 **577.55 GiB 降至 59.41 GiB，释放 518.15 GiB**。训练仍在写入，后续占用会变化；精确时间、字节数和逐项删除记录见 [cleanup_report.json](../runtime/baselines/revision5_20261008/cleanup_report.json)。
+活动训练保留最近两份检查点和 best，全部 train/eval 指标及代表视频保留。固定版本节点、当前初始化、update 1000 对照、基础转换及测试权重单独保留。旧训练分支、失效节点、失败初始化、重复诊断输出和旧更新流水已清理，具体路径与空间统计见清理清单。
 
-历史文档、配置、指标、源码快照和诊断日志共 4,620 个文件，合并为约 31 MiB 的 [legacy_records.tar.gz](../runtime/baselines/revision5_20261008/legacy_records.tar.gz)，已检查压缩流并记录 [SHA256](../runtime/baselines/revision5_20261008/legacy_records.json)。该归档不含旧模型权重、视频或 `.config` 凭据；归档内路径和结论是历史记录，不作为当前运行指南。
-
-日常使用以下边界：
-
-- `docs/` 只保存当前说明；新诊断图片和临时报告写到 `runtime/reports/`。
-- 当前实验保留最近三份检查点及 best；固定版本节点单独保留，不混入轮转规则。
-- 数据、`.venv`、`runtime/habitat-env`、`runtime/vendor`、`third_party/OVSegDT` 和初始化权重是运行依赖。
-- Triton、TorchInductor、NVIDIA、navmesh 等正在使用的缓存保留；删除进程仍引用的缓存或日志会破坏可追溯性或运行稳定性。
-- 可再生成的下载缓存按需清理，先检查环境是否依赖其中的符号链接；新实验使用新目录，不覆盖当前基线。
+`src`、`services`、`configs`、`tools`、`tests`、`scripts` 保留实现与复现能力。`runtime/data`、`.venv`、`runtime/habitat-env`、`runtime/vendor`、上游源码和正在使用的编译／navmesh 缓存是运行依赖。`.config` 凭据不进入快照。后续诊断输出放到 `runtime/reports`，运行状态写入活动实验，不在项目文档中追加日期更新流水。

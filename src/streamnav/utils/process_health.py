@@ -23,7 +23,34 @@ def process_alive(pid, marker, parent=None, proc_root=Path("/proc")):
 def training_process_alive(pid, parent=None, proc_root=Path("/proc")):
     return any(
         process_alive(pid, marker, parent=parent, proc_root=proc_root)
-        for marker in ("streamnav.training.trainer", "tools/check_ovsegdt_training.py")
+        for marker in (
+            "streamnav.training.trainer",
+            "tools/check_ovsegdt_training.py",
+            "tools/benchmark_training_recipes.py",
+        )
+    )
+
+
+def training_stop_targets(workers, launcher, proc_root=Path("/proc")):
+    """One live worker coordinates a healthy group through any_rank(stop).
+
+    Signalling every rank can race with handler removal during shutdown.
+    A broken group cannot coordinate, so signal its remaining live workers.
+    """
+    current = [w for w in workers if w.get("launcher_pid") == launcher or w["pid"] == launcher]
+    alive = [
+        w
+        for w in current
+        if training_process_alive(
+            w["pid"], parent=launcher if w["pid"] != launcher else None, proc_root=proc_root
+        )
+    ]
+    if alive:
+        if len(alive) == len(current):
+            return [min(alive, key=lambda w: w.get("rank", 0))["pid"]]
+        return [w["pid"] for w in alive]
+    return (
+        [launcher] if not current and training_process_alive(launcher, proc_root=proc_root) else []
     )
 
 
@@ -52,6 +79,7 @@ def current_health(run_dir, *, now=None, stale_seconds=120, proc_root=Path("/pro
     warnings = result.setdefault("warnings", [])
     if not result["process_alive"] and result["recorded_status"] not in {
         "complete",
+        "stopped",
         "halted_for_review",
         "process_exited_early",
     }:

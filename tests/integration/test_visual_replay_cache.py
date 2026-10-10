@@ -19,12 +19,21 @@ pytestmark = [
 ]
 
 
-def test_frozen_visual_cache_preserves_real_replay_and_optimizer(tmp_path):
+@pytest.mark.parametrize("cache_embeddings", [False, True])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "qwen35_0p8b_kda_stable",
+        "qwen35_0p8b_kda_chat_calibrated",
+        "qwen35_0p8b_kda_chat_temporal_contrast",
+    ],
+)
+def test_frozen_visual_cache_preserves_real_replay_and_optimizer(tmp_path, cache_embeddings, model):
     with initialize_config_dir(version_base=None, config_dir=str(Path("configs").resolve())):
         cfg = compose(
             config_name="config",
             overrides=[
-                "model=qwen35_0p8b_kda_stable",
+                f"model={model}",
                 "trainer=ovsegdt_kda_cached",
                 "data=hm3d_v1",
                 "eval=hm3d_v1",
@@ -34,6 +43,7 @@ def test_frozen_visual_cache_preserves_real_replay_and_optimizer(tmp_path):
                 "trainer.sequence_length=2",
                 "trainer.sequence_batch_size=2",
                 "trainer.actor_warmup_updates=0",
+                f"trainer.cache_replay_embeddings={str(cache_embeddings).lower()}",
             ],
         )
     trainer = EndToEndObjectNavTrainer(OmegaConf.to_container(cfg, resolve=True))
@@ -42,7 +52,9 @@ def test_frozen_visual_cache_preserves_real_replay_and_optimizer(tmp_path):
         assert buffer.visual_embeddings is not None
         sequences = next(buffer.sequence_batches(2, shuffle=False))
         with torch.no_grad(), trainer.autocast():
-            cached = replay_sequences(trainer.policy, buffer, sequences)[:2]
+            cached = replay_sequences(
+                trainer.policy, buffer, sequences, cache_embeddings=cache_embeddings
+            )[:2]
             visual = buffer.visual_embeddings
             buffer.visual_embeddings = None
             uncached = replay_sequences(trainer.policy, buffer, sequences)[:2]

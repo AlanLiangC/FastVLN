@@ -32,6 +32,7 @@ class HabitatObjectNavEnv:
         self.scene = None
         self.reward = ObjectNavReward(RewardConfig(**config.get("reward", {})))
         self.explorer = None
+        self._cached_observations = None
 
     def _make_sim(self, scene):
         if self.sim is not None:
@@ -52,6 +53,16 @@ class HabitatObjectNavEnv:
         agent.height = self.config.get("agent_height", 0.88)
         agent.radius = self.config.get("agent_radius", 0.18)
         agent.sensor_specifications = [sensor]
+        if self.config.get("perception_labels", False):
+            depth = habitat_sim.CameraSensorSpec()
+            depth.uuid = "perception_depth"
+            depth.sensor_type = habitat_sim.SensorType.DEPTH
+            depth.resolution = list(sensor.resolution)
+            depth.position = list(sensor.position)
+            depth.orientation = list(sensor.orientation)
+            depth.hfov = sensor.hfov
+            depth.near, depth.far = 0.05, 20.0
+            agent.sensor_specifications.append(depth)
         agent.action_space = {
             "move_forward": habitat_sim.agent.ActionSpec(
                 "move_forward",
@@ -168,6 +179,7 @@ class HabitatObjectNavEnv:
         state.position = episode["start_position"]
         state.rotation = quat_from_coeffs(episode["start_rotation"])
         self.sim.get_agent(0).set_state(state)
+        self._cached_observations = None
         self.follower.reset()
         self.goal_positions = np.asarray(
             [v["agent_state"]["position"] for g in episode["goals"] for v in g["view_points"]],
@@ -241,8 +253,21 @@ class HabitatObjectNavEnv:
         e = self.episode
         return f"{e['dataset_id']}:{e['split']}:{e['scene_id']}:{e['episode_id']}"
 
+    def _sensor_observations(self):
+        if self._cached_observations is None:
+            self._cached_observations = self.sim.get_sensor_observations()
+        return self._cached_observations
+
     def _observation(self):
-        return np.ascontiguousarray(self.sim.get_sensor_observations()["rgb"][:, :, :3])
+        return np.ascontiguousarray(self._sensor_observations()["rgb"][:, :, :3])
+
+    def oracle_supervision(self):
+        if not self.config.get("perception_labels", False) or self.episode["split"] != "train":
+            raise ValueError("Perception labels require opt-in training episodes")
+        from perception_labels import PerceptionLabeler
+
+        action = self.oracle()
+        return {"action": int(action), "perception": PerceptionLabeler(self).labels(action)}
 
     def oracle(self):
         if self.ended:
@@ -322,6 +347,7 @@ class HabitatObjectNavEnv:
                     NavigationAction.LOOK_DOWN: "look_down",
                 }[action]
             )
+            self._cached_observations = sim_observations
         after = self.sim.get_agent(0).get_state().position
         moved = float(np.linalg.norm(after - before))
         collision = bool(sim_observations.get("collided", False))
@@ -340,6 +366,8 @@ class HabitatObjectNavEnv:
         denom = max(self.initial_distance, self.path_length, 1e-8)
         efficiency = self.initial_distance / denom
         soft_success = max(0.0, 1.0 - distance / max(self.initial_distance, 1e-8))
+        navigation = getattr(self.explorer, "navigation", None)
+        repairs = navigation.repairs if navigation is not None else 0
         metrics = {
             "success": float(success),
             "success_strict_0_1": float(stopped and distance < 0.1),
@@ -353,6 +381,7 @@ class HabitatObjectNavEnv:
             "collision_rate": self.collisions / self.steps,
             "path_length": self.path_length,
             "oracle_recoveries": self.oracle_recoveries,
+            "oracle_navigation_repairs": repairs,
         }
         # Simulator.step already rendered the post-action RGB. Rendering it a
         # second time adds cost to every learner and curriculum transition.
@@ -368,6 +397,8 @@ class HabitatObjectNavEnv:
             "terminated": stopped,
             "truncated": truncated,
             "collision": collision,
+            "displacement": moved,
+            "oracle_navigation_repairs": repairs,
             "success": success,
             "geodesic_distance": distance,
             "metrics": metrics,

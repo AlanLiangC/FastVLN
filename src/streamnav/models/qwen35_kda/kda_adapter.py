@@ -59,7 +59,7 @@ class KDAAdapter(nn.Module):
         nn.init.zeros_(self.beta_proj.weight)
         nn.init.zeros_(self.beta_proj.bias)
 
-    def forward(self, x, state: LayerState, mode="auto"):
+    def forward(self, x, state: LayerState, mode="auto", cu=None, cu_cpu=None, lengths=None):
         from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
         b, t, _ = x.shape
@@ -72,6 +72,8 @@ class KDAAdapter(nn.Module):
         g = -F.softplus(self.decay_proj(x).float()).view(b, t, self.num_heads, self.head_dim)
         beta = self.beta_proj(x).sigmoid()
         if mode == "reference":
+            if lengths is not None:
+                raise ValueError("Variable-length batches require FLA kernels")
             o, recurrent = delta_reference(q, k, v, g, beta, state.recurrent)
         else:
             chunk = mode == "chunk" or (mode == "auto" and torch.is_grad_enabled())
@@ -85,6 +87,8 @@ class KDAAdapter(nn.Module):
                 initial_state=state.recurrent,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu,
+                **({"cu_seqlens_cpu": cu_cpu} if chunk else {}),
             )
         if self.output_norm:
             # FLA KimiDeltaAttention normalizes each value head before its
@@ -101,7 +105,7 @@ class StreamingGatedDeltaNet(nn.Module):
         super().__init__()
         self.original = original
 
-    def forward(self, x, state: LayerState, mode="auto"):
+    def forward(self, x, state: LayerState, mode="auto", cu=None, cu_cpu=None, lengths=None):
         from fla.ops.gated_delta_rule import (
             chunk_gated_delta_rule,
             fused_recurrent_gated_delta_rule,
@@ -112,12 +116,33 @@ class StreamingGatedDeltaNet(nn.Module):
         qkv = m.in_proj_qkv(x).transpose(1, 2)
         history = state.conv
         if history is None:
-            history = qkv.new_zeros(b, m.conv_dim, m.conv_kernel_size - 1)
-        joined = torch.cat((history, qkv), dim=-1)
-        conv = joined[:, :, -(m.conv_kernel_size - 1) :].contiguous()
-        qkv = F.silu(F.conv1d(joined, m.conv1d.weight, m.conv1d.bias, groups=m.conv_dim)).transpose(
-            1, 2
-        )
+            history = qkv.new_zeros(
+                b if lengths is None else len(lengths), m.conv_dim, m.conv_kernel_size - 1
+            )
+        if lengths is None:
+            joined = torch.cat((history, qkv), dim=-1)
+            conv = joined[:, :, -(m.conv_kernel_size - 1) :].contiguous()
+            qkv = F.silu(F.conv1d(joined, m.conv1d.weight, m.conv1d.bias, groups=m.conv_dim))
+        else:
+            # Convolution histories are independent. Right padding is confined
+            # to this causal convolution; trim it before the recurrent kernels
+            # and take final history from each sequence's actual final tokens.
+            blocks = qkv.split(lengths, dim=-1)
+            joined_blocks = [
+                torch.cat((history[i : i + 1], block), dim=-1) for i, block in enumerate(blocks)
+            ]
+            conv = torch.cat([block[:, :, -(m.conv_kernel_size - 1) :] for block in joined_blocks])
+            joined = torch.cat(
+                [
+                    F.pad(block, (0, max(lengths) - length))
+                    for block, length in zip(joined_blocks, lengths, strict=True)
+                ]
+            )
+            convolved = F.silu(F.conv1d(joined, m.conv1d.weight, m.conv1d.bias, groups=m.conv_dim))
+            qkv = torch.cat(
+                [convolved[i : i + 1, :, :length] for i, length in enumerate(lengths)], dim=-1
+            )
+        qkv = qkv.transpose(1, 2)
         q, k, v = qkv.split((m.key_dim, m.key_dim, m.value_dim), dim=-1)
         q, k = (y.reshape(b, t, m.num_k_heads, m.head_k_dim).contiguous() for y in (q, k))
         v = v.reshape(b, t, m.num_v_heads, m.head_v_dim).contiguous()
@@ -127,6 +152,8 @@ class StreamingGatedDeltaNet(nn.Module):
         beta = m.in_proj_b(x).sigmoid()
         g = -m.A_log.float().exp() * F.softplus(m.in_proj_a(x).float() + m.dt_bias.float())
         if mode == "reference":
+            if lengths is not None:
+                raise ValueError("Variable-length batches require FLA kernels")
             o, recurrent = delta_reference(q, k, v, g, beta, state.recurrent)
         else:
             chunk = mode == "chunk" or (mode == "auto" and torch.is_grad_enabled())
@@ -140,6 +167,8 @@ class StreamingGatedDeltaNet(nn.Module):
                 initial_state=state.recurrent,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu,
+                **({"cu_seqlens_cpu": cu_cpu} if chunk else {}),
             )
         z = m.in_proj_z(x).reshape(-1, m.head_v_dim)
         o = m.norm(o.reshape(-1, m.head_v_dim), z).reshape(b, t, m.value_dim)

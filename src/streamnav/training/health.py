@@ -20,6 +20,30 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
     if any(not math.isfinite(r.get("total_loss", 0)) for r in recent):
         result["warnings"].append("nonfinite_loss")
         result["stop_recommended"] = True
+    alphas = [r["ealm_alpha"] for r in recent if "ealm_alpha" in r]
+    if alphas:
+        result["ppo_policy_coefficient_mean"] = statistics.mean(1 - a for a in alphas)
+        inactive = 0
+        for row in reversed(rows):
+            if row.get("ealm_alpha", 0) < 0.999:
+                break
+            inactive += 1
+        result["ppo_policy_inactive_updates"] = inactive
+        if inactive >= 20:
+            result["warnings"].append("ppo_policy_inactive")
+    labelled = [r for r in recent if "teacher_stop_count" in r and "greedy_stop_count" in r]
+    if labelled:
+        positives = sum(r["teacher_stop_count"] for r in labelled)
+        stops = sum(r["greedy_stop_count"] for r in labelled)
+        result["teacher_stop_labels_recent"] = positives
+        result["greedy_stops_recent"] = stops
+        if positives:
+            result["teacher_stop_recall_recent"] = (
+                sum((r["oracle_class_recall"][0] or 0) * r["teacher_stop_count"] for r in labelled)
+                / positives
+            )
+        if len(labelled) >= 20 and positives >= 50 and stops == 0:
+            result["warnings"].append("stop_not_learned")
     greedy = [r["greedy_action_histogram"] for r in recent if "greedy_action_histogram" in r]
     if greedy:
         means = [statistics.mean(r[a] for r in greedy) for a in range(len(greedy[0]))]
@@ -52,12 +76,21 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         result["zero_success_splits"] = [s for s, r in complete[-1].items() if r["success"] == 0]
         result["macro_autonomous_sr"] = statistics.mean(result["last_autonomous_sr"].values())
         result["last_evaluation_update"] = next(iter(complete[-1].values()))["update"]
+        latest = list(complete[-1].values())
+        if all("collision_rate" in r for r in latest):
+            collisions = statistics.mean(r["collision_rate"] for r in latest)
+            result["macro_validation_collision_rate"] = collisions
+            if collisions > 0.5:
+                result["warnings"].append("high_validation_collision_rate")
+        if all("oracle_success" in r for r in latest):
+            result["macro_oracle_success"] = statistics.mean(r["oracle_success"] for r in latest)
         if all(r["success"] == 0 for r in complete[-1].values()):
             result["warnings"].append("zero_autonomous_success")
         elif result["zero_success_splits"]:
             result["warnings"].append("zero_success_on_some_splits")
         if (
             update >= min_updates
+            and latest_update >= min_updates
             and len(complete) >= patience
             and all(r["success"] == 0 for group in complete[-patience:] for r in group.values())
         ):

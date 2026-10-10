@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--steps", type=int, default=32)
-    parser.add_argument("--goal-conditioning", choices=["episode", "nav_query"])
+    parser.add_argument("--goal-conditioning", choices=["episode", "nav_query", "chat_query"])
     parser.add_argument("--kda-output-norm", choices=["enabled", "disabled"])
     args = parser.parse_args()
     with initialize_config_dir(version_base=None, config_dir=str(Path("configs").resolve())):
@@ -47,7 +47,11 @@ def main():
     source = make_source(config["data"], 2025)
     records = []
     pooled = []
-    hook = policy.pooling.register_forward_hook(lambda m, x, y: pooled.append(y.detach().float()))
+    # Chat pooling runs once per environment; capture the assembled actor input
+    # so every RGB/goal control has its own row in both model paths.
+    hook = policy.actor_critic.register_forward_pre_hook(
+        lambda m, x: pooled.append(x[0].detach().float())
+    )
     try:
         episode = source.sample_episode()
         observation = envs.reset([episode])[0]

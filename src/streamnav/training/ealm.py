@@ -14,17 +14,21 @@ class EntropyAdaptiveLossMixer(nn.Module):
         entropy_ema_decay=0.95,
         enabled=True,
         fixed_alpha=0.5,
+        minimum_ppo_weight=0.0,
     ):
         super().__init__()
         if (
             entropy_high <= entropy_low
             or not 0 <= fixed_alpha <= 1
             or not 0 <= entropy_ema_decay < 1
+            or not 0 <= minimum_ppo_weight <= 1
+            or not all(math.isfinite(x) for x in (entropy_low, entropy_high))
         ):
             raise ValueError("Invalid entropy normalization or fixed alpha")
         self.low, self.high = entropy_low, entropy_high
         self.enabled, self.fixed_alpha = enabled, fixed_alpha
         self.decay = entropy_ema_decay
+        self.minimum_ppo_weight = minimum_ppo_weight
         self.register_buffer("entropy_ema", torch.tensor(float("nan"), dtype=torch.float64))
 
     def forward(self, il_loss, ppo_loss, entropy):
@@ -36,7 +40,8 @@ class EntropyAdaptiveLossMixer(nn.Module):
             if math.isnan(previous)
             else min(max((previous - self.low) / (self.high - self.low), 0.0), 1.0)
         )
-        alpha = torch.full_like(entropy, weight if self.enabled else self.fixed_alpha)
+        weight = min(weight if self.enabled else self.fixed_alpha, 1 - self.minimum_ppo_weight)
+        alpha = torch.full_like(entropy, weight)
         return alpha * il_loss + (1 - alpha) * ppo_loss, alpha
 
     @torch.no_grad()

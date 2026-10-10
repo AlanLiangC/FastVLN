@@ -88,6 +88,12 @@ class HabitatClient:
     def get_oracle_action(self):
         return NavigationAction(self.request("GET_ORACLE_ACTION")["action"])
 
+    def get_oracle_supervision(self):
+        result = self.request("GET_ORACLE_SUPERVISION")
+        if result["perception"]["episode_id"] != self.episode_id:
+            raise EpisodeMismatchError("Perception labels belong to another episode")
+        return result
+
     def close(self, force=False):
         if self.process.poll() is None:
             if not force:
@@ -110,6 +116,7 @@ class VectorHabitatEnvs:
     """One simulator process and one socket per environment, parallel RPC fanout."""
 
     def __init__(self, config, num_envs):
+        self.config = config
         self.clients = []
         self.executor = ThreadPoolExecutor(max_workers=num_envs)
         try:
@@ -145,6 +152,15 @@ class VectorHabitatEnvs:
         def oracle(client):
             try:
                 return client.get_oracle_action()
+            except OracleUnavailableError as exc:
+                return exc
+
+        return list(self.executor.map(oracle, self.clients))
+
+    def get_oracle_supervisions(self):
+        def oracle(client):
+            try:
+                return client.get_oracle_supervision()
             except OracleUnavailableError as exc:
                 return exc
 

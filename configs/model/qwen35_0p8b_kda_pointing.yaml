@@ -1,0 +1,6 @@
+defaults:
+  - qwen35_0p8b_kda_chat_temporal_contrast
+  - _self_
+perception:
+  enabled: true
+  embedding_dim: 64

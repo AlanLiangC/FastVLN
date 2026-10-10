@@ -24,6 +24,9 @@ def test_resume_does_not_signal_launcher_using_previous_worker_snapshot(
     )
     monkeypatch.setattr("sys.argv", ["monitor", "--pid", "10", "--run-dir", str(tmp_path)])
     monkeypatch.setattr(monitor_training, "worker_alive", lambda pid: True)
+    monkeypatch.setattr(
+        monitor_training, "training_stop_targets", lambda workers, pid: [11] if workers else []
+    )
     signals = []
     monkeypatch.setattr(monitor_training.os, "kill", lambda pid, sig: signals.append(pid))
     monkeypatch.setattr(

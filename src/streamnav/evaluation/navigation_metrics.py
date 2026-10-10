@@ -34,4 +34,13 @@ def aggregate_metrics(episodes):
             )
             / len(episodes),
         )
+    if all("max_alternating_turns" in e for e in episodes):
+        result.update(
+            alternating_turn_episode_rate=sum(e["max_alternating_turns"] >= 8 for e in episodes)
+            / len(episodes),
+            long_alternating_turn_episode_rate=sum(
+                e["max_alternating_turns"] >= 100 for e in episodes
+            )
+            / len(episodes),
+        )
     return result

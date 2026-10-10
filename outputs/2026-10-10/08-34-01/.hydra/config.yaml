@@ -1,0 +1,182 @@
+checkpoint: /inspire/qb-ilm2/project/spatiotemporal-intelligence-research/ky26298/Projects/Active_Navigation/FastVLN/runs/streamnav_pointing_20261010/ealm/checkpoints/update_0000003
+data:
+  iterator_options:
+    max_scene_repeat_steps: 50000
+    step_repetition_range: 0.2
+  sources:
+  - manifest: runtime/data/manifests/hm3d_ovon_train.json
+    weight: 1.0
+device: cuda:0
+distributed:
+  gpu_offset: 0
+  gradient_sync: ddp
+  world_size: 8
+eval:
+  episodes: 100
+  manifests:
+  - runtime/data/manifests/hm3d_ovon_val_seen.json
+  - runtime/data/manifests/hm3d_ovon_val_seen_synonyms.json
+  - runtime/data/manifests/hm3d_ovon_val_unseen.json
+  max_steps: 500
+  num_envs: 12
+  stratified: true
+  video: true
+  video_anchor_episodes: 1
+  video_episodes: 6
+  video_selection: representative
+habitat:
+  agent_height: 0.88
+  agent_radius: 0.18
+  forward_step: 0.25
+  gpu_device_id: 0
+  height: 270
+  hfov: 120
+  max_episode_steps: 500
+  navmesh_agent_max_climb: 0.1
+  navmesh_cache: runtime/cache/navmesh
+  navmesh_cell_height: 0.05
+  oracle: objnav_explorer
+  oracle_config:
+    area_thresh: 1.5
+    beeline_dist_thresh: 3.5
+    map_resolution: 128
+    visibility_dist: 3.0
+  oracle_execution: collision_safe
+  perception_labels: true
+  python: runtime/habitat-env/bin/python
+  reward:
+    collision_penalty: 0.003
+    false_stop_penalty: 0.0
+    progress_scale: 0.0
+    slack_penalty: 0.001
+    success_reward: 5.0
+  sensor_height: 0.88
+  sensor_pitch_deg: 0.0
+  success_distance: 0.25
+  tilt_angle: 30
+  timeout_s: 120
+  turn_angle: 30
+  width: 480
+model:
+  action_dim: 6
+  action_names:
+  - STOP
+  - MOVE_FORWARD
+  - TURN_LEFT
+  - TURN_RIGHT
+  - LOOK_UP
+  - LOOK_DOWN
+  base_model: Qwen/Qwen3.5-0.8B
+  checkpoint: /inspire/qb-ilm2/project/spatiotemporal-intelligence-research/ky26298/Projects/Active_Navigation/FastVLN/checkpoints/pointing_initialization_20261010
+  critic_gain: 0.0
+  critic_type: linear
+  dtype: bfloat16
+  freeze_vision_encoder: true
+  goal_conditioning: chat_query
+  gradient_checkpointing: true
+  image_size:
+  - 270
+  - 480
+  inference_mode: chunk
+  kda_output_norm: true
+  perception:
+    embedding_dim: 64
+    enabled: true
+  value_hidden_dim: 512
+run_dir: /inspire/qb-ilm2/project/spatiotemporal-intelligence-research/ky26298/Projects/Active_Navigation/FastVLN/runs/streamnav_pointing_20261010/ealm
+seed: 2025
+serving:
+  demo_episodes: 48
+  host: 127.0.0.1
+  max_batch_size: 8
+  max_sessions: 16
+  port: 8765
+  reload_on_demo_reset: true
+  session_ttl_s: 900
+trainer:
+  actor_warmup_updates: 0
+  auxiliary_il:
+    num_envs: 0
+  backbone_lr: 1.0e-05
+  batch_chat_body: true
+  cache_frozen_vision: true
+  cache_replay_embeddings: true
+  checkpoint_interval: 50
+  collapse_threshold: 0.95
+  collapse_window: 10
+  critic_lr: 2.5e-05
+  curriculum:
+    duration_updates: 2000
+    enabled: false
+    end_distance: 6.0
+    probability: 0.5
+    start_distance: 1.5
+  dagger:
+    beta_end: 0.0
+    beta_start: 0.0
+    decay_updates: 10000
+  ddp_find_unused_parameters: false
+  ealm:
+    enabled: true
+    entropy_ema_decay: 0.95
+    entropy_high: 0.75
+    entropy_low: 0.35
+    fixed_alpha: 0.5
+  early_eval_updates:
+  - 50
+  eval_episodes: 48
+  eval_first_update: false
+  eval_interval: 100
+  eval_max_steps: 500
+  filter_blocked_forward_labels: true
+  fork_recipe_changes: []
+  fused_optimizer: true
+  head_lr: 0.00025
+  il_class_weights:
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  initialize_optimizer_branches: true
+  keep_checkpoints: 2
+  log_policy_gradient_terms: true
+  loss:
+    entropy_coef: 0.01
+    value_coef: 0.5
+  max_grad_norm: 0.2
+  num_envs: 4
+  num_updates: 2500
+  optimizer: adam
+  optimizer_eps: 1.0e-05
+  perception_loss:
+    apos_coef: 0.05
+    arrival_coef: 0.1
+    opos_coef: 0.1
+  perception_lr: 0.00025
+  ppo:
+    bootstrap_time_limits: false
+    clip_eps: 0.2
+    gae_lambda: 0.95
+    gamma: 0.99
+    replay_log_prob_tolerance: 0.05
+    use_clipped_value_loss: true
+    use_normalized_advantage: false
+  replay_pack_frames: 64
+  replay_preflight: true
+  revision: 13
+  rollout_inference_batch_size: 2
+  rollout_steps: 100
+  sequence_batch_size: 2
+  sequence_length: 100
+  supervision:
+    min_updates: 500
+    stale_seconds: 3600
+    stop_on_failure: true
+    zero_sr_patience: 5
+  total_num_steps: 1000000000
+  update_epochs: 1
+  verify_data_hashes: false
+  vision_lr: 0.0
+  weight_decay: 0.0

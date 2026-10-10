@@ -7,4 +7,6 @@ max_steps: 500
 video: true
 num_envs: 12
 stratified: true
-video_episodes: 1
+video_episodes: 6
+video_selection: representative
+video_anchor_episodes: 1

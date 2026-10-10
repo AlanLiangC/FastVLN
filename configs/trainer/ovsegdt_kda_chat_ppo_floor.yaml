@@ -1,0 +1,8 @@
+defaults:
+  - ovsegdt_kda_chat_temporal_fast
+  - _self_
+# Independent branch; preserve all saved optimizer/RNG/sampler state.
+fork_recipe_changes: [ealm]
+ealm:
+  minimum_ppo_weight: 0.2
+log_policy_gradient_terms: true

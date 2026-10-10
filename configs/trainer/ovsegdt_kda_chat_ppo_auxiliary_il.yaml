@@ -1,0 +1,6 @@
+defaults:
+  - ovsegdt_kda_chat_auxiliary_il
+  - _self_
+fork_recipe_changes: [ealm, auxiliary_il]
+ealm:
+  minimum_ppo_weight: 0.2

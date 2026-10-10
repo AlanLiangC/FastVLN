@@ -1,0 +1,17 @@
+defaults:
+  - ovsegdt_kda_chat_temporal_fast
+  - _self_
+revision: 13
+actor_warmup_updates: 0
+initialize_optimizer_branches: false
+perception_lr: 0.00025
+perception_loss:
+  apos_coef: 0.05
+  opos_coef: 0.10
+  arrival_coef: 0.10
+filter_blocked_forward_labels: true
+verify_data_hashes: false
+checkpoint_interval: 50
+keep_checkpoints: 2
+eval_first_update: false
+early_eval_updates: [50]

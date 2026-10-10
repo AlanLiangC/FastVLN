@@ -11,7 +11,7 @@ from pathlib import Path
 import yaml
 
 from streamnav.training.health import learning_health
-from streamnav.utils.process_health import training_process_alive
+from streamnav.utils.process_health import training_process_alive, training_stop_targets
 
 
 def read_rows(path):
@@ -87,10 +87,19 @@ def main():
                 health["stop_recommended"] = True
         if not alive:
             target = cfg.get("trainer", {}).get("num_updates", 10000)
+            request_file = output / "stop_request.json"
+            manual_stop = (
+                request_file.exists()
+                and json.loads(request_file.read_text()).get("training_pid") == args.pid
+            )
             health["status"] = (
                 "complete"
                 if health["update"] >= target
-                else ("halted_for_review" if stopped_for_health else "process_exited_early")
+                else (
+                    "halted_for_review"
+                    if stopped_for_health
+                    else ("stopped" if manual_stop else "process_exited_early")
+                )
             )
             write_status(output / "health_status.json", health)
             print(json.dumps({"training_exit": health}), flush=True)
@@ -104,7 +113,7 @@ def main():
             if worker_alive(args.pid):
                 # Signal workers, not torchrun: torchrun escalates to SIGKILL
                 # after a short timeout, possibly interrupting checkpoint I/O.
-                targets = [w["pid"] for w in workers] or [args.pid]
+                targets = training_stop_targets(workers, args.pid)
                 for pid in targets:
                     if worker_alive(pid):
                         try:

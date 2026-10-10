@@ -1,0 +1,6 @@
+defaults:
+  - ovsegdt_kda_chat_temporal_fast
+  - _self_
+fork_recipe_changes: [backbone_optimizer_eps]
+backbone_optimizer_eps: 0.000001
+log_policy_gradient_terms: true

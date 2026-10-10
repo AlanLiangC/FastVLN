@@ -14,6 +14,7 @@ import torch
 import yaml
 from safetensors.torch import load_file, save_file
 
+from streamnav.contracts.perception import perception_config
 from streamnav.data.manifest import file_hash
 from streamnav.models.policy.streaming_policy import StreamingObjectNavPolicy
 from streamnav.models.qwen35_kda.backbone import Qwen35KDABackbone
@@ -35,6 +36,7 @@ def load_policy(config, training=False, preserve_master_weights=False):
         model_cfg["goal_conditioning"] = saved_model.get("goal_conditioning", "episode")
         model_cfg["kda_output_norm"] = saved_model.get("kda_output_norm", False)
         model_cfg["critic_gain"] = saved_model.get("critic_gain", 1.0)
+        model_cfg["perception"] = saved_model.get("perception")
     if model_cfg["action_dim"] not in (4, 6) or model_cfg["dtype"] not in ("bfloat16", "float32"):
         raise ValueError("Only six/legacy-four actions and bf16/fp32 precision are supported")
     # FP32 master parameters/moments for the optimizer, BF16 autocast compute.
@@ -63,12 +65,23 @@ def load_policy(config, training=False, preserve_master_weights=False):
         model_cfg["action_dim"],
         model_cfg.get("critic_type", "mlp"),
         model_cfg.get("critic_gain", 1.0),
+        perception=model_cfg.get("perception"),
     )
     policy.inference_compute_dtype = getattr(torch, model_cfg["dtype"])
     policy.loaded_checkpoint = str(path)
     heads = Path(path) / "actor_critic.safetensors"
     if heads.exists():
         policy.actor_critic.load_state_dict(load_file(str(heads)))
+    perception_weights = path / "perception.safetensors"
+    if policy.perception is not None:
+        if perception_weights.exists():
+            policy.perception.load_state_dict(load_file(str(perception_weights)))
+        elif config.get("checkpoint"):
+            raise ValueError(
+                "Resume checkpoint lacks perception weights; use explicit weight initialization"
+            )
+    elif perception_weights.exists():
+        raise ValueError("Cannot discard a checkpoint's perception action branch")
     return policy
 
 
@@ -86,6 +99,19 @@ def provenance(config):
     if source_revision is None and revision_file.exists():
         source_revision = revision_file.read_text().splitlines()[0]
     serialized = json.dumps(config, sort_keys=True)
+    initialization = Path(config.get("checkpoint") or config["model"]["checkpoint"]).resolve()
+    calibration = initialization / "conversion_calibration.json"
+    distillation = initialization / "conversion_distillation.json"
+    initialization_record = {
+        "checkpoint": str(initialization),
+        "weights_sha256": {p.name: file_hash(p) for p in initialization.glob("*.safetensors")},
+        "conversion_calibration": json.loads(calibration.read_text())
+        if calibration.exists()
+        else None,
+        "conversion_distillation": json.loads(distillation.read_text())
+        if distillation.exists()
+        else None,
+    }
     source_hash = hashlib.sha256()
     source_files = []
     for folder in (
@@ -124,6 +150,7 @@ def provenance(config):
         "source_archive_sha256": file_hash(archive),
         "qwen_revision": source_revision or "unknown-local-source",
         "qwen_source_config_sha256": layout_data["source_config_sha256"],
+        "model_initialization": initialization_record,
         "qwen_source_weight_sha256": {p.name: file_hash(p) for p in source.glob("*.safetensors")},
         "fla_revision": f"PyPI:{importlib.metadata.version('flash-linear-attention')}",
         "versions": {
@@ -154,6 +181,14 @@ def save_checkpoint(
             {k: v.detach().cpu().contiguous() for k, v in policy.actor_critic.state_dict().items()},
             str(temp / "actor_critic.safetensors"),
         )
+        if getattr(policy, "perception", None) is not None:
+            save_file(
+                {
+                    k: v.detach().cpu().contiguous()
+                    for k, v in policy.perception.state_dict().items()
+                },
+                str(temp / "perception.safetensors"),
+            )
         policy.backbone.config.save_pretrained(temp)
         policy.backbone.tokenizer.save_pretrained(temp / "tokenizer")
         shutil.copy2(
@@ -231,8 +266,9 @@ def promote_best_checkpoint(run_dir, update, results):
     return True
 
 
-def restore_training(path, optimizer, scheduler, dagger, sources, config=None, mixer=None):
-    # Only load checkpoints created by this project and trusted by the user.
+def validate_resume_configuration(path, config):
+    """Validate before touching a run; recipe experiments require an empty fork."""
+    changes = {}
     if config is not None:
         previous = yaml.safe_load((Path(path) / "resolved_config.yaml").read_text())
         if previous["trainer"].get("revision", 1) != config["trainer"].get("revision", 1):
@@ -275,8 +311,31 @@ def restore_training(path, optimizer, scheduler, dagger, sources, config=None, m
             "kda_output_norm", False
         ):
             raise ValueError("Resume model configuration changed: kda_output_norm")
+        if perception_config(previous["model"].get("perception")) != perception_config(
+            config["model"].get("perception")
+        ):
+            raise ValueError(
+                "Resume perception architecture changed; use explicit weight initialization"
+            )
+        for section, key in (
+            ("trainer", "perception_loss"),
+            ("trainer", "perception_lr"),
+            ("habitat", "perception_labels"),
+        ):
+            if previous[section].get(key) != config[section].get(key):
+                raise ValueError(f"Resume perception recipe changed: {section}.{key}")
         if previous["trainer"]["dagger"] != config["trainer"]["dagger"]:
             raise ValueError("Resume requires the same DAgger schedule")
+        allowed = config["trainer"].get("fork_recipe_changes", [])
+        permitted = {
+            "ealm",
+            "auxiliary_il",
+            "backbone_optimizer_eps",
+            "oracle_execution",
+            "filter_blocked_forward_labels",
+        }
+        if not isinstance(allowed, list) or not set(allowed).issubset(permitted):
+            raise ValueError(f"Recipe forks permit only {', '.join(sorted(permitted))}")
         for key in (
             "ppo",
             "ealm",
@@ -297,9 +356,39 @@ def restore_training(path, optimizer, scheduler, dagger, sources, config=None, m
             "sequence_length",
             "sequence_batch_size",
             "update_epochs",
+            "backbone_optimizer_eps",
+            "auxiliary_il",
+            "filter_blocked_forward_labels",
         ):
-            if previous["trainer"].get(key) != config["trainer"].get(key):
-                raise ValueError(f"Resume training recipe changed: {key}")
+            before, after = previous["trainer"].get(key), config["trainer"].get(key)
+            if key == "ealm":
+                before = {"minimum_ppo_weight": 0.0, **before}
+                after = {"minimum_ppo_weight": 0.0, **after}
+            if key == "auxiliary_il":
+                from streamnav.training.auxiliary_il import auxiliary_il_config
+
+                before, after = auxiliary_il_config(before), auxiliary_il_config(after)
+            if key == "filter_blocked_forward_labels":
+                before, after = bool(before), bool(after)
+            if before != after:
+                if key not in allowed:
+                    raise ValueError(f"Resume training recipe changed: {key}")
+                changes[key] = {"before": before, "after": after}
+        before = previous["habitat"].get("oracle_execution", "upstream")
+        after = config["habitat"].get("oracle_execution", "upstream")
+        if after not in ("upstream", "collision_safe"):
+            raise ValueError("Unknown oracle_execution")
+        if before != after:
+            if "oracle_execution" not in allowed:
+                raise ValueError("Resume environment recipe changed: oracle_execution")
+            changes["oracle_execution"] = {"before": before, "after": after}
+        if changes:
+            destination = Path(config["run_dir"]).resolve()
+            metrics = destination / "train_metrics.jsonl"
+            if destination == Path(previous["run_dir"]).resolve() or (
+                metrics.exists() and metrics.stat().st_size
+            ):
+                raise ValueError("Training recipe changes require a new, empty run_dir")
         for key in ("oracle", "oracle_config", "reward", "tilt_angle", "max_episode_steps"):
             if previous["habitat"].get(key) != config["habitat"].get(key):
                 raise ValueError(f"Resume environment recipe changed: {key}")
@@ -308,12 +397,25 @@ def restore_training(path, optimizer, scheduler, dagger, sources, config=None, m
             manifest_path = item["manifest"]
             if saved_manifest["dataset_manifests"][manifest_path] != file_hash(manifest_path):
                 raise ValueError(f"Training manifest changed since checkpoint: {manifest_path}")
+    return changes
+
+
+def restore_training(
+    path, optimizer, scheduler, dagger, sources, config=None, mixer=None, auxiliary_controller=None
+):
+    # Only load checkpoints created by this project and trusted by the user.
+    fork_changes = validate_resume_configuration(path, config)
     saved = torch.load(Path(path) / "optimizer.pt", map_location="cpu", weights_only=False)
     from streamnav.training.distributed import rank, world_size
 
     if saved.get("world_size", 1) != world_size():
         raise ValueError("Resume requires the same distributed world size")
     optimizer.load_state_dict(saved["optimizer"])
+    if config is not None:
+        from streamnav.training.optimizer import optimizer_epsilon
+
+        for group in optimizer.param_groups:
+            group["eps"] = optimizer_epsilon(config["trainer"], group.get("role"))
     scheduler.load_state_dict(saved["scheduler"])
     dagger.update = json.loads((Path(path) / "dagger_scheduler.json").read_text())["update"]
     per_rank = saved["rank_states"][rank()] if saved.get("rank_states") else saved
@@ -321,7 +423,110 @@ def restore_training(path, optimizer, scheduler, dagger, sources, config=None, m
         if "mixer" not in per_rank:
             raise ValueError("Checkpoint lacks the per-rank EALM entropy EMA")
         mixer.load_state_dict(per_rank["mixer"])
+    if (
+        auxiliary_controller is not None
+        and "auxiliary_il" in per_rank
+        and "auxiliary_il" not in fork_changes
+    ):
+        auxiliary_controller.load_state_dict(per_rank["auxiliary_il"])
     for source, state in zip(sources, per_rank["sources"], strict=True):
         source.load_state_dict(state)
     restore_rng(per_rank["rng"])
     return saved["update"]
+
+
+def initialize_training_branches(path, optimizer, sources, config, mixer):
+    """Explicit new-run initialization: preserve old Adam/RNG/samplers, add new heads.
+
+    The new run has its own update counter and recipe; this is not full resume.
+    Existing optimizer groups must match exactly and never silently lose moments.
+    """
+    from streamnav.training.distributed import rank, world_size
+
+    path = Path(path)
+    previous = yaml.safe_load((path / "resolved_config.yaml").read_text())
+    if previous["data"] != config["data"]:
+        raise ValueError("Branch initialization requires identical training data and samplers")
+    manifest = json.loads((path / "manifest.json").read_text())
+    for item in config["data"]["sources"]:
+        filename = item["manifest"]
+        if manifest["dataset_manifests"][filename] != file_hash(filename):
+            raise ValueError("Branch initialization training manifest changed")
+    for section, keys in (
+        (
+            "model",
+            (
+                "image_size",
+                "action_dim",
+                "value_hidden_dim",
+                "critic_type",
+                "goal_conditioning",
+                "kda_output_norm",
+                "freeze_vision_encoder",
+            ),
+        ),
+        (
+            "habitat",
+            (
+                "width",
+                "height",
+                "hfov",
+                "sensor_height",
+                "sensor_pitch_deg",
+                "agent_height",
+                "agent_radius",
+                "success_distance",
+                "forward_step",
+                "turn_angle",
+                "oracle",
+                "oracle_execution",
+                "oracle_config",
+                "reward",
+            ),
+        ),
+    ):
+        for key in keys:
+            if previous[section].get(key) != config[section].get(key):
+                raise ValueError(f"Branch initialization changed {section}.{key}")
+    saved = torch.load(path / "optimizer.pt", map_location="cpu", weights_only=False)
+    if saved.get("world_size", 1) != world_size():
+        raise ValueError("Branch initialization requires the original distributed world size")
+    restore_optimizer_branches(optimizer, saved["optimizer"])
+    per_rank = saved["rank_states"][rank()] if saved.get("rank_states") else saved
+    mixer.load_state_dict(per_rank["mixer"])
+    for source, state in zip(sources, per_rank["sources"], strict=True):
+        source.load_state_dict(state)
+    restore_rng(per_rank["rng"])
+    return {
+        "parent_update": saved["update"],
+        "checkpoint": str(path.resolve()),
+        "restored": "existing Adam moments, per-rank RNG/samplers/EALM",
+        "new": "perception branch and new-run update/schedule counters",
+        "episode_state": "simulator episodes and recurrent caches restart",
+    }
+
+
+def restore_optimizer_branches(optimizer, saved):
+    current = optimizer.state_dict()
+    old_groups = {group["role"]: group for group in saved["param_groups"]}
+    current_roles = {group["role"] for group in current["param_groups"]}
+    if set(old_groups) - current_roles:
+        raise ValueError("Cannot discard an existing optimizer branch")
+    for actual, group in zip(optimizer.param_groups, current["param_groups"], strict=True):
+        old = old_groups.get(group["role"])
+        if old is None:
+            if group["role"] != "perception":
+                raise ValueError("Only the perception optimizer branch may be newly initialized")
+            continue
+        if len(old["params"]) != len(group["params"]):
+            raise ValueError(f"Optimizer parameter count changed in {group['role']}")
+        for parameter, new_id, old_id in zip(
+            actual["params"], group["params"], old["params"], strict=True
+        ):
+            state = saved["state"].get(old_id)
+            if state is not None:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in state and state[key].shape != parameter.shape:
+                        raise ValueError(f"Optimizer shape changed in {group['role']}")
+                current["state"][new_id] = state
+    optimizer.load_state_dict(current)
