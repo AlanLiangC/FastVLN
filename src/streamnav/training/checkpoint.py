@@ -22,6 +22,14 @@ from streamnav.utils.seed import restore_rng, rng_state
 
 
 def load_policy(config, training=False, preserve_master_weights=False):
+    if config["model"].get("family") == "lightnav_kda":
+        from streamnav.models.lightnav_kda.policy import LightNavKDAPolicy
+        from streamnav.training.lightnav_trainer import load_adapters
+
+        lightnav_policy = LightNavKDAPolicy(config)
+        if config.get("checkpoint"):
+            load_adapters(lightnav_policy, config["checkpoint"])
+        return lightnav_policy.train(training)
     device = torch.device(config["device"])
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -75,7 +83,11 @@ def load_policy(config, training=False, preserve_master_weights=False):
     perception_weights = path / "perception.safetensors"
     if policy.perception is not None:
         if perception_weights.exists():
-            policy.perception.load_state_dict(load_file(str(perception_weights)))
+            saved_config = yaml.safe_load((path / "resolved_config.yaml").read_text())
+            source_scale = perception_config(saved_config["model"].get("perception"))[
+                "fusion_scale"
+            ]
+            policy.perception.load_scaled_weights(load_file(str(perception_weights)), source_scale)
         elif config.get("checkpoint"):
             raise ValueError(
                 "Resume checkpoint lacks perception weights; use explicit weight initialization"
@@ -324,6 +336,9 @@ def validate_resume_configuration(path, config):
         ):
             if previous[section].get(key) != config[section].get(key):
                 raise ValueError(f"Resume perception recipe changed: {section}.{key}")
+        for key, default in (("oracle_success_stop", False), ("arrival_near_distance", 0.75)):
+            if previous["habitat"].get(key, default) != config["habitat"].get(key, default):
+                raise ValueError(f"Resume supervision recipe changed: habitat.{key}")
         if previous["trainer"]["dagger"] != config["trainer"]["dagger"]:
             raise ValueError("Resume requires the same DAgger schedule")
         allowed = config["trainer"].get("fork_recipe_changes", [])
@@ -349,6 +364,9 @@ def validate_resume_configuration(path, config):
             "weight_decay",
             "max_grad_norm",
             "il_class_weights",
+            "stop_calibration_coef",
+            "stop_hard_negative_coef",
+            "stop_calibration_prior_correction",
             "curriculum",
             "actor_warmup_updates",
             "num_envs",
@@ -361,6 +379,10 @@ def validate_resume_configuration(path, config):
             "filter_blocked_forward_labels",
         ):
             before, after = previous["trainer"].get(key), config["trainer"].get(key)
+            if key in ("stop_calibration_coef", "stop_hard_negative_coef"):
+                before, after = before or 0.0, after or 0.0
+            if key == "stop_calibration_prior_correction":
+                before, after = bool(before), bool(after)
             if key == "ealm":
                 before = {"minimum_ppo_weight": 0.0, **before}
                 after = {"minimum_ppo_weight": 0.0, **after}
@@ -435,7 +457,7 @@ def restore_training(
     return saved["update"]
 
 
-def initialize_training_branches(path, optimizer, sources, config, mixer):
+def initialize_training_branches(path, optimizer, sources, config, mixer, policy=None):
     """Explicit new-run initialization: preserve old Adam/RNG/samplers, add new heads.
 
     The new run has its own update counter and recipe; this is not full resume.
@@ -492,6 +514,12 @@ def initialize_training_branches(path, optimizer, sources, config, mixer):
     if saved.get("world_size", 1) != world_size():
         raise ValueError("Branch initialization requires the original distributed world size")
     restore_optimizer_branches(optimizer, saved["optimizer"])
+    source_scale = perception_config(previous["model"].get("perception"))["fusion_scale"]
+    target_scale = perception_config(config["model"].get("perception"))["fusion_scale"]
+    if source_scale != target_scale:
+        if policy is None or policy.perception is None:
+            raise ValueError("Fusion reparameterization requires the initialized policy")
+        policy.perception.rescale_optimizer_moments(optimizer, source_scale)
     per_rank = saved["rank_states"][rank()] if saved.get("rank_states") else saved
     mixer.load_state_dict(per_rank["mixer"])
     for source, state in zip(sources, per_rank["sources"], strict=True):
@@ -503,6 +531,20 @@ def initialize_training_branches(path, optimizer, sources, config, mixer):
         "restored": "existing Adam moments, per-rank RNG/samplers/EALM",
         "new": "perception branch and new-run update/schedule counters",
         "episode_state": "simulator episodes and recurrent caches restart",
+        "fusion_reparameterization": {
+            "source_scale": source_scale,
+            "target_scale": target_scale,
+            "weights": "rescaled to preserve initial action logits",
+            "adam": "fusion gradient moments transformed to new coordinates",
+        },
+        "supervision_changes": {
+            key: {
+                "before": previous["habitat"].get(key, default),
+                "after": config["habitat"].get(key, default),
+            }
+            for key, default in (("oracle_success_stop", False), ("arrival_near_distance", 0.75))
+            if previous["habitat"].get(key, default) != config["habitat"].get(key, default)
+        },
     }
 
 

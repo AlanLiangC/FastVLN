@@ -32,6 +32,8 @@ habitat:
     visibility_dist: 3.0
     area_thresh: 1.5
   success_distance: 0.25
+  oracle_success_stop: false
+  arrival_near_distance: 0.75
   max_episode_steps: 500
   timeout_s: 120
   reward:

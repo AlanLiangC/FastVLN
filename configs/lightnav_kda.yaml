@@ -1,0 +1,107 @@
+seed: 2025
+device: cuda:0
+run_dir: runs/lightnav_kda_active
+model:
+  family: lightnav_kda
+  checkpoint: checkpoints/lightnav0_base
+  dtype: bfloat16
+  language_compute_dtype: float32
+  recurrent_decode: true
+  float32_matmul_precision: high
+  action_dim: 6
+  video_size: [256, 448]
+  lora_rank: 16
+  lora_alpha: 16
+  gate_rank: 16
+  local_only_every: 4
+  gradient_checkpointing: true
+  inference_mode: frame_local_attention_plus_kda_memory
+data:
+  iterator_options:
+    max_scene_repeat_steps: 50000
+    step_repetition_range: 0.2
+  sources:
+    - manifest: runtime/data/manifests/hm3d_ovon_train.json
+      weight: 1.0
+trainer:
+  num_updates: 2500
+  num_envs: 2
+  rollout_steps: 100
+  sequence_length: 20
+  replay_mode: packed
+  learning_rates:
+    lora: 0.00001
+    memory: 0.0001
+    action: 0.0001
+    critic: 0.0001
+  warmup_updates: 50
+  expert_warmup_probability: 0.7
+  ppo_ramp_updates: 100
+  ppo_weight: 0.5
+  point_retention_coef: 0.1
+  point_teacher_interval: 4
+  teacher_history_frames: 8
+  value_loss_coef: 0.5
+  entropy_coef: 0.002
+  point_entropy_coef: 0.0001
+  max_grad_norm: 1.0
+  replay_tolerance: 0.05
+  checkpoint_interval: 25
+  eval_interval: 100
+  keep_checkpoints: 2
+  supervision:
+    stale_seconds: 3600
+    min_updates: 500
+    zero_sr_patience: 5
+    stop_on_failure: true
+eval:
+  manifests:
+    - runtime/data/manifests/hm3d_ovon_val_seen.json
+    - runtime/data/manifests/hm3d_ovon_val_seen_synonyms.json
+    - runtime/data/manifests/hm3d_ovon_val_unseen.json
+  episodes: 48
+  max_steps: 500
+  video: true
+  num_envs: 1
+  stratified: true
+  video_episodes: 6
+  video_selection: representative
+  video_anchor_episodes: 1
+habitat:
+  python: runtime/habitat-env/bin/python
+  gpu_device_id: 0
+  width: 480
+  height: 270
+  sensor_height: 0.88
+  sensor_pitch_deg: 0.0
+  hfov: 120
+  agent_height: 0.88
+  agent_radius: 0.18
+  navmesh_agent_max_climb: 0.10
+  navmesh_cell_height: 0.05
+  navmesh_cache: runtime/cache/navmesh
+  forward_step: 0.25
+  turn_angle: 30
+  tilt_angle: 30
+  oracle: objnav_explorer
+  oracle_execution: collision_safe
+  oracle_success_stop: true
+  oracle_config:
+    map_resolution: 128
+    beeline_dist_thresh: 3.5
+    visibility_dist: 3.0
+    area_thresh: 1.5
+  success_distance: 0.25
+  max_episode_steps: 500
+  timeout_s: 120
+  perception_labels: false
+  reward:
+    success_reward: 5.0
+    slack_penalty: 0.001
+    progress_scale: 0.1
+    collision_penalty: 0.003
+    false_stop_penalty: 0.0
+distributed:
+  gpu_offset: 0
+  world_size: 8
+  gradient_sync: manual

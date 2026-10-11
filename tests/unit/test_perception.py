@@ -268,3 +268,43 @@ def test_depth_visibility_masks_uncertainty_and_keeps_preaction_pose(
     assert result["opos_valid"] == expected_valid
     assert (result["opos"] > 0) == expected_point
     assert result["arrival"] == 2 and result["apos"] == APOS_STOP
+
+
+@pytest.mark.parametrize(
+    "aligned,distance,action,expected",
+    [
+        (True, 0.249, A.STOP, 2),
+        (True, 0.25, A.TURN_LEFT, 1),
+        (True, 0.749, A.TURN_LEFT, 1),
+        (True, 0.75, A.TURN_LEFT, 0),
+        (False, 0.249, A.TURN_LEFT, 1),
+        (False, 0.25, A.TURN_LEFT, 0),
+    ],
+)
+def test_arrival_supervision_agrees_with_success_radius(
+    label_module, monkeypatch, aligned, distance, action, expected
+):
+    camera = SimpleNamespace(position=np.zeros(3), rotation=SimpleNamespace(inverse=lambda: None))
+    env = SimpleNamespace(
+        sim=SimpleNamespace(
+            get_agent=lambda _: SimpleNamespace(
+                get_state=lambda: SimpleNamespace(sensor_states={"rgb": camera})
+            )
+        ),
+        _sensor_observations=lambda: {"perception_depth": np.ones((27, 48))},
+        episode={"goals": []},
+        uid="episode",
+        steps=0,
+        previous_distance=distance,
+        config={
+            "success_distance": 0.25,
+            "oracle_success_stop": aligned,
+            "arrival_near_distance": 0.75,
+        },
+        explorer=None,
+        oracle_goal=None,
+    )
+    monkeypatch.setattr(label_module.PerceptionLabeler, "affordance", lambda *args: None)
+    label = label_module.PerceptionLabeler(env).labels(action)
+    assert label["arrival"] == expected
+    assert (label["apos"] == APOS_STOP) == (action == A.STOP and distance < 0.25)

@@ -3,6 +3,38 @@ import pytest
 from streamnav.evaluation.navigation_metrics import aggregate_metrics
 
 
+@pytest.mark.parametrize("batch_body", [False, True])
+def test_standalone_evaluation_restores_training_body_mode(tmp_path, monkeypatch, batch_body):
+    import json
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    from streamnav.evaluation import runner
+
+    (tmp_path / "manifest.json").write_text(json.dumps({"update": 900}))
+    policy = SimpleNamespace(loaded_checkpoint=str(tmp_path), batch_chat_body=not batch_body)
+    calls = []
+    monkeypatch.setattr(runner.parallel, "initialize", lambda config: None)
+    monkeypatch.setattr(runner, "seed_everything", lambda seed: None)
+
+    def load(config, **kwargs):
+        assert kwargs["preserve_master_weights"] is True
+        return policy
+
+    def evaluate(actual, config, **kwargs):
+        calls.append((actual.batch_chat_body, kwargs["update"], kwargs["video"]))
+
+    monkeypatch.setattr(runner, "load_policy", load)
+    monkeypatch.setattr(runner, "evaluate", evaluate)
+    runner.main.__wrapped__(
+        OmegaConf.create(
+            {"seed": 2025, "trainer": {"batch_chat_body": batch_body}, "eval": {"video": True}}
+        )
+    )
+    assert calls == [(batch_body, 900, True)]
+
+
 def test_near_goal_stop_probabilities_are_weighted_by_decision_count():
     common = {
         "success": 0.0,

@@ -25,6 +25,7 @@ def training_process_alive(pid, parent=None, proc_root=Path("/proc")):
         process_alive(pid, marker, parent=parent, proc_root=proc_root)
         for marker in (
             "streamnav.training.trainer",
+            "streamnav.training.lightnav_trainer",
             "tools/check_ovsegdt_training.py",
             "tools/benchmark_training_recipes.py",
         )

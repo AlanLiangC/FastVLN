@@ -22,11 +22,13 @@ def rows(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default="runs/streamnav_active")
+    parser.add_argument("--root", default="runs/lightnav_kda_active")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     reports = []
-    for directory in sorted(Path(args.root).iterdir()):
+    root = Path(args.root)
+    directories = [root] if (root / "resolved_config.yaml").exists() else sorted(root.iterdir())
+    for directory in directories:
         if not directory.is_dir():
             continue
         train = rows(directory / "train_metrics.jsonl")
@@ -52,8 +54,8 @@ def main():
             {
                 "experiment": directory.name,
                 "update": last.get("update", 0),
-                "total_env_steps": last.get("total_env_steps", 0),
-                "last_update_seconds": last.get("update_seconds"),
+                "total_env_steps": last.get("total_env_steps", last.get("frames", 0)),
+                "last_update_seconds": last.get("update_seconds", last.get("elapsed_seconds")),
                 "autonomous_evaluation": latest,
                 "best_evaluation": best,
                 "health_age_seconds": round(time.time() - health.get("time", 0), 1),
@@ -73,9 +75,17 @@ def main():
             f"status={health.get('status', 'unknown')} monitor_age={report['health_age_seconds']}s"
         )
         print("  warnings:", ", ".join(health.get("warnings", [])) or "none")
+        progress = health.get("progress", {})
+        if progress:
+            print(
+                f"  progress: update={progress['update']} phase={progress['phase']} "
+                f"{progress['completed']}/{progress['total']} "
+                f"age={time.time() - progress['time']:.0f}s"
+            )
         best = report["best_evaluation"]
         if best:
-            print(f"  best: update={best['update']} macro_SR={best['score'][0]:.4f}")
+            score = best["success"] if "success" in best else best["score"][0]
+            print(f"  best: update={best['update']} macro_SR={score:.4f}")
         for split, evaluation in report["autonomous_evaluation"].items():
             print(f"  {split}: {json.dumps(evaluation)}")
     subprocess.run(

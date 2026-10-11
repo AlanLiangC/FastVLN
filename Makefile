@@ -12,14 +12,14 @@ unit:
 	python -m pytest tests/unit tests/regression -q
 gpu:
 	source scripts/env.sh
-	python -m pytest tests/gpu -q
+	python tools/validate_lightnav_kda.py
 integration:
 	source scripts/env.sh
 	STREAMNAV_INTEGRATION=1 python -m pytest tests/integration -q
 smoke:
 	source scripts/env.sh
-	python -m streamnav.training.trainer data=hm3d_v1 eval=hm3d_v1 run_dir=runs/smoke_$$(date -u +%Y%m%d_%H%M%S) trainer.num_updates=1 trainer.num_envs=2 trainer.rollout_steps=4 trainer.sequence_length=4 trainer.sequence_batch_size=2 trainer.update_epochs=1 trainer.checkpoint_interval=1 trainer.eval_interval=1 trainer.eval_episodes=3 trainer.eval_max_steps=4
+	python -m streamnav.training.lightnav_trainer --run-dir runs/lightnav_smoke_$$(date -u +%Y%m%d_%H%M%S) --updates 2 --num-envs 1 --rollout-steps 4 --sequence-length 2 --eval-episodes 3 --eval-max-steps 8 --skip-initial-eval
 train:
-	bash scripts/start_eight_gpu_training.sh
+	bash scripts/start_lightnav_training.sh
 viewer:
-	bash scripts/start_viewer.sh
+	python -m http.server 8765 --directory runs/lightnav_kda_active

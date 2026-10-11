@@ -9,13 +9,23 @@ from omegaconf import OmegaConf
 from streamnav.training.checkpoint import restore_training
 
 
-@pytest.mark.parametrize("key", ["backbone_lr", "head_lr", "vision_lr", "max_grad_norm"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "backbone_lr",
+        "head_lr",
+        "vision_lr",
+        "max_grad_norm",
+        "stop_calibration_coef",
+        "stop_hard_negative_coef",
+    ],
+)
 def test_resume_rejects_changed_optimizer_recipe_before_loading_state(tmp_path, key):
     with initialize_config_dir(version_base=None, config_dir=str(Path("configs").resolve())):
         config = OmegaConf.to_container(compose(config_name="config"), resolve=True)
     (tmp_path / "resolved_config.yaml").write_text(yaml.safe_dump(config))
     changed = copy.deepcopy(config)
-    changed["trainer"][key] += 0.001
+    changed["trainer"][key] = changed["trainer"].get(key, 0.0) + 0.001
     with pytest.raises(ValueError, match=f"recipe changed: {key}"):
         restore_training(tmp_path, None, None, None, [], changed)
 
@@ -57,4 +67,27 @@ def test_resume_rejects_changed_training_reset_distribution(tmp_path):
     changed = copy.deepcopy(config)
     changed["trainer"]["curriculum"]["enabled"] = True
     with pytest.raises(ValueError, match="recipe changed: curriculum"):
+        restore_training(tmp_path, None, None, None, [], changed)
+
+
+@pytest.mark.parametrize(
+    "key,value", [("oracle_success_stop", True), ("arrival_near_distance", 1.0)]
+)
+def test_resume_rejects_changed_success_supervision(tmp_path, key, value):
+    with initialize_config_dir(version_base=None, config_dir=str(Path("configs").resolve())):
+        config = OmegaConf.to_container(compose(config_name="config"), resolve=True)
+    (tmp_path / "resolved_config.yaml").write_text(yaml.safe_dump(config))
+    changed = copy.deepcopy(config)
+    changed["habitat"][key] = value
+    with pytest.raises(ValueError, match=f"supervision recipe changed: habitat.{key}"):
+        restore_training(tmp_path, None, None, None, [], changed)
+
+
+def test_resume_rejects_changed_stop_probability_prior(tmp_path):
+    with initialize_config_dir(version_base=None, config_dir=str(Path("configs").resolve())):
+        config = OmegaConf.to_container(compose(config_name="config"), resolve=True)
+    (tmp_path / "resolved_config.yaml").write_text(yaml.safe_dump(config))
+    changed = copy.deepcopy(config)
+    changed["trainer"]["stop_calibration_prior_correction"] = True
+    with pytest.raises(ValueError, match="recipe changed: stop_calibration_prior_correction"):
         restore_training(tmp_path, None, None, None, [], changed)

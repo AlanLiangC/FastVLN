@@ -12,9 +12,48 @@ from streamnav.contracts.perception import (
 )
 
 
+def point_type_logits(logits):
+    """Compare aggregate point probability with each singleton sentinel."""
+    if logits.shape[-1] not in (APOS_SIZE, OPOS_SIZE):
+        raise ValueError("Invalid pointing vocabulary")
+    return torch.cat(
+        (
+            logits[..., :1],
+            logits[..., 1 : POINT_CELLS + 1].float().logsumexp(-1, keepdim=True),
+            logits[..., POINT_CELLS + 1 :],
+        ),
+        dim=-1,
+    )
+
+
+def point_type_targets(target):
+    return torch.where(
+        target > POINT_CELLS,
+        target - POINT_CELLS + 1,
+        (target > 0).long(),
+    )
+
+
+def decode_point_logits(logits, *, hierarchical=False):
+    if not hierarchical:
+        return logits.argmax(-1)
+    kind = point_type_logits(logits).argmax(-1)
+    location = logits[..., 1 : POINT_CELLS + 1].argmax(-1) + 1
+    return torch.where(kind == 1, location, torch.where(kind == 0, 0, POINT_CELLS + kind - 1))
+
+
 class NavigationPerception(nn.Module):
-    def __init__(self, hidden_dim, action_dim, embedding_dim=64):
+    def __init__(
+        self,
+        hidden_dim,
+        action_dim,
+        embedding_dim=64,
+        fusion_scale=1.0,
+        supervision_backbone_scale=1.0,
+    ):
         super().__init__()
+        self.fusion_scale = fusion_scale
+        self.supervision_backbone_scale = supervision_backbone_scale
         self.norm = nn.LayerNorm(hidden_dim)
         self.apos = nn.Linear(hidden_dim, APOS_SIZE)
         self.opos = nn.Linear(hidden_dim, OPOS_SIZE)
@@ -52,13 +91,16 @@ class NavigationPerception(nn.Module):
         nn.init.zeros_(self.action_residual.weight)
         nn.init.zeros_(self.action_residual.bias)
 
-    def forward(self, hidden):
+    def predict(self, hidden):
         features = self.norm(hidden)
-        predictions = {
+        return {
             "apos": self.apos(features).float(),
             "opos": self.opos(features).float(),
             "arrival": self.arrival(features).float(),
         }
+
+    def forward(self, hidden):
+        predictions = self.predict(hidden)
         probabilities = {name: logits.softmax(-1) for name, logits in predictions.items()}
         expected = [
             probabilities[name].to(table.weight.dtype) @ table.weight
@@ -76,5 +118,32 @@ class NavigationPerception(nn.Module):
             )
         )
         # No teacher-forced coordinates, hard STOP override or extra body forward.
-        residual = self.action_residual(torch.cat(expected, dim=-1)).float()
-        return predictions, residual
+        residual = self.action_residual(torch.cat(expected, dim=-1)).float() * self.fusion_scale
+        supervision = predictions
+        if torch.is_grad_enabled() and self.supervision_backbone_scale != 1:
+            # Weak auxiliary labels must not overwhelm navigation features.
+            # Keep full head gradients and the original IL/PPO fusion gradient;
+            # scale only the teacher loss gradient entering the shared backbone.
+            teacher_hidden = (
+                hidden.detach() + (hidden - hidden.detach()) * self.supervision_backbone_scale
+            )
+            supervision = self.predict(teacher_hidden)
+        return supervision, residual
+
+    def load_scaled_weights(self, state, source_scale=1.0):
+        # A power-of-two reparameterization preserves initial policy decisions
+        # while increasing the effective learning rate of the fusion branch.
+        state = dict(state)
+        ratio = source_scale / self.fusion_scale
+        for name in ("action_residual.weight", "action_residual.bias"):
+            state[name] = state[name] * ratio
+        self.load_state_dict(state)
+
+    def rescale_optimizer_moments(self, optimizer, source_scale=1.0):
+        # dL/dW_new = (new_scale / old_scale) * dL/dW_old.
+        ratio = self.fusion_scale / source_scale
+        for parameter in self.action_residual.parameters():
+            state = optimizer.state.get(parameter, {})
+            for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                if name in state:
+                    state[name].mul_(ratio if name == "exp_avg" else ratio**2)

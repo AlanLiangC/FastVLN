@@ -68,6 +68,10 @@ def main():
         # A resumed job may still have the previous launcher's worker file.
         workers = [w for w in workers if w.get("launcher_pid") == args.pid or w["pid"] == args.pid]
         health["workers"] = [{**w, "alive": worker_alive(w["pid"])} for w in workers]
+        progress_file = output / "training_progress.json"
+        progress = json.loads(progress_file.read_text()) if progress_file.exists() else {}
+        if progress.get("worker_pid") in {w["pid"] for w in workers}:
+            health["progress"] = progress
         health["expected_workers"] = cfg.get("distributed", {}).get("world_size", 1)
         if alive and not workers:
             # During resume, config/metrics still belong to the prior run until
@@ -82,7 +86,10 @@ def main():
                 start_time, (output / "train_metrics.jsonl").stat().st_mtime if rows else start_time
             )
             health["seconds_since_update"] = age
-            if age > supervision.get("stale_seconds", 1800):
+            progress_time = health.get("progress", {}).get("time", 0)
+            progress_age = min(age, now - progress_time)
+            health["seconds_since_progress"] = progress_age
+            if progress_age > supervision.get("stale_seconds", 1800):
                 health["warnings"].append("training_has_stopped_advancing")
                 health["stop_recommended"] = True
         if not alive:

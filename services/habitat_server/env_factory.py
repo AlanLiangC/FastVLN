@@ -33,6 +33,12 @@ class HabitatObjectNavEnv:
         self.reward = ObjectNavReward(RewardConfig(**config.get("reward", {})))
         self.explorer = None
         self._cached_observations = None
+        if config.get("oracle_success_stop", False):
+            near_distance = float(config.get("arrival_near_distance", 0.75))
+            if not np.isfinite(near_distance) or near_distance <= config.get(
+                "success_distance", 0.1
+            ):
+                raise ValueError("arrival_near_distance must exceed success_distance")
 
     def _make_sim(self, scene):
         if self.sim is not None:
@@ -272,6 +278,15 @@ class HabitatObjectNavEnv:
     def oracle(self):
         if self.ended:
             raise RuntimeError("Reset required after episode termination")
+        # Training advice must agree with the task's actual success condition.
+        # This changes labels only: the learner still executes its own actions,
+        # and autonomous evaluation never queries or applies this advice.
+        if (
+            self.config.get("oracle_success_stop", False)
+            and self.episode["split"] == "train"
+            and self.previous_distance < self.config.get("success_distance", 0.1)
+        ):
+            return NavigationAction.STOP
         if self.explorer is not None:
             # Exploration can legitimately move away from the object. Do not
             # apply the old greedy follower's distance-progress heuristic.

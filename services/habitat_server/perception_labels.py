@@ -63,7 +63,14 @@ class PerceptionLabeler:
         depth = env._sensor_observations()["perception_depth"]
         height, width = depth.shape
         hfov = env.config.get("hfov", 120)
-        near = env.previous_distance < env.config.get("success_distance", 0.25)
+        in_success = env.previous_distance < env.config.get("success_distance", 0.1)
+        success_aligned = env.config.get("oracle_success_stop", False)
+        near = (
+            env.previous_distance < env.config.get("arrival_near_distance", 0.75)
+            if success_aligned
+            else in_success
+        )
+        ready = in_success and (success_aligned or action == A.STOP)
         result = {
             "apos": 0,
             "apos_valid": False,
@@ -71,9 +78,7 @@ class PerceptionLabeler:
             "opos": 0,
             "opos_valid": False,
             "opos_confidence": 0.0,
-            "arrival": ARRIVAL_READY
-            if near and action == A.STOP
-            else (ARRIVAL_NEAR if near else ARRIVAL_FAR),
+            "arrival": ARRIVAL_READY if ready else (ARRIVAL_NEAR if near else ARRIVAL_FAR),
             "arrival_valid": True,
             "arrival_confidence": 1.0,
             "object_label_source": "geometry_depth_weak",
@@ -82,7 +87,7 @@ class PerceptionLabeler:
         }
         if action == A.STOP:
             # Local-frontier STOP is never arrival supervision.
-            if near:
+            if in_success:
                 result.update(apos=APOS_STOP, apos_valid=True, apos_confidence=1.0)
         else:
             target = (

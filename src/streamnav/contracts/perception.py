@@ -1,5 +1,8 @@
 """Frame-relative pointing vocabulary, shared by labels, heads and visualizations."""
 
+import math
+from typing import Any
+
 GRID_WIDTH = 48
 GRID_HEIGHT = 27
 POINT_CELLS = GRID_WIDTH * GRID_HEIGHT
@@ -31,7 +34,13 @@ def decode_pixel(token, width, height):
 
 
 def perception_config(config=None):
-    result = {"enabled": False, "embedding_dim": 64}
+    result: dict[str, Any] = {
+        "enabled": False,
+        "embedding_dim": 64,
+        "fusion_scale": 1.0,
+        "point_decoding": "flat",
+        "supervision_backbone_scale": 1.0,
+    }
     if config:
         unknown = set(config) - set(result)
         if unknown:
@@ -39,4 +48,13 @@ def perception_config(config=None):
         result.update(config)
     if not isinstance(result["enabled"], bool) or not 1 <= result["embedding_dim"] <= 256:
         raise ValueError("Invalid perception model configuration")
+    if not math.isfinite(result["fusion_scale"]) or not 0 < result["fusion_scale"] <= 32:
+        raise ValueError("Invalid perception fusion scale")
+    if result["point_decoding"] not in ("flat", "hierarchical"):
+        raise ValueError("Invalid perception point decoding")
+    if (
+        not math.isfinite(result["supervision_backbone_scale"])
+        or not 0 <= result["supervision_backbone_scale"] <= 1
+    ):
+        raise ValueError("Invalid perception supervision backbone scale")
     return result

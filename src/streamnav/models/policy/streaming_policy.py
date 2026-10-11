@@ -41,6 +41,8 @@ class StreamingObjectNavPolicy(nn.Module):
                 backbone.config.text_config.hidden_size,
                 action_dim,
                 self.perception_config["embedding_dim"],
+                self.perception_config["fusion_scale"],
+                self.perception_config["supervision_backbone_scale"],
             ).to(device=backbone.device, dtype=backbone.nav_token.dtype)
             if self.perception_config["enabled"]
             else None

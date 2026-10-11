@@ -1,6 +1,6 @@
 # 数据与可复现性
 
-当前训练只使用 **HM3D-OVON train**，验证使用 `val_seen`、`val_seen_synonyms`、`val_unseen`。通用入口为 [训练数据配置](../configs/data/hm3d_ovon.yaml) 和 [验证配置](../configs/eval/hm3d_ovon.yaml)，当前有效配置见 [版本节点](current_version.md)。实际清单位于 `runtime/data/manifests/`。
+当前训练只使用 **HM3D-OVON train**，验证使用 `val_seen`、`val_seen_synonyms`、`val_unseen`。通用入口为 [训练数据配置](../configs/data/hm3d_ovon.yaml) 和 [验证配置](../configs/eval/hm3d_ovon.yaml)，当前有效配置见 [LightNav-KDA 配置](../configs/lightnav_kda.yaml)。实际清单位于 `runtime/data/manifests/`。
 
 | Split | 原始 episode 数 | 用途 |
 |---|---:|---|
@@ -17,9 +17,9 @@
 
 统一 episode 包含 dataset、split、scene、episode ID、目标文本、起始位姿和目标元数据。`goals=[]` 时读取 `goals_by_category`，OVON children categories 也解析为合法目标视点。地图、位姿和目标视点供教师／奖励／评估使用，策略仍只接收 RGB＋文本。
 
-可选感知分支使用现有三维目标 anchor 和训练时深度生成弱点位标签，仿真深度不进入策略，评估关闭标注传感器。当前场景未准备 semantic mesh；逐帧实例可见性并非现成真值。标签的置信度、遮挡屏蔽和验证流程见 [轻量感知监督](perception.md)。
+当前模型不使用深度投影弱点位标签。训练点位来自冻结 LightNav 的软分布，详见 [原生 point CoT](perception.md)。任务是目标类别导航，而非 R2R 的逐句路径指令，原 LightNav 到本任务的能力迁移需要评估。
 
-Manifest 保存源文件 SHA256、episode 数、场景映射和类别集合。启动检查训练／验证场景及 unseen 词表泄漏；恢复核对训练清单本身的哈希。当前 `verify_data_hashes=false` 避免每次启动重算所有数据源文件，可显式开启完整源文件检查。训练惰性按场景加载、场景内无放回，分配规则见 [训练说明](training.md#数据教师与监督)。
+Manifest 保存源文件 SHA256、episode 数、场景映射和类别集合。训练和验证使用独立清单。训练惰性按场景加载、场景内无放回，分配规则见 [训练说明](training.md)。
 
 Navmesh 使用机体高 0.88 m、半径 0.18 m、max climb 0.10 m、cell height 0.05 m 重建。`runtime/cache/navmesh` 的缓存签名包含上述参数，不复用不同机器人尺寸的网格。
 

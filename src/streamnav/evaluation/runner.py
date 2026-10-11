@@ -17,6 +17,7 @@ from streamnav.data.schema import HabitatEpisodeSource
 from streamnav.envs.habitat_client import VectorHabitatEnvs
 from streamnav.evaluation.latency_metrics import latency_summary
 from streamnav.evaluation.navigation_metrics import aggregate_metrics
+from streamnav.evaluation.perception_records import perception_records as make_perception_records
 from streamnav.evaluation.pointing_overlay import draw_pointing_overlay
 from streamnav.evaluation.video_cases import (
     retain_video_cases,
@@ -35,7 +36,7 @@ def video_frame(
 ):
     image = Image.fromarray(rgb.cpu().numpy())
     width, height = image.size
-    canvas = Image.new("RGB", (width, ((height + 96 + 15) // 16) * 16), "#121827")
+    canvas = Image.new("RGB", (width, ((height + 128 + 15) // 16) * 16), "#121827")
     canvas.paste(image, (0, 0))
     if perception is not None:
         draw_pointing_overlay(canvas, perception, (width, height))
@@ -47,7 +48,7 @@ def video_frame(
     distance = info.get("geodesic_distance", info.get("distance", float("nan")))
     draw.text(
         (10, height + 38),
-        f"{label} | step {info['frame_id']} | distance {distance:.2f} m",
+        f"{label} | step {info['frame_id']} | viewpoint d={distance:.2f} m",
         fill="white",
     )
     probability = f"P(STOP)={stop_probability:.4f}" if stop_probability is not None else ""
@@ -68,8 +69,37 @@ def video_frame(
         )
         draw.text(
             (10, height + 77),
-            f"APOS={apos} | OPOS={'point' if perception['opos'] else 'out of view'} | "
-            f"P(ready)={perception['arrival_probabilities'][2]:.3f}",
+            f"APOS={apos} | OPOS={'point' if perception['opos'] else 'none (pred)'}"
+            + (
+                f" | P(ready)={perception['arrival_probabilities'][2]:.3f}"
+                if "arrival_probabilities" in perception
+                else " | point CoT"
+            ),
+            fill="white",
+        )
+    if perception is not None and "apos_point_probability" in perception:
+        draw.text(
+            (width - 164, height + 58),
+            f"P(point)={perception['apos_point_probability']:.2f}/"
+            f"{perception['opos_point_probability']:.2f}",
+            fill="white",
+        )
+        draw.text(
+            (10, height + 97),
+            f"Location peak A={perception['apos_conditional_location_peak']:.3f} "
+            f"O={perception['opos_conditional_location_peak']:.3f} (given point)",
+            fill="white",
+        )
+        draw.text(
+            (10, height + 117),
+            "Markers: decoded point tokens; action conditioned on APOS -> OPOS"
+            if perception.get("point_cot", False)
+            else "Markers: MAP locations; "
+            + (
+                "action uses full distributions"
+                if perception.get("action_fusion_enabled", True)
+                else "fusion disabled for this audit"
+            ),
             fill="white",
         )
     import numpy as np
@@ -184,19 +214,13 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                         perception_records: list[dict[str, Any] | None] = [None for _ in active]
                         if pointing:
                             predictions = output_batch[3]
-                            ids = {
-                                name: predictions[name].argmax(-1).tolist()
-                                for name in ("apos", "opos")
-                            }
-                            ready = predictions["arrival"].softmax(-1).tolist()
-                            perception_records = [
-                                {
-                                    "apos": ids["apos"][j],
-                                    "opos": ids["opos"][j],
-                                    "arrival_probabilities": ready[j],
-                                }
-                                for j in range(len(active))
-                            ]
+                            perception_records = make_perception_records(
+                                predictions,
+                                hierarchical=getattr(policy, "perception_config", {}).get(
+                                    "point_decoding", "flat"
+                                )
+                                == "hierarchical",
+                            )
                         perception_by_slot = dict(zip(active, perception_records, strict=True))
                         for action in actions:
                             action_counts[int(action)] += 1
@@ -394,6 +418,8 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                 "success_distance": env_config.get("success_distance", 0.1),
                 "inference_mode": config["model"].get("inference_mode", "auto"),
                 "compute_dtype": config["model"]["dtype"],
+                "parameter_dtype": str(next(policy.parameters()).dtype).removeprefix("torch."),
+                "batch_chat_body": getattr(policy, "batch_chat_body", False),
                 "loaded_checkpoint": str(getattr(policy, "loaded_checkpoint", "unknown")),
                 "evaluated_model_update": update,
                 "scene_count": len(scene_ids),
@@ -431,6 +457,10 @@ def main(cfg):
     try:
         seed_everything(config["seed"])
         policy = load_policy(config, preserve_master_weights=True)
+        # Match evaluation inside training. The policy constructor defaults to
+        # serial chat bodies; switching FLA paths changes BF16 roundoff and can
+        # change greedy trajectories even with identical saved weights.
+        policy.batch_chat_body = config.get("trainer", {}).get("batch_chat_body", False)
         manifest = Path(policy.loaded_checkpoint) / "manifest.json"
         update = json.loads(manifest.read_text()).get("update", 0) if manifest.exists() else 0
         evaluate(policy, config, update=update, video=config["eval"]["video"])

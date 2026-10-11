@@ -2,7 +2,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "$STREAMNAV_ROOT"
-python - "${1:-runs/streamnav_active/ealm}" <<'PY'
+python - "${1:-runs/lightnav_kda_active}" <<'PY'
 import json,os,signal,sys,time
 from pathlib import Path
 from streamnav.utils.process_health import training_stop_targets

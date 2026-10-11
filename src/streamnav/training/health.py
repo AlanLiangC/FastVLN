@@ -17,7 +17,7 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
     recent = rows[-50:]
     update = rows[-1]["update"]
     result.update(status="training", update=update)
-    if any(not math.isfinite(r.get("total_loss", 0)) for r in recent):
+    if any(not math.isfinite(r.get("total_loss", r.get("loss", 0))) for r in recent):
         result["warnings"].append("nonfinite_loss")
         result["stop_recommended"] = True
     alphas = [r["ealm_alpha"] for r in recent if "ealm_alpha" in r]
@@ -31,6 +31,11 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         result["ppo_policy_inactive_updates"] = inactive
         if inactive >= 20:
             result["warnings"].append("ppo_policy_inactive")
+    elif "ppo_coefficient" in rows[-1]:
+        result["ppo_policy_coefficient_mean"] = statistics.mean(
+            r["ppo_coefficient"] for r in recent
+        )
+        result["ppo_policy_coefficient_latest"] = rows[-1]["ppo_coefficient"]
     labelled = [r for r in recent if "teacher_stop_count" in r and "greedy_stop_count" in r]
     if labelled:
         positives = sum(r["teacher_stop_count"] for r in labelled)

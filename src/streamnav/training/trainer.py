@@ -36,6 +36,7 @@ from streamnav.training.optimizer import OVSegDTLRScheduler, build_optimizer, gr
 from streamnav.training.perception_loss import perception_losses
 from streamnav.training.ppo import clipped_ppo_loss, ovsegdt_value_loss, replay_consistency_metrics
 from streamnav.training.rollout import RolloutCollector, SequenceReplay
+from streamnav.training.stop_loss import stop_calibration_loss, stop_hard_negative_loss
 from streamnav.utils.logging import ActionHistogramMetric, append_json
 from streamnav.utils.seed import rng_state, seed_everything
 
@@ -43,6 +44,12 @@ from streamnav.utils.seed import rng_state, seed_everything
 class EndToEndObjectNavTrainer:
     def __init__(self, config):
         self.config, self.cfg = config, config["trainer"]
+        if self.cfg.get("stop_hard_negative_coef", 0.0) > 0 and not config["habitat"].get(
+            "oracle_success_stop", False
+        ):
+            raise ValueError(
+                "STOP hard-negative supervision requires success-aligned teacher labels"
+            )
         self.run_dir = Path(config["run_dir"])
         self.run_dir.mkdir(parents=True, exist_ok=True)
         metrics_file = self.run_dir / "train_metrics.jsonl"
@@ -135,6 +142,7 @@ class EndToEndObjectNavTrainer:
                 self.sources,
                 config,
                 self.mixer,
+                policy=self.policy,
             )
             self.manifest["branch_initialization"] = initialization
             if parallel.rank() == 0:
@@ -274,7 +282,29 @@ class EndToEndObjectNavTrainer:
             + self.cfg["loss"]["value_coef"] * value_loss.mean()
             - self.cfg["loss"]["entropy_coef"] * entropy_bonus
         )
+        stop_coefficient = self.cfg.get("stop_calibration_coef", 0.0)
+        if not math.isfinite(stop_coefficient) or stop_coefficient < 0:
+            raise ValueError("STOP calibration coefficient must be finite and nonnegative")
+        stop_metrics = {}
+        if stop_coefficient:
+            stop_loss, stop_metrics = stop_calibration_loss(
+                logits,
+                expert,
+                il_mask,
+                prior_correction=self.cfg.get("stop_calibration_prior_correction", False),
+            )
+            total = total + stop_coefficient * stop_loss
+        hard_stop_coefficient = self.cfg.get("stop_hard_negative_coef", 0.0)
+        if not math.isfinite(hard_stop_coefficient) or hard_stop_coefficient < 0:
+            raise ValueError("STOP hard-negative coefficient must be finite and nonnegative")
+        if hard_stop_coefficient:
+            hard_stop_loss, hard_stop_metrics = stop_hard_negative_loss(
+                logits, expert, il_mask, actions
+            )
+            total = total + hard_stop_coefficient * hard_stop_loss
+            stop_metrics.update(hard_stop_metrics)
         metrics = {
+            **stop_metrics,
             "total_loss": total.detach().item(),
             "il_loss": ((il_loss * il_mask).mean() / il_fraction).detach().item(),
             "il_loss_all_frames": il_loss.mean().detach().item(),
@@ -326,6 +356,18 @@ class EndToEndObjectNavTrainer:
                     (il_gradient * ppo_gradient).sum() / (il_norm * ppo_norm).clamp_min(1e-12)
                 ).item(),
             )
+            if stop_coefficient:
+                stop_gradient = torch.autograd.grad(
+                    stop_coefficient * stop_loss, logits, retain_graph=True
+                )[0]
+                metrics["policy_logit_grad_norm_stop_calibration"] = stop_gradient.norm().item()
+            if hard_stop_coefficient:
+                hard_stop_gradient = torch.autograd.grad(
+                    hard_stop_coefficient * hard_stop_loss, logits, retain_graph=True
+                )[0]
+                metrics["policy_logit_grad_norm_stop_hard_negative"] = (
+                    hard_stop_gradient.norm().item()
+                )
         return total, metrics
 
     def _preflight_replay(self, buffer, sequences):

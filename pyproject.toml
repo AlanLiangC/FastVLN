@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "streamnav"
 version = "0.1.0"
-description = "Streaming KDA-Qwen3.5 ObjectNav with joint DAgger/PPO training"
+description = "LightNav point-CoT ObjectNav with KDA memory, LoRA and DAgger/PPO"
 requires-python = ">=3.12"
 dependencies = [
   "torch==2.10.0", "torchvision==0.25.0", "transformers==5.3.0",
