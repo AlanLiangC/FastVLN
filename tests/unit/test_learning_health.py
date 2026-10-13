@@ -1,4 +1,27 @@
-from streamnav.training.health import learning_health
+import pytest
+
+from streamnav.training.health import grounding_learning_health, learning_health
+
+
+def test_grounding_monitor_tracks_points_and_never_invents_navigation_success():
+    rows = [
+        {
+            "update": 200,
+            "loss": 2.0,
+            "grad_norm": 1.0,
+            "seconds": 2.0,
+            "source_counts": {"coco": 230, "pixmo": 26},
+            "absence_samples": 26,
+        }
+    ]
+    evaluations = [{"update": 200, "macro_visible_point_accuracy_5pct": 0.0}]
+    status = grounding_learning_health(rows, evaluations)
+    assert status["samples_per_second"] == 128
+    assert status["absence_fraction"] == 26 / 256
+    assert status["best_visible_point_update"] == 200
+    assert "macro_autonomous_sr" not in status and not status["stop_recommended"]
+    rows[0]["opos_loss"] = float("nan")
+    assert grounding_learning_health(rows, evaluations)["stop_recommended"]
 
 
 def training_rows(greedy, gain=0.0):
@@ -122,3 +145,120 @@ def test_zero_sr_stop_waits_for_complete_validation_at_review_budget():
     incomplete = prior + [{"update": 500, "split": "seen", "success": 0.0}]
     assert not learning_health(rows, incomplete)["stop_recommended"]
     assert learning_health(rows, evaluations())["stop_recommended"]
+
+
+def test_lightnav_warmup_does_not_trigger_inactive_ppo_warning():
+    rows = [
+        {"update": i, "loss": 1, "ppo_coefficient": 0, "ppo_token_gradient_norm_max": 0}
+        for i in range(1, 51)
+    ]
+    report = learning_health(rows, [])
+    assert report["ppo_policy_inactive_updates"] == 0
+    assert "ppo_policy_inactive" not in report["warnings"]
+
+
+def test_active_lightnav_ppo_without_token_gradients_is_reported():
+    rows = [
+        {"update": i, "loss": 1, "ppo_coefficient": 0.1, "ppo_token_gradient_norm_max": 0}
+        for i in range(51, 71)
+    ]
+    report = learning_health(rows, [])
+    assert "ppo_policy_inactive" in report["warnings"]
+    rows[-1]["ppo_token_gradient_norm_max"] = 0.1
+    assert "ppo_policy_inactive" not in learning_health(rows, [])["warnings"]
+
+
+def test_low_stochastic_training_sr_alert_does_not_stop_or_invent_formal_sr():
+    rows = [
+        {"update": i, "loss": 1, "expert_probability": 0, "episodes": 10, "successes": 0}
+        for i in range(51, 71)
+    ]
+    report = learning_health(rows, [])
+    assert report["sampled_training_sr"] == 0
+    assert "low_sampled_training_success" in report["warnings"]
+    assert "macro_autonomous_sr" not in report
+    assert not report["stop_recommended"]
+
+
+def test_finite_total_loss_cannot_hide_nonfinite_components():
+    report = learning_health([{"update": 1, "loss": 1, "grad_norm": float("nan")}], [])
+    assert report["stop_recommended"]
+    assert "nonfinite_training_component" in report["warnings"]
+
+
+def test_lightnav_conditional_stop_monitor_uses_counts_and_distinct_label():
+    rows = [
+        {
+            "update": i,
+            "loss": 1,
+            "teacher_stop_count": 3,
+            "conditional_greedy_stop_count": 1,
+            "conditional_stop_true_positive": 0,
+        }
+        for i in range(81, 101)
+    ]
+    rows[-1].update(teacher_stop_count=10, conditional_stop_true_positive=1)
+    report = learning_health(rows, [])
+    assert report["conditional_stop_labels_recent"] == 67
+    assert report["conditional_stop_recall_recent"] == 1 / 67
+    assert "conditional_stop_not_learned" in report["warnings"]
+    assert "teacher_stop_recall_recent" not in report
+    assert not report["stop_recommended"]
+    rows[-1]["conditional_stop_true_positive"] = 10
+    assert "conditional_stop_not_learned" not in learning_health(rows, [])["warnings"]
+
+
+def test_lightnav_conditional_stop_monitor_does_not_invent_missing_positives():
+    rows = [
+        {
+            "update": i,
+            "loss": 1,
+            "teacher_stop_count": 0,
+            "conditional_greedy_stop_count": 0,
+            "conditional_stop_true_positive": 0,
+        }
+        for i in range(81, 101)
+    ]
+    report = learning_health(rows, [])
+    assert report["conditional_stop_recall_recent"] is None
+    assert "conditional_stop_not_learned" not in report["warnings"]
+
+
+def test_expert_stream_supervisor_checks_execution_and_student_accounting():
+    row = {
+        "update": 105,
+        "loss": 1,
+        "expert_probability": 0,
+        "transitions": 1600,
+        "student_transitions": 800,
+        "expert_stream_transitions": 800,
+        "expert_stream_action_correct": 800,
+    }
+    assert not learning_health([row], [])["stop_recommended"]
+    row["expert_stream_action_correct"] = 799
+    assert "expert_stream_oracle_execution_mismatch" in learning_health([row], [])["warnings"]
+    row["expert_stream_action_correct"] = 800
+    row["student_transitions"] = 1600
+    assert "expert_student_stream_accounting_mismatch" in learning_health([row], [])["warnings"]
+
+
+@pytest.mark.parametrize("teacher_probability,student_actions", [(0, 800), (0.7, 240)])
+def test_three_stream_supervisor_counts_dagger_and_warmup_actions(
+    teacher_probability, student_actions
+):
+    row = {
+        "update": 415,
+        "loss": 1,
+        "expert_probability": teacher_probability,
+        "transitions": 2400,
+        "student_transitions": student_actions,
+        "student_stream_transitions": 800,
+        "dagger_stream_transitions": 800,
+        "expert_stream_transitions": 800,
+        "expert_stream_action_correct": 800,
+    }
+    assert not learning_health([row], [])["stop_recommended"]
+    row["dagger_stream_transitions"] = 799
+    report = learning_health([row], [])
+    assert report["stop_recommended"]
+    assert "expert_student_stream_accounting_mismatch" in report["warnings"]

@@ -3,7 +3,7 @@ import time
 import torch
 
 from streamnav.contracts.action import NavigationAction
-from streamnav.models.qwen35_kda.cache import state_bytes
+from streamnav.contracts.cache import state_bytes
 
 
 @torch.no_grad()

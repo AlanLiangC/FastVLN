@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from streamnav.models.qwen35_kda.cache import clone_state
+from streamnav.contracts.cache import clone_state
 
 
 @dataclass(frozen=True)

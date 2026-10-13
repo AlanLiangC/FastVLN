@@ -1,8 +1,8 @@
 import pytest
 import torch
 
+from streamnav.contracts.cache import clone_state, stack_caches, state_bytes, unstack_cache
 from streamnav.contracts.state import LayerState, StreamingState
-from streamnav.models.qwen35_kda.cache import clone_state, stack_caches, state_bytes, unstack_cache
 from streamnav.training.rollout_buffer import RecurrentRolloutBuffer
 
 

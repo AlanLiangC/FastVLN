@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
 
 from streamnav.contracts.action import NavigationAction
+from streamnav.contracts.cache import state_bytes
 from streamnav.contracts.perception import APOS_LEFT, APOS_RIGHT, APOS_STOP
 from streamnav.data.schema import HabitatEpisodeSource
 from streamnav.envs.habitat_client import VectorHabitatEnvs
@@ -24,10 +25,10 @@ from streamnav.evaluation.video_cases import (
     select_video_cases,
     write_video_index,
 )
-from streamnav.models.qwen35_kda.cache import state_bytes
 from streamnav.training import distributed as parallel
 from streamnav.training.checkpoint import load_policy
 from streamnav.utils.logging import append_json
+from streamnav.utils.progress import write_worker_progress
 from streamnav.utils.seed import seed_everything
 
 
@@ -140,12 +141,35 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
     if video_limit < 0 or video_selection not in ("first", "representative"):
         raise ValueError("Invalid evaluation video settings")
     representative = video_selection == "representative"
+    started = time.monotonic()
+
+    def progress(phase, decisions, total, **details):
+        write_worker_progress(
+            config["run_dir"],
+            update,
+            phase,
+            decisions,
+            total,
+            started,
+            rank=parallel.rank(),
+            **details,
+        )
+
+    progress("evaluation_starting", 0, 0)
     envs = VectorHabitatEnvs(env_config, count)
     try:
         for manifest in config["eval"]["manifests"]:
             source = HabitatEpisodeSource(manifest, seed=config["seed"])
             split = source.manifest["dataset_id"] + "_" + source.manifest["split"]
             metrics, times, batch_times, video_records = [], [], [], []
+            decisions = 0
+            decision_limit = (
+                ((limit + parallel.world_size() - 1) // parallel.world_size())
+                * env_config["max_episode_steps"]
+                if limit is not None
+                else 0
+            )
+            progress("evaluation", 0, decision_limit, split=split, episodes_completed=0)
             stratified = config["eval"].get("stratified", True)
             iterator = (
                 (i, e)
@@ -172,6 +196,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                 traces: list[list[dict[str, Any]]] = [[] for _ in batch]
                 turn_streaks = [0 for _ in batch]
                 alternating_turn_streaks = [0 for _ in batch]
+                forward_collision_streaks = [0 for _ in batch]
                 last_turn_actions: list[NavigationAction | None] = [None for _ in batch]
                 active = list(range(len(batch)))
                 stop_diagnostics: list[dict[str, Any]] = [
@@ -182,6 +207,9 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                         "false_stop": False,
                         "max_consecutive_turns": 0,
                         "max_alternating_turns": 0,
+                        "max_forward_collision_streak": 0,
+                        "after_collision_steps": 0,
+                        "after_collision_forward_steps": 0,
                     }
                     for _ in batch
                 ]
@@ -243,6 +271,11 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                             )
                             near = distance < env_config.get("success_distance", 0.1)
                             diagnostics = stop_diagnostics[i]
+                            if observation.get("collision", False):
+                                diagnostics["after_collision_steps"] += 1
+                                diagnostics["after_collision_forward_steps"] += int(
+                                    action == NavigationAction.MOVE_FORWARD
+                                )
                             if near:
                                 diagnostics["near_goal_steps"] += 1
                                 diagnostics["near_goal_stop_probability_sum"] += probability
@@ -306,6 +339,16 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                             states[i], observations[i] = state, observation
                             cache_bytes = state_bytes(state)
                             episode = batch[i][1]
+                            forward_collision_streaks[i] = (
+                                forward_collision_streaks[i] + 1
+                                if action == NavigationAction.MOVE_FORWARD
+                                and observation.get("collision", False)
+                                else 0
+                            )
+                            stop_diagnostics[i]["max_forward_collision_streak"] = max(
+                                stop_diagnostics[i]["max_forward_collision_streak"],
+                                forward_collision_streaks[i],
+                            )
                             writer = writers[i]
                             if writer is not None:
                                 traces[i].append(
@@ -366,10 +409,26 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                             else:
                                 remaining.append(i)
                         active = remaining
+                        decisions += len(actions)
+                        if decisions % 20 == 0 or len(remaining) < len(actions):
+                            progress(
+                                "evaluation",
+                                decisions,
+                                decision_limit,
+                                split=split,
+                                episodes_completed=len(metrics),
+                            )
                 finally:
                     for writer in writers:
                         if writer is not None:
                             writer.close()
+            progress(
+                "evaluation_wait",
+                decisions,
+                decision_limit,
+                split=split,
+                episodes_completed=len(metrics),
+            )
             payloads = parallel.gather(
                 {
                     "metrics": metrics,
@@ -418,6 +477,10 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                 "success_distance": env_config.get("success_distance", 0.1),
                 "inference_mode": config["model"].get("inference_mode", "auto"),
                 "compute_dtype": config["model"]["dtype"],
+                "language_compute_dtype": str(
+                    getattr(policy, "language_compute_dtype", "unknown")
+                ).removeprefix("torch."),
+                "point_decoding": getattr(policy, "point_decoding", "legacy"),
                 "parameter_dtype": str(next(policy.parameters()).dtype).removeprefix("torch."),
                 "batch_chat_body": getattr(policy, "batch_chat_body", False),
                 "loaded_checkpoint": str(getattr(policy, "loaded_checkpoint", "unknown")),
@@ -450,7 +513,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
         torch.cuda.empty_cache()
 
 
-@hydra.main(version_base=None, config_path="../../../configs", config_name="config")
+@hydra.main(version_base=None, config_path="../../../configs", config_name="pointcot")
 def main(cfg):
     config = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     parallel.initialize(config)

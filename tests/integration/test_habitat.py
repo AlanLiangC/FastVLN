@@ -48,6 +48,7 @@ def test_oracle_reaches_real_object_goal():
                 "navmesh_radius": 0.18,
                 "navmesh_agent_max_climb": 0.10,
                 "navmesh_cell_height": 0.05,
+                "allow_sliding": False,
             }
         )
         for _ in range(100):

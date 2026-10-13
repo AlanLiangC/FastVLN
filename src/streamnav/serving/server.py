@@ -294,7 +294,7 @@ def create_app(policy, config):
     return app
 
 
-@hydra.main(version_base=None, config_path="../../../configs", config_name="config")
+@hydra.main(version_base=None, config_path="../../../configs", config_name="pointcot")
 def main(cfg):
     config = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     app = create_app(load_policy(config, preserve_master_weights=True), config)

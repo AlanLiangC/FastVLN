@@ -13,6 +13,10 @@ def perception_records(predictions, *, hierarchical=False):
     for name in ("apos", "opos"):
         logits = predictions[name]
         tokens = decode_point_logits(logits, hierarchical=hierarchical).tolist()
+        if predictions.get("point_cot", False) and name + "_tokens" in predictions:
+            # Draw the token that actually conditioned the next autoregressive
+            # prediction, even when an external caller requests another mode.
+            tokens = predictions[name + "_tokens"].tolist()
         flat = logits.argmax(-1).tolist()
         types = point_type_logits(logits).softmax(-1).tolist()
         locations = logits[..., 1 : POINT_CELLS + 1].softmax(-1).amax(-1).tolist()

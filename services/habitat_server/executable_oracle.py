@@ -37,10 +37,21 @@ class ExecutableNavigation:
         state = self.env.sim.get_agent(0).get_state()
         step = self.env.config.get("forward_step", 0.25)
         endpoint = state.position + quat_rotate_vector(state.rotation, np.array([0.0, 0.0, -step]))
-        actual = np.asarray(self.env.sim.pathfinder.try_step_no_sliding(state.position, endpoint))
-        # Match allow_sliding=False and the robot-specific baked navmesh.
+        sliding = self.env.config.get("allow_sliding", False)
+        pathfinder = self.env.sim.pathfinder
+        actual = np.asarray(
+            pathfinder.try_step(state.position, endpoint)
+            if sliding
+            else pathfinder.try_step_no_sliding(state.position, endpoint)
+        )
+        if not np.isfinite(actual).all():
+            return False
+        if sliding:
+            # A deflected step can make real progress without reaching its
+            # straight-line endpoint. Reject only negligible horizontal motion.
+            return bool(np.linalg.norm((actual - state.position)[[0, 2]]) > step * 0.05)
         remaining = np.linalg.norm((actual - endpoint)[[0, 2]])
-        return bool(np.isfinite(actual).all() and remaining <= step * 0.05)
+        return bool(remaining <= step * 0.05)
 
     def action(self, target, upstream_action):
         upstream_action = NavigationAction(int(np.asarray(upstream_action).item()))

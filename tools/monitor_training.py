@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from streamnav.training.health import learning_health
+from streamnav.training.health import grounding_learning_health, learning_health
 from streamnav.utils.process_health import training_process_alive, training_stop_targets
 
 
@@ -20,7 +21,9 @@ def read_rows(path):
     rows = []
     for line in path.read_text().splitlines():
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
+            if isinstance(row, dict):
+                rows.append(row)
         except json.JSONDecodeError:
             # The learner may still be writing the last line.
             continue
@@ -35,6 +38,34 @@ def write_status(path, data):
 
 def worker_alive(pid):
     return training_process_alive(pid)
+
+
+def read_json(path, default):
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, type(default)) else default
+    except (FileNotFoundError, json.JSONDecodeError):
+        # Worker registration may still be writing; never use another launch's PIDs.
+        return default
+
+
+def latest_worker_progress(output, workers, now):
+    pids = {w["pid"] for w in workers}
+    candidates = []
+    for path in [
+        output / "training_progress.json",
+        *sorted((output / "progress").glob("rank_*.json")),
+    ]:
+        data = read_json(path, {})
+        timestamp = data.get("time")
+        if (
+            data.get("worker_pid") in pids
+            and isinstance(timestamp, (int, float))
+            and math.isfinite(timestamp)
+            and timestamp <= now + 5
+        ):
+            candidates.append(data)
+    return max(candidates, key=lambda row: row["time"]) if candidates else {}
 
 
 def main():
@@ -53,32 +84,42 @@ def main():
         rows = read_rows(output / "train_metrics.jsonl")
         evaluations = read_rows(output / "eval_metrics.jsonl")
         cfg_path = output / "resolved_config.yaml"
-        cfg = (yaml.safe_load(cfg_path.read_text()) or {}) if cfg_path.exists() else {}
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        except (FileNotFoundError, yaml.YAMLError):
+            cfg = {}
         supervision = cfg.get("trainer", {}).get("supervision", {})
-        health = learning_health(
-            rows,
-            evaluations,
-            expected_splits=len(cfg.get("eval", {}).get("manifests", [1, 2, 3])),
-            min_updates=supervision.get("min_updates", 500),
-            patience=supervision.get("zero_sr_patience", 5),
-        )
+        if cfg.get("stage") == "grounding":
+            health = grounding_learning_health(rows, read_rows(output / "grounding_eval.jsonl"))
+        else:
+            health = learning_health(
+                rows,
+                evaluations,
+                expected_splits=len(cfg.get("eval", {}).get("manifests", [1, 2, 3])),
+                min_updates=supervision.get("min_updates", 500),
+                patience=supervision.get("zero_sr_patience", 5),
+            )
         health.update(time=now, training_pid=args.pid, process_alive=alive)
+        manual_stop = read_json(output / "stop_request.json", {}).get("training_pid") == args.pid
         workers_file = output / "training_workers.json"
-        workers = json.loads(workers_file.read_text()) if workers_file.exists() else []
+        workers = read_json(workers_file, [])
         # A resumed job may still have the previous launcher's worker file.
         workers = [w for w in workers if w.get("launcher_pid") == args.pid or w["pid"] == args.pid]
         health["workers"] = [{**w, "alive": worker_alive(w["pid"])} for w in workers]
-        progress_file = output / "training_progress.json"
-        progress = json.loads(progress_file.read_text()) if progress_file.exists() else {}
-        if progress.get("worker_pid") in {w["pid"] for w in workers}:
+        progress = latest_worker_progress(output, workers, now)
+        if progress:
             health["progress"] = progress
+            if health["status"] == "training" and progress.get("phase", "").startswith(
+                ("evaluation", "grounding_eval")
+            ):
+                health["status"] = "evaluating"
         health["expected_workers"] = cfg.get("distributed", {}).get("world_size", 1)
         if alive and not workers:
             # During resume, config/metrics still belong to the prior run until
             # this launcher registers its workers. Do not terminate torchrun
             # using the old run's stopping rule before initialization finishes.
             health["status"] = "starting"
-        if alive and workers and not all(w["alive"] for w in health["workers"]):
+        if alive and workers and not manual_stop and not all(w["alive"] for w in health["workers"]):
             health["warnings"].append("training_worker_exited")
             health["stop_recommended"] = True
         if alive:
@@ -87,17 +128,16 @@ def main():
             )
             health["seconds_since_update"] = age
             progress_time = health.get("progress", {}).get("time", 0)
-            progress_age = min(age, now - progress_time)
+            progress_age = max(0, min(age, now - progress_time))
             health["seconds_since_progress"] = progress_age
             if progress_age > supervision.get("stale_seconds", 1800):
                 health["warnings"].append("training_has_stopped_advancing")
                 health["stop_recommended"] = True
         if not alive:
-            target = cfg.get("trainer", {}).get("num_updates", 10000)
-            request_file = output / "stop_request.json"
-            manual_stop = (
-                request_file.exists()
-                and json.loads(request_file.read_text()).get("training_pid") == args.pid
+            target = (
+                cfg["grounding"]["pretrain_updates"]
+                if cfg.get("stage") == "grounding"
+                else cfg.get("trainer", {}).get("num_updates", 10000)
             )
             health["status"] = (
                 "complete"
@@ -113,6 +153,7 @@ def main():
             return
         if (
             health["stop_recommended"]
+            and not manual_stop
             and not stopped_for_health
             and (workers or "training_has_stopped_advancing" in health["warnings"])
             and supervision.get("stop_on_failure", True)
@@ -129,8 +170,10 @@ def main():
                             pass
                 stopped_for_health = True
                 print(json.dumps({"graceful_stop_requested": health}), flush=True)
-        health["graceful_stop_requested"] = stopped_for_health
-        if stopped_for_health:
+        health["graceful_stop_requested"] = stopped_for_health or manual_stop
+        if manual_stop:
+            health["status"] = "stopping"
+        elif stopped_for_health:
             health["status"] = "stopping_for_review"
         write_status(output / "health_status.json", health)
         result = subprocess.run(

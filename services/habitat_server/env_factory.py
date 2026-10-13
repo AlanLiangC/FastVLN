@@ -26,6 +26,8 @@ from streamnav.training.rewards import ObjectNavReward, RewardConfig
 class HabitatObjectNavEnv:
     def __init__(self, config):
         self.config = config
+        if not isinstance(config.get("allow_sliding", False), bool):
+            raise ValueError("allow_sliding must be a boolean")
         random.seed(config.get("seed", 2025))
         np.random.seed(config.get("seed", 2025))
         self.sim = None
@@ -47,7 +49,7 @@ class HabitatObjectNavEnv:
         sim_cfg.scene_id = scene
         sim_cfg.gpu_device_id = self.config.get("gpu_device_id", 1)
         sim_cfg.enable_physics = False
-        sim_cfg.allow_sliding = False
+        sim_cfg.allow_sliding = self.config.get("allow_sliding", False)
         sensor = habitat_sim.CameraSensorSpec()
         sensor.uuid = "rgb"
         sensor.sensor_type = habitat_sim.SensorType.COLOR
@@ -163,6 +165,7 @@ class HabitatObjectNavEnv:
             "navmesh_radius": float(navmesh.agent_radius),
             "navmesh_agent_max_climb": float(navmesh.agent_max_climb),
             "navmesh_cell_height": float(navmesh.cell_height),
+            "allow_sliding": bool(self.sim.config.sim_cfg.allow_sliding),
         }
 
     def distance(self):
@@ -193,6 +196,13 @@ class HabitatObjectNavEnv:
         )
         if len(self.goal_positions) == 0:
             raise RuntimeError("ObjectNav episode has no goal viewpoints")
+        start_spec = episode.get("metadata", {}).get("training_start")
+        start_result = {"kind": "original", "applied": False}
+        if start_spec is not None:
+            from mixed_starts import apply_mixed_start
+
+            start_result = apply_mixed_start(self, start_spec)
+        self.training_start_result = start_result
         self.steps, self.path_length, self.collisions = 0, 0.0, 0
         self.ended = False
         self.initial_distance = self.previous_distance = self.distance()
@@ -252,6 +262,7 @@ class HabitatObjectNavEnv:
             "timestamp_s": time.monotonic(),
             "robot": self.robot_configuration(),
             "curriculum_warmup_steps": warmup_steps,
+            "training_start": start_result,
         }
 
     @property
@@ -365,6 +376,7 @@ class HabitatObjectNavEnv:
             self._cached_observations = sim_observations
         after = self.sim.get_agent(0).get_state().position
         moved = float(np.linalg.norm(after - before))
+        horizontal_moved = float(np.linalg.norm((after - before)[[0, 2]]))
         collision = bool(sim_observations.get("collided", False))
         self.path_length += moved
         self.steps += 1
@@ -413,9 +425,14 @@ class HabitatObjectNavEnv:
             "truncated": truncated,
             "collision": collision,
             "displacement": moved,
+            "forward_blocked": bool(
+                action == NavigationAction.MOVE_FORWARD
+                and horizontal_moved <= self.config.get("forward_step", 0.25) * 0.05
+            ),
             "oracle_navigation_repairs": repairs,
             "success": success,
             "geodesic_distance": distance,
+            "training_start": self.training_start_result,
             "metrics": metrics,
             "frame_id": self.steps,
             "timestamp_s": time.monotonic(),

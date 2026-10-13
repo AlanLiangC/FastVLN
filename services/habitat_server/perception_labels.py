@@ -106,6 +106,8 @@ class PerceptionLabeler:
                     apos_valid=True,
                     apos_confidence=1.0,
                 )
+        if not env.config.get("perception_object_labels", True):
+            return result
         candidates, definitely_out = [], []
         for goal in env.episode["goals"]:
             position = np.asarray(goal["position"])

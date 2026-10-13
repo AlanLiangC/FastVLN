@@ -7,8 +7,8 @@ from typing import Any, cast
 import torch
 
 from streamnav.contracts.action import NavigationAction
+from streamnav.contracts.cache import clone_state
 from streamnav.errors import OracleUnavailableError
-from streamnav.models.qwen35_kda.cache import clone_state
 from streamnav.training.auxiliary_il import AuxiliaryILController
 from streamnav.training.dagger import behavior_log_prob, select_env_action
 from streamnav.training.rollout_buffer import RecurrentRolloutBuffer

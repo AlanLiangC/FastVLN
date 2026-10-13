@@ -43,4 +43,21 @@ def aggregate_metrics(episodes):
             )
             / len(episodes),
         )
+    if all("max_forward_collision_streak" in e for e in episodes):
+        after_collision = sum(e["after_collision_steps"] for e in episodes)
+        result.update(
+            blocked_forward_episode_rate=sum(
+                e["max_forward_collision_streak"] >= 8 for e in episodes
+            )
+            / len(episodes),
+            long_blocked_forward_episode_rate=sum(
+                e["max_forward_collision_streak"] >= 100 for e in episodes
+            )
+            / len(episodes),
+            max_forward_collision_streak=max(e["max_forward_collision_streak"] for e in episodes),
+            after_collision_forward_rate=sum(e["after_collision_forward_steps"] for e in episodes)
+            / after_collision
+            if after_collision
+            else None,
+        )
     return result

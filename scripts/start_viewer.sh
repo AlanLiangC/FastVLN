@@ -2,12 +2,12 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "$STREAMNAV_ROOT"
-viewer_checkpoint="${1:-runs/streamnav_active/ealm/checkpoints/best}"
-if [[ $# -eq 0 && ! -e "$viewer_checkpoint/actor_critic.safetensors" ]]; then
-  viewer_checkpoint="runs/streamnav_active/ealm/checkpoints/latest"
+viewer_checkpoint="${1:-runs/qwen35_pointcot_active/checkpoints/best}"
+if [[ $# -eq 0 && ! -e "$viewer_checkpoint/adapters.safetensors" ]]; then
+  viewer_checkpoint="runs/qwen35_pointcot_active/checkpoints/latest"
 fi
 if [[ $# -gt 0 ]]; then shift; fi
-if [[ ! -f "$viewer_checkpoint/actor_critic.safetensors" ]]; then
+if [[ ! -f "$viewer_checkpoint/adapters.safetensors" ]]; then
   echo "A trained checkpoint is required: $viewer_checkpoint" >&2
   exit 1
 fi

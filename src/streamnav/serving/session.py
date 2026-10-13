@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from streamnav.contracts.cache import state_bytes
 from streamnav.contracts.state import StreamingState
-from streamnav.models.qwen35_kda.cache import state_bytes
 
 
 @dataclass

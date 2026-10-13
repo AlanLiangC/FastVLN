@@ -1,19 +1,27 @@
-# LightNav-KDA 架构
+# 架构
 
-策略以 LightNav-0 的 Qwen3-VL-4B 初始化：36 层语言主干、hidden size 2560，32 个 query heads、8 个 KV heads，head dimension 128。保留原视觉编码器、DeepStack 注入、MRoPE 和点位词表。
+唯一活动模型族为 `qwen35_pointcot`，实现见 [policy.py](../src/streamnav/models/point_cot/policy.py)，配置见 [pointcot.yaml](../configs/pointcot.yaml)。它直接加载固定 revision 的官方多模态 [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
 
-每个环境 step 接收当前 RGB、目标文本和该 episode 的 KDA 状态。当前图像按原处理器缩放到 448×256，为满足视频 tubelet 将同一帧重复两次；不会将前几帧作为策略输入。视觉特征在无梯度模式下计算。
+## 当前帧与历史
 
-全部 36 层保留当前决策内部的原生 attention。每四层中的前三层额外使用共享 Q/K/V 的 KDA 记忆残差，共 27 层；当前帧及生成 token 的局部 KV 在决策结束后释放，跨帧只保留 KDA 矩阵。零初始化残差系数使新记忆分支不会在初始化时破坏原生当前帧 attention；这不保证删除原历史输入后完整任务性能保持不变。
+24 层语言网络保留原有 18 层 Gated DeltaNet、6 层 gated attention、MLP、norm 和多模态位置编码。视觉编码器冻结，沿用官方 processor。图像保持比例缩放、不裁切；点坐标定义在原始图像的归一化坐标中。
 
-每层递归状态为 FP32 `(B,32,128,128)`，单环境约 54 MiB，不随 episode 长度增长。新 episode 清空缓存；BPTT 边界只断开梯度，不清空数值。
+所有原生 token mixer 的状态只用于一次决策。当前帧和目标文本构成前缀，随后自回归生成 APOS、OPOS、action。原生 GDN 的卷积与矩阵状态、attention 的 KV 在这一块内延续，下一帧清空。
 
-生成顺序是 `APOS → OPOS → action`。每次选择出的 token 都以对应 embedding 回送主干，OPOS 条件于实际 APOS，动作条件于两个实际点位。动作词表含六个 token，输入输出共用六个新增向量；不运行 RVQ 解码。STOP、前进、左右转的初始化参考原粗级轨迹码对应的运动含义，上下看初始化后仍需导航监督学习。
+6 层 attention 另加 KDA 分支，使用共享 Q/K/V/O 和小门控参数。它使用未施加当前帧 RoPE 的 Q/K，按 token 顺序更新跨帧矩阵。残差系数从零初始化，保留基座的单帧计算。跨帧只保留六个矩阵，不保留历史 RGB、历史 KV 或逐帧特征列表。
 
-可训练参数包括各层 Q/K/V/O 的 rank-16 LoRA、rank-16 KDA 门控与残差系数、六动作向量及偏置、critic。原视觉、MLP、norm、embedding 和原 LM 输出行冻结；当前可训练约 1891 万参数，占独立参数总数的 0.42%。原 checkpoint 重复保存的相同输入/输出词表在校验完全相等后共享。视觉计算使用 BF16，语言主干和输出头使用 FP32，矩阵乘法允许 TF32 Tensor Core；可训练参数、优化器和 KDA 状态均为 FP32。底座权重数值来自同一原始检查点，仅改变存储和计算精度，不增加可训练参数。统计保存在活动训练目录的 `parameters.json`。
+每个 episode 的长期缓存为 6 × 8 × 256 × 256 个 FP32 元素，共 **12 MiB**，不会随轨迹长度增长。新 episode 必须通过 `start_episode` 重置缓存。最终 action token 也进入记忆，使后续帧可以利用执行过的动作。
 
-critic 从生成 APOS 前的状态读取。PPO 使用三 token 联合对数概率；重放保存实际点位、动作和片段初始缓存，所有片段累计梯度后统一更新一次参数。
+## 可训练参数
 
-回放按 20 帧批量执行：每帧的原生 attention 仅计算该帧的提示词、视觉和已采样 token，KDA 则按时间顺序读取有效 token。右侧 padding 不进入 KDA，episode 边界通过独立序列重置状态，梯度也在该处断开。推理仍自回归生成两个点与动作；单 token 无梯度解码使用 fused recurrent KDA，梯度回放使用 chunk KDA。
+默认 LoRA rank=8、alpha=16，覆盖 attention/GDN 投影与 MLP。新增低秩 KDA 门控、两组 tied point 输入/输出表、六动作表与 critic 均训练，原始视觉与语言参数冻结。
 
-每个回放片段先检查实际采样概率；超出原 0.05 阈值时按原顺序重算整个片段，保留完整 BPTT。最终仍不满足校验或梯度非有限值时拒绝 update，日志同时记录批量原始误差与重算次数。语言 FP32 减少跨矩阵形状的舍入误差，使批量回放可以稳定工作；可以用 `float32_matmul_precision: highest` 禁用 TF32 做精度对照。
+当前实测总参数 861,432,829，可训练参数 **8,446,909（约 0.98%）**。APOS/OPOS 是新的可训练 token，不是已具备 LightNav point 能力的冻结 token；需要 Stage I grounding 和导航几何监督。
+
+语言与冻结视觉均采用 FP32，矩阵乘法使用 TF32 high；新增表与优化器参数 FP32。批量视觉编码与逐图编码校验保持同一图像、空间位置和 prompt，视觉 FP32 减少批次形状导致的数值差异。最大视觉像素预算 114,688，输入保留比例且不裁切。吞吐报告区分单卡优化测试和八卡实际训练，不使用缓存后决策延迟替代训练 FPS。
+
+## 训练时的打包
+
+原生 mixer 将独立帧放在 batch 维，KDA 则把每条 fragment 的有效 token 按时间拼接。padding 不写入长期记忆；episode 边界通过 `cu_seqlens` 分段。默认 100 步 rollout，20 步反向 fragment，更新一次优化器前检查所有 fragment 的概率一致性。
+
+PPO 和导航 point CE 使用 rollout 实际生成的两个点与动作历史；动作 IL 另混入标注点前缀的 teacher forcing，不能替换 PPO 前缀，也不能覆盖行为概率。APOS 还以聚合像素概率的类型 CE 校准路点与方向/停止分类，不增加参数。grounding 的每张静态图像都从空缓存开始，不影响导航缓存。
