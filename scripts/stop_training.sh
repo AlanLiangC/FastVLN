@@ -2,7 +2,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "$STREAMNAV_ROOT"
-python - "${1:-runs/qwen35_pointcot_active}" <<'PY'
+python - "${1:-runs/qwen35_pointcot_opos_hint}" <<'PY'
 import json,os,signal,sys,time
 from pathlib import Path
 from streamnav.utils.process_health import training_stop_targets

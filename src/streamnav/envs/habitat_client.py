@@ -94,6 +94,12 @@ class HabitatClient:
             raise EpisodeMismatchError("Perception labels belong to another episode")
         return result
 
+    def get_object_supervision(self):
+        result = self.request("GET_OBJECT_SUPERVISION")
+        if result.get("episode_id") != self.episode_id:
+            raise EpisodeMismatchError("Object labels belong to a different episode")
+        return result
+
     def close(self, force=False):
         if self.process.poll() is None:
             if not force:
@@ -158,13 +164,18 @@ class VectorHabitatEnvs:
         return list(self.executor.map(oracle, self.clients))
 
     def get_oracle_supervisions(self):
+        return [future.result() for future in self.submit_oracle_supervisions()]
+
+    def submit_oracle_supervisions(self):
+        """One request per socket; caller must finish these before step/reset."""
+
         def oracle(client):
             try:
                 return client.get_oracle_supervision()
             except OracleUnavailableError as exc:
                 return exc
 
-        return list(self.executor.map(oracle, self.clients))
+        return [self.executor.submit(oracle, client) for client in self.clients]
 
     def close(self):
         for client in self.clients:

@@ -12,6 +12,15 @@ def aggregate_metrics(episodes):
     extra = ("success_strict_0_1", "oracle_success", "min_distance_to_goal")
     keys = (*keys, *(k for k in extra if all(k in e for e in episodes)))
     result = {key: sum(e[key] for e in episodes) / len(episodes) for key in keys}
+    if all("path_length" in e for e in episodes):
+        result.update(
+            path_length=sum(e["path_length"] for e in episodes) / len(episodes),
+            stationary_episode_rate=sum(e["path_length"] < 0.01 for e in episodes) / len(episodes),
+        )
+    if all("max_consecutive_turns" in e for e in episodes):
+        result["long_turn_episode_rate"] = sum(
+            e["max_consecutive_turns"] >= 100 for e in episodes
+        ) / len(episodes)
     if all("near_goal_steps" in e for e in episodes):
         steps = sum(e["near_goal_steps"] for e in episodes)
         maxima = [

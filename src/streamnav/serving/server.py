@@ -31,6 +31,7 @@ class StartRequest(BaseModel):
 
 class FrameRequest(BaseModel):
     rgb_base64: str = Field(max_length=6_000_000)
+    object_hint: dict[str, Any] | None = None
 
 
 class BatchItem(FrameRequest):
@@ -145,7 +146,7 @@ def create_app(policy, config):
 
     @app.post("/sessions/{session_id}/step")
     def step(session_id: str, request: FrameRequest):
-        return manager.step(session_id, decode_rgb(request.rgb_base64))
+        return manager.step(session_id, decode_rgb(request.rgb_base64), request.object_hint)
 
     @app.post("/sessions/{session_id}/reset")
     def reset(session_id: str, request: StartRequest):
@@ -161,7 +162,7 @@ def create_app(policy, config):
     def batch(requests: list[BatchItem]):
         return batch_steps(
             manager,
-            [(r.session_id, decode_rgb(r.rgb_base64)) for r in requests],
+            [(r.session_id, decode_rgb(r.rgb_base64), r.object_hint) for r in requests],
             serving["max_batch_size"],
         )
 
@@ -177,7 +178,7 @@ def create_app(policy, config):
                 serving.get("reload_on_demo_reset", True)
                 and str(latest) != manager.policy.loaded_checkpoint
             ):
-                if not (latest / "actor_critic.safetensors").is_file():
+                if not (latest / "adapters.safetensors").is_file():
                     raise ValueError("Latest checkpoint is not complete")
                 # Stage the old weights on CPU to avoid two FP32 GPU copies
                 # alongside the learner. In-flight requests share this lock.

@@ -35,7 +35,7 @@ def test_viewer_reloads_latest_on_reset_and_invalidates_sessions(tmp_path, monke
     versions = [tmp_path / f"update_{i}" for i in (1, 2)]
     for version in versions:
         version.mkdir()
-        (version / "actor_critic.safetensors").touch()
+        (version / "adapters.safetensors").touch()
     latest = tmp_path / "latest"
     latest.symlink_to(versions[0])
     config = {

@@ -17,6 +17,14 @@ def validate_affordance_label(label, episode_id, frame_id):
     confidence = label["apos_confidence"]
     if not math.isfinite(confidence) or not 0 <= confidence <= 1:
         raise ValueError("Invalid geometric APOS confidence")
+    if label.get("opos_valid"):
+        targets = label.get("opos_targets") or [label["opos"]]
+        if not 0 <= label["opos"] <= 1296 or any(
+            type(t) is not int or not 0 <= t <= 1296 for t in targets
+        ):
+            raise ValueError("Invalid instance OPOS label")
+        if label["opos"] not in targets or (0 in targets and targets != [0]):
+            raise ValueError("OPOS absence and visible points cannot share a label")
     return label
 
 

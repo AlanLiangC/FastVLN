@@ -29,13 +29,13 @@ def benchmark(function, repetitions=10):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--inputs", default="runtime/reports/navigation_speed_inputs.pt")
+    parser.add_argument("--inputs", default="runtime/fixtures/navigation/rgb_inputs.pt")
     parser.add_argument("--output", default="runtime/reports/navigation_batching_validation.json")
     args = parser.parse_args()
     config = yaml.safe_load(Path("configs/pointcot.yaml").read_text())
     seed_everything(config["seed"])
     policy = Qwen35PointCoTPolicy(config).eval()
-    load_adapters(policy, args.checkpoint)
+    load_adapters(policy, args.checkpoint, allow_new_plan=True)
     rows = torch.load(args.inputs, weights_only=False)
     states = [policy.start_episode(r["episode_id"], r["instruction"]) for r in rows]
     errors, replay_errors, token_matches = [], [], []

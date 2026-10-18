@@ -24,6 +24,20 @@ def draw_pointing_overlay(canvas, perception, image_size):
     radius = max(8, round(width / 48))
     font = _font(max(12, round(width / 34)))
     labels = []
+    external = decode_pixel(perception.get("object_hint_token", 0), width, height)
+    if external is not None:
+        x, y = external
+        draw.rectangle(
+            (x - radius - 3, y - radius - 3, x + radius + 3, y + radius + 3),
+            outline="white",
+            width=5,
+        )
+        draw.rectangle(
+            (x - radius - 3, y - radius - 3, x + radius + 3, y + radius + 3),
+            outline="#ffb000",
+            width=3,
+        )
+        labels.append(("hint", "#ffb000", x, y))
     for name, color in (("apos", APOS_COLOR), ("opos", OPOS_COLOR)):
         point = decode_pixel(perception[name], width, height)
         if point is None:
@@ -50,9 +64,11 @@ def draw_pointing_overlay(canvas, perception, image_size):
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
         box_w, box_h = right - left + 8, bottom - top + 8
         label_x = x + radius + 9
+        if name == "hint":
+            label_x = x - radius - 9 - box_w
         if label_x + box_w > width - 2:
             label_x = x - radius - 9 - box_w
-        label_y = y - box_h - 4 if name == "apos" else y + 4
+        label_y = y - box_h - 4 if name in ("apos", "hint") else y + 4
         label_x = max(2, min(label_x, width - box_w - 2))
         label_y = max(2, min(label_y, height - box_h - 2))
         draw.rectangle(

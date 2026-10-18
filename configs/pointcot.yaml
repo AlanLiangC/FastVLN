@@ -1,6 +1,6 @@
 seed: 2025
 device: cuda:0
-run_dir: runs/qwen35_pointcot_active
+run_dir: runs/qwen35_pointcot_opos_hint
 model:
   family: qwen35_pointcot
   checkpoint: checkpoints/qwen35_0p8b_base
@@ -8,6 +8,10 @@ model:
   language_compute_dtype: float32
   float32_matmul_precision: high
   point_decoding: flat
+  apos_decoding: hierarchical
+  opos_decoding: hierarchical
+  future_action_steps: 4
+  object_hint_token: true
   action_dim: 6
   image_size:
   - 256
@@ -16,50 +20,71 @@ model:
   lora_alpha: 16
   gate_rank: 8
   gradient_checkpointing: false
+  inference_cuda_graphs: true
+  cache_frame_templates: true
   inference_mode: frame_local_native_plus_kda
   vision_compute_dtype: float32
 data:
   iterator_options:
-    max_scene_repeat_steps: 50000
+    max_scene_repeat_steps: 2000
     step_repetition_range: 0.2
   sources:
   - manifest: runtime/data/manifests/hm3d_ovon_train.json
     weight: 1.0
 trainer:
   num_updates: 10000
-  num_envs: 2
+  num_envs: 3
   num_expert_envs: 1
-  num_dagger_envs: 0
+  num_dagger_envs: 1
   rollout_steps: 100
   sequence_length: 20
   replay_mode: packed
+  split_teacher_replay: true
+  overlap_perception_oracle: true
+  ppo_num_mini_batches: 2
   learning_rates:
-    lora: 0.00002
-    memory: 0.0001
-    point: 0.0001
-    action: 0.0003
-    critic: 0.0003
-  warmup_updates: 100
-  expert_warmup_probability: 0.7
+    lora: 0.00001
+    memory: 0.00005
+    point: 0.00005
+    action: 0.00015
+    critic: 0.00015
+    planning: 0.0003
+    hint: 0.0001
+  object_hints:
+    episode_probability: 0.5
+    noise:
+      dropout: 0.2
+      jitter: 1
+      false_positive: 0.01
+      constrain_to_support: true
+  warmup_updates: 50
+  schedule_from_fork: true
+  expert_warmup_probability: 0.0
   ppo_ramp_updates: 200
-  ppo_weight: 0.5
+  ppo_weight: 0.25
   recovery_il_weight: 3.0
   stop_il_weight: 2.0
   value_loss_coef: 0.5
   entropy_coef: 0.005
   max_grad_norm: 1.0
   replay_tolerance: 0.05
-  checkpoint_interval: 25
+  checkpoint_interval: 5
   eval_interval: 100
   keep_checkpoints: 2
   supervision:
     stale_seconds: 3600
-    min_updates: 500
+    min_updates: 200
     zero_sr_patience: 5
     stop_on_failure: true
-  point_il_coef: 1.0
+  point_il_coef: 0.25
+  opos_supervision:
+    anchor_weight: 0.2
+    balanced_visibility: true
+    visibility_balance_power: 0.5
   point_supervision_prefix: actual
-  apos_type_il_coef: 2.0
+  apos_type_il_coef: 0.0
+  apos_forward_intent_coef: 1.0
+  future_action_loss_coef: 0.25
   grounding_coef: 0.5
   grounding_batch_size: 4
   bootstrap_time_limits: false
@@ -70,13 +95,21 @@ eval:
   - runtime/data/manifests/hm3d_ovon_val_seen.json
   - runtime/data/manifests/hm3d_ovon_val_seen_synonyms.json
   - runtime/data/manifests/hm3d_ovon_val_unseen.json
-  episodes: 48
+  episodes: 12
+  full_episodes: 48
+  full_eval_interval: 500
+  settings: [no_hint, simulated_hint]
+  hint_noise:
+    dropout: 0.0
+    jitter: 0
+    false_positive: 0.0
+    constrain_to_support: true
   max_steps: 500
   video: true
-  num_envs: 1
+  num_envs: 8
   stratified: true
-  video_episodes: 6
-  video_selection: representative
+  video_episodes: 2
+  video_selection: first
   video_anchor_episodes: 1
 habitat:
   python: runtime/habitat-env/bin/python
@@ -107,7 +140,10 @@ habitat:
   max_episode_steps: 500
   timeout_s: 120
   perception_labels: true
-  perception_object_labels: false
+  perception_object_labels: true
+  object_label_source: semantic_instance
+  semantic_dataset_config: runtime/data/scene_datasets/hm3d/hm3d_annotated_basis.scene_dataset_config.json
+  opos_min_visible_pixels: 9
   reward:
     success_reward: 5.0
     slack_penalty: 0.001
@@ -116,7 +152,7 @@ habitat:
     false_stop_penalty: 5.0
 distributed:
   gpu_offset: 0
-  world_size: 1
+  world_size: 8
   gradient_sync: manual
 curriculum:
   original_probability: 0.5

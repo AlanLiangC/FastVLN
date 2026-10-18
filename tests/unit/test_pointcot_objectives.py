@@ -8,7 +8,11 @@ from streamnav.contracts.episode import NavigationEpisode
 from streamnav.data.grounding import GroundingSource, check_grounding_split, validate_record
 from streamnav.data.mixed_starts import MixedStartEpisodeSource, validate_curriculum
 from streamnav.models.point_cot.policy import TokenStep
-from streamnav.training.point_supervision import marginal_point_loss, targets_from_label
+from streamnav.training.point_supervision import (
+    grounding_loss,
+    marginal_point_loss,
+    targets_from_label,
+)
 from streamnav.training.pointcot_trainer import replay_losses
 
 
@@ -26,6 +30,38 @@ def test_equivalent_objects_use_probability_mass():
     logits = torch.tensor([[1.0, 2.0, 3.0]])
     loss = marginal_point_loss(logits, [[1, 2, 2]])
     assert torch.allclose(loss, -logits.softmax(-1)[:, 1:].sum(-1).log())
+
+
+@pytest.mark.parametrize("mode,expected", [("flat", 1297), ("hierarchical", 42)])
+def test_grounding_auxiliary_uses_navigation_apos_decoding(monkeypatch, mode, expected):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(GroundingSource, "features_many", lambda policy, rows: [None])
+    apos = torch.zeros(1, 1300)
+    apos[0, 42], apos[0, 1297] = 0.5, 2.0
+    opos = torch.zeros(1, 1297, requires_grad=True)
+
+    class Policy:
+        device = torch.device("cpu")
+        apos_decoding = mode
+        calls = 0
+
+        def start_episode(self, image, instruction):
+            return None
+
+        def replay_fragment(self, features, state, tokens, resets=None):
+            if self.calls:
+                assert int(tokens[0][0]) == expected
+            self.calls += 1
+            return SimpleNamespace(apos_logits=apos, opos_logits=opos)
+
+    policy = Policy()
+    loss, _, _ = grounding_loss(
+        policy,
+        [{"image_id": "x", "instruction": "Find a chair.", "opos_targets": [42]}],
+    )
+    loss.backward()
+    assert policy.calls == 2 and opos.grad[0, 42] < 0
 
 
 def test_grounding_splits_are_by_image(tmp_path):
@@ -104,7 +140,8 @@ def test_weighted_grounding_resume_and_real_image_priority(tmp_path):
     assert samples == source.sample(200)
 
 
-def test_dagger_trains_actual_points_and_never_replaces_ppo_prefix():
+@pytest.mark.parametrize("checkpoint_teacher", [False, True])
+def test_dagger_trains_actual_points_and_never_replaces_ppo_prefix(checkpoint_teacher):
     from types import SimpleNamespace
 
     zero = torch.tensor(0)
@@ -148,7 +185,16 @@ def test_dagger_trains_actual_points_and_never_replaces_ppo_prefix():
         "entropy_coef": 0.01,
     }
     loss, pieces, error = replay_losses(
-        Policy(), None, {}, sampled, [record], torch.ones(1), torch.zeros(1), cfg, 0.5
+        Policy(),
+        None,
+        {},
+        sampled,
+        [record],
+        torch.ones(1),
+        torch.zeros(1),
+        cfg,
+        0.5,
+        checkpoint_teacher=checkpoint_teacher,
     )
     loss.sum().backward()
     assert actual.grad[0, 0] < 0 and teacher.grad[0, 0] < 0

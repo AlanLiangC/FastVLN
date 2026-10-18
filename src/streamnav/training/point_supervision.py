@@ -4,12 +4,15 @@ import torch
 from torch.nn import functional as F
 
 from streamnav.data.grounding_support import support_targets
+from streamnav.models.policy.perception import decode_point_logits, point_type_logits
 
 
 def targets_from_label(label):
     label = label or {}
     return {
-        name + "_targets": [int(label[name])] if label.get(name + "_valid", False) else []
+        name + "_targets": (label.get(name + "_targets") or [int(label[name])])
+        if label.get(name + "_valid", False)
+        else []
         for name in ("apos", "opos")
     }
 
@@ -25,6 +28,34 @@ def marginal_point_loss(logits, targets):
         else:
             losses.append(row.sum() * 0)
     return torch.stack(losses)
+
+
+def navigation_object_losses(logits, targets, *, anchor_weight=0.0):
+    """Factorized token CE: visibility plus conditional location, counted once."""
+    if not 0 <= anchor_weight <= 1:
+        raise ValueError("Navigation OPOS anchor weight must lie in [0, 1]")
+    types = point_type_logits(logits).float().log_softmax(-1)
+    valid = torch.tensor([bool(t) for t in targets], device=logits.device)
+    visible = torch.tensor([bool(t) and t != [0] for t in targets], device=logits.device)
+    visibility = -types.gather(-1, visible.long()[:, None]).squeeze(-1) * valid
+    total = marginal_point_loss(logits, targets)
+    if anchor_weight:
+        anchor = marginal_point_loss(logits, [[t[0]] if t else [] for t in targets])
+        total = (1 - anchor_weight) * total + anchor_weight * anchor
+    location = (total - visibility) * visible
+    return visibility + location, visibility, location
+
+
+def forward_intent_loss(logits, labels, experts):
+    """Unknown coordinates still permit forward-compatible NONE/POINT intent.
+
+    This does not invent a pixel or assert visibility. Reliable APOS labels,
+    including visible waypoints during turns, retain their original semantics.
+    """
+    mask = torch.tensor([not label["apos_targets"] for label in labels], device=logits.device)
+    mask &= experts == 1
+    log_probs = point_type_logits(logits).float().log_softmax(-1)
+    return -log_probs[:, :2].logsumexp(-1) * mask, mask
 
 
 def supervised_fragment(policy, features, state, tokens, labels, *, resets=None, experts=None):
@@ -80,7 +111,11 @@ def grounding_loss(policy, rows, *, anchor_weight=1.0, point_radius=0.0):
         prefix = policy.replay_fragment(
             features, state, [(zero, zero, zero)] * len(rows), resets=resets
         )
-        prefix_tokens = [(a, zero, zero) for a in prefix.apos_logits.argmax(-1)]
+        apos_tokens = decode_point_logits(
+            prefix.apos_logits,
+            hierarchical=getattr(policy, "apos_decoding", "flat") == "hierarchical",
+        )
+        prefix_tokens = [(a, zero, zero) for a in apos_tokens]
     step, apos, opos, _ = supervised_fragment(
         policy, features, state, prefix_tokens, rows, resets=resets
     )

@@ -6,8 +6,11 @@ from dataclasses import dataclass
 
 import torch
 
+from streamnav.contracts.action import NavigationAction
 from streamnav.contracts.cache import state_bytes
+from streamnav.contracts.object_hint import object_hint_token
 from streamnav.contracts.state import StreamingState
+from streamnav.evaluation.perception_records import perception_records
 
 
 @dataclass
@@ -59,21 +62,52 @@ class SessionManager:
             return sid
 
     @torch.no_grad()
-    def step(self, session_id, rgb):
+    def step(self, session_id, rgb, object_hint=None):
         with self.lock:
             self._expire()
             session = self.sessions[session_id]
+            hint = object_hint_token(
+                object_hint,
+                rgb.shape[1],
+                rgb.shape[0],
+                frame_id=session.state.step_index,
+                episode_id=session_id,
+            )
+            pointing = getattr(self.policy, "supports_object_hints", False)
             with self.autocast():
-                action, output = self.policy.act(rgb, session.state, deterministic=True)
-            session.state = output.state
+                if pointing:
+                    logits, values, states, predictions = self.policy.forward_batch(
+                        rgb[None], [session.state], return_perception=True, hint_tokens=[hint]
+                    )
+                    action = NavigationAction(int(logits[0].argmax()))
+                    probabilities, value, state = (
+                        logits[0].softmax(-1).tolist(),
+                        float(values[0]),
+                        states[0],
+                    )
+                else:
+                    if hint:
+                        raise ValueError("Loaded checkpoint has no object-hint input")
+                    action, output = self.policy.act(rgb, session.state, deterministic=True)
+                    probabilities, value, state = (
+                        output.logits.softmax(-1).tolist(),
+                        output.value.item(),
+                        output.state,
+                    )
+            session.state = state
             session.last_access = time.monotonic()
             return {
                 "action": int(action),
                 "action_name": action.name,
-                "value": output.value.item(),
-                "probabilities": output.logits.softmax(-1).tolist(),
-                "step": output.state.step_index,
-                "state_bytes": state_bytes(output.state),
+                "value": value,
+                "probabilities": probabilities,
+                "step": state.step_index,
+                "state_bytes": state_bytes(state),
+                **(
+                    {"perception": perception_records(predictions)[0], "object_hint_token": hint}
+                    if pointing
+                    else {}
+                ),
             }
 
     @torch.no_grad()
@@ -85,7 +119,7 @@ class SessionManager:
             session = self.sessions[session_id]
             session.instruction = instruction
             with self.autocast():
-                session.state = self.policy.reset(session_id, instruction)
+                session.state = self.policy.start_episode(session_id, instruction)
             session.last_access = time.monotonic()
 
     def close(self, session_id):

@@ -22,7 +22,7 @@ def rows(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default="runs/qwen35_pointcot_active")
+    parser.add_argument("--root", default="runs/qwen35_pointcot_opos_hint")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     reports = []
@@ -37,6 +37,7 @@ def main():
             continue
         train = rows(directory / "train_metrics.jsonl")
         evaluations = rows(directory / "eval_metrics.jsonl")
+        hint_evaluations = rows(directory / "eval_hint_metrics.jsonl")
         grounding_evaluations = rows(directory / "grounding_eval.jsonl")
         health = current_health(directory)
         last = train[-1] if train else {}
@@ -76,6 +77,26 @@ def main():
                         "apos_geometry_greedy_accuracy",
                         "apos_geometry_pixel_greedy_accuracy_5pct",
                         "apos_parameter_gradient_norm",
+                        "apos_forward_intent_fraction",
+                        "future_action_loss",
+                        "future_action_accuracy",
+                        "future_action_target_counts",
+                        "training_scene_count",
+                        "opos_loss",
+                        "opos_visibility_loss",
+                        "opos_location_loss",
+                        "opos_label_fraction",
+                        "opos_visible_fraction",
+                        "opos_absent_fraction",
+                        "opos_parameter_gradient_norm",
+                        "opos_no_hint_positive_gradient_norm",
+                        "opos_no_hint_visible_count",
+                        "opos_no_hint_visible_detection_hits",
+                        "opos_no_hint_visible_location_hits",
+                        "opos_hint_visible_count",
+                        "opos_hint_visible_detection_hits",
+                        "opos_hint_visible_location_hits",
+                        "object_hint_fraction",
                     )
                 }
                 if "apos_geometry_labels" in last
@@ -84,6 +105,7 @@ def main():
                 if grounding_evaluations
                 else None,
                 "autonomous_evaluation": latest,
+                "hint_evaluation": hint_evaluations[-3:],
                 "best_evaluation": best,
                 "health_age_seconds": round(time.time() - health.get("time", 0), 1),
                 "health": health,
@@ -103,7 +125,7 @@ def main():
         )
         print("  warnings:", ", ".join(health.get("warnings", [])) or "none")
         if report["navigation_supervision"]:
-            print("  APOS geometry:", json.dumps(report["navigation_supervision"]))
+            print("  point CoT:", json.dumps(report["navigation_supervision"]))
         progress = health.get("progress", {})
         if progress:
             print(
@@ -117,7 +139,12 @@ def main():
             print(f"  best: update={best['update']} {metric}={best[metric]:.4f}")
         elif best:
             score = best["success"] if "success" in best else best["score"][0]
-            print(f"  best: update={best['update']} macro_SR={score:.4f}")
+            metric = (
+                "anchor_macro_SR"
+                if best.get("selection_metric") == "fixed_anchor_success"
+                else "macro_SR"
+            )
+            print(f"  best: update={best['update']} {metric}={score:.4f}")
         if report["grounding_evaluation"]:
             evaluation = report["grounding_evaluation"]
             print(
@@ -131,6 +158,12 @@ def main():
                 )
         for split, evaluation in report["autonomous_evaluation"].items():
             print(f"  {split}: {json.dumps(evaluation)}")
+        for evaluation in report["hint_evaluation"]:
+            fields = {
+                key: evaluation.get(key)
+                for key in ("update", "episodes", "success", "spl", "hint_source", "hint_noise")
+            }
+            print(f"  simulated_hint/{evaluation['split']}: {json.dumps(fields)}")
     subprocess.run(
         ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used", "--format=csv,noheader"],
         check=True,

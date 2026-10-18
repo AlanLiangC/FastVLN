@@ -2,9 +2,9 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "$STREAMNAV_ROOT"
-viewer_checkpoint="${1:-runs/qwen35_pointcot_active/checkpoints/best}"
+viewer_checkpoint="${1:-runs/qwen35_pointcot_opos_hint/checkpoints/best}"
 if [[ $# -eq 0 && ! -e "$viewer_checkpoint/adapters.safetensors" ]]; then
-  viewer_checkpoint="runs/qwen35_pointcot_active/checkpoints/latest"
+  viewer_checkpoint="runs/qwen35_pointcot_opos_hint/checkpoints/latest"
 fi
 if [[ $# -gt 0 ]]; then shift; fi
 if [[ ! -f "$viewer_checkpoint/adapters.safetensors" ]]; then

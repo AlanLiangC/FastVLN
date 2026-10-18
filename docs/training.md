@@ -1,91 +1,112 @@
 # 训练与评估
 
-配置见 [pointcot.yaml](../configs/pointcot.yaml)。Stage I grounding 已完成，Stage II 导航从改进训练的最佳 update 800 权重初始化。
+当前配置为 [pointcot.yaml](../configs/pointcot.yaml)，模型与监督接口分别见 [架构](architecture.md) 和 [Point CoT](perception.md)。当前节点为 `checkpoints/versions/qwen35_pointcot_20261017`：navigation 固定 update 5155，best 固定 update 4400。活动运行继续写入 `runs/qwen35_pointcot_opos_hint`。
 
-## Stage I：grounding
+## 导航训练
 
 ```bash
 source scripts/env.sh
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 STREAMNAV_WORLD_SIZE=6 bash scripts/start_grounding_training.sh --initialize-from runs/pointcot_grounding/checkpoints/update_0004400
+# 当前八卡运行恢复；保留权重、Adam、数据游标和 PPO 进度
+bash scripts/start_eight_gpu_training.sh \
+  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest --skip-initial-eval
+# 从固定节点恢复到新目录
+STREAMNAV_RUN_DIR=runs/navigation_from_node bash scripts/start_eight_gpu_training.sh \
+  --resume checkpoints/versions/qwen35_pointcot_20261017/navigation --skip-initial-eval
+# 保存完整 update 后暂停
+bash scripts/stop_training.sh runs/qwen35_pointcot_opos_hint
+python tools/training_status.py --root runs/qwen35_pointcot_opos_hint
 ```
 
-当前使用 GPU 0–5，GPU 6、7 留给其他任务；grounding 启动脚本默认选择这六张卡。每卡 batch 32，全局 batch 192。当前配置从保留的 4400 权重进行 2000 次改进更新，约 38.4 万次查询采样；update 从 0 重新计数。`--initialize-from` 只加载 adapter，优化器、采样器和学习率曲线重新初始化，来源权重和数据可显式变化；`--resume` 则严格恢复原配方和状态，二者互斥。完整基座预训练需要另设预算和学习率。带来源权重的采样不是每张图恰好遍历固定次数。输入、来源数量、采样比例和防泄漏规则见 [数据文档](datasets.md)。
+| 项目 | 当前设置 |
+|---|---|
+| GPU / 环境 | 默认 GPU 0–7；每卡专家、greedy DAgger、随机 PPO 各 1 个环境 |
+| rollout / fragment | 100 步 / 20 步 |
+| update | 2400 条转移，2 次同步 mini-batch optimizer step |
+| 预算 | 累计 update 10000 |
+| PPO | 系数 0.25，clip=0.2；仅随机学生参与 PPO 和 critic |
+| 动作 IL | 实际预测点前缀与标注点前缀各 50%，三路环境都接受教师动作 CE |
+| 辅助项 | point=0.25，未来动作=0.25，grounding=0.5 |
+| grounding 混合 | 每 rank 每 mini-batch 4 条，八卡每 update 64 条 |
+| 优化器 | fused AdamW，梯度同步后裁剪到范数 1 |
+| 保存 / 评估 | 每 5 / 100 update，最近 2 个检查点及 best、配方初始检查点保留 |
 
-基座冻结，OPOS loss 为 20% canonical 点概率损失 + 80% 实例有效区域概率损失；只有点标注时区域分支使用半径 0.025 的网格邻域。LoRA、KDA 和点表参与更新；APOS 未标注时使用当前模型的预测前缀并屏蔽 APOS loss。没有动作或 STOP loss。弱框使用区域概率质量，权重 0.25。新增动作/critic 在这一阶段没有有效监督。
+LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-4，hint LR=1e-4。PPO 原计划为预热 50 update，再用 200 update 升至 0.25；当前延续的 `schedule_origin_update=1403` 已进入完整 PPO 阶段，恢复不重新预热。
 
-使用八线程图像读取、批量冻结视觉编码、FP32 + TF32 high 和 fused AdamW，关闭 grounding 梯度检查点。视觉 FP32 减少 BF16 编码随批次形状产生的数值差异，图片仍保留比例且不裁切。视觉像素预算最多 114,688，避免极端长宽比图片产生过长序列。每张图片独立重置缓存，batch padding 不进入 KDA 的有效序列。
+一个环境 step 是一次当前帧决策及仿真动作；一个 update 汇集全部环境的 100 步转移后更新参数。100 不是 episode 长度：episode 最多 500 步，可跨 update 延续。KDA 只在反向 fragment 起点 detach，20 步内保留梯度。六卡每 update 为 1800 条转移，跨卡数比较使用累计 `frames`。
 
-LoRA/KDA LR=1e-5、point LR=5e-5，当前改进训练前 25 update 线性 warmup，随后 cosine 降到初始 LR 的 10%；梯度范数裁剪 1。每次同步更新前汇总所有 rank 梯度。日志记录来源数量、缺失和弱区域样本数量、loss、学习率比例、最慢 rank 的更新耗时及最大显存。
+动作 CE 对碰撞恢复、STOP 样本的加权在整个分布式 rollout 上归一化。PPO 使用实际 APOS、OPOS、当前动作的联合概率，专家覆盖动作与 greedy DAgger 不使用伪造的 on-policy 概率。四步规划只用专家连续轨迹后续三步作辅助监督，跨 STOP、episode 或 rollout 边界的标签屏蔽；部署执行当前一步后重新观测规划。
 
-启动先保存、评估 update 0，并将其纳入最佳权重选择，避免改进训练退化后覆盖初始化基线。之后每 200 update 保存和验证，固定验证 1,536 条查询，按来源和标签类型分层；完成预算后再验证。分别报告可见点的精确格命中、归一化 5% 半径命中、明确缺失命中、弱区域命中及分来源结果。最佳权重按四个真实点来源的宏平均可见目标定位选择：有实例 support 时检查预测 token 是否在实例内部；只有点标注时使用 5% 距离。旧的 canonical 点距离指标保留用于跨版本比较，弱区域与缺失准确率不能抬高这一主指标。新最佳权重还须满足明确缺失准确率 ≥85%，防止通过总是预测存在来抬高可见目标成绩；通过门槛后，缺失命中用于同分比较。
+## 场景、起点与提示
 
-每次 eval 使用实际确定性 APOS 前缀计算 OPOS 的混合 loss、canonical NLL 和 support NLL，分来源记录；同时报告可见目标误判缺失率与缺失目标误判存在率，不额外运行第二次视觉编码或模型推理。每次 eval 保存 32 个案例：12 个分层固定，其余按预测结果选择。复用同一验证预测，目录为 `runs/pointcot_grounding_refined/grounding_visualizations/update_XXXXXXX/`，包括原图、标记图、`overview.jpg`、`index.html`、`cases.json` 和全部查询的 `predictions.jsonl`。洋红菱形为预测 OPOS，青绿圆圈为标注点，绿色轮廓为真实实例有效网格，橙框为弱区域；没有真值的 APOS 不绘制。标记有白边，原图亮度保持不变。
+使用 HM3D-OVON train 和官方 HM3D-Semantics 实例资产，路径与准备方式见 [数据文档](datasets.md)。缺少实例资产或整次 rollout 的 OPOS 有效标签为零时拒绝训练。机器人 `allow_sliding=true`，高 0.88 m、半径 0.18 m，前进 0.25 m、转向 30°，成功距离 0.25 m。
+
+训练 reset 按 episode 选择 50% 原始起点、35% 距目标合法视点 geodesic 0.5–3 m 的 near 起点、15% 距离 0–0.2 m 的 ready 起点。near 有 50% 概率朝向目标；ready 朝向目标并检查可见性。采样失败保留原始起点。比例针对 reset，不代表转移或 STOP 标签比例。评估只用原始起点。
+
+每 rank 的 sampler 按约 2000 次环境 step 驻留场景，带 20% jitter。约一半 episode 全程 NULL，其余用训练实例点模拟提示，并加入 20% 缺失、±1 格内部扰动、1% 随机误报。NULL 只表示没有外部信息，目标可见时仍监督 OPOS 像素位置。训练深度与实例图仅用于生成标签，不进入策略输入。
+
+## 计算与回放校验
+
+每卡环境共享批量视觉编码与 APOS → OPOS → action 推理；padding 不进入有效 recurrence，各环境缓存独立。关闭常规语言梯度检查点，实际与教师前缀分别前向、反向，累积到同一组梯度后才执行原有 optimizer step。监督、归一化和混合比例保持一致；浮点累加顺序可以产生微小差异。
+
+推理启用 CUDA Graph，按形状、序列边界和 LoRA 状态缓存，最多 16 个图。缓存满时先释放旧图；输出状态复制到各环境独立存储。FLA 序列索引在图内生成，避免图引用被释放的临时缓存。图只用于无梯度推理，有梯度回放保持原计算路径。
+
+文本模板、token ID 和图像网格位置按指令缓存，LRU 各 256 条；每帧仍使用当前 RGB 编码。视觉编码与教师 / 实例标签 RPC 重叠，标签返回后填 hint token；所有 RPC 完成后才 step/reset。教师不可用导致重置时丢弃预取特征。
+
+第一次参数更新前，完整 rollout 的行为概率回放误差必须 ≤0.05。打包误差超限时依次尝试逐步回放和原三环境布局的批量回放，保持采样 token、padding、独立缓存与重置。后备批量路径使用逐帧 activation checkpoint，释放推理图缓存以控制显存。仍不一致时保存诊断并退出，不放宽阈值或跳过错误样本。NaN/Inf 梯度在 optimizer step 前拒绝。
+
+第二个 mini-batch 使用新策略对旧行为概率计算 PPO，允许合法的概率变化。关键字段为 `replay_log_prob_error_max`、`differentiable_replay_error_max`、`policy_log_probability_change_max`、`ppo_clip_fraction`、`optimizer_steps`。原生 GDN 与 KDA 的采样和回放使用一致的 chunk 方程。
+
+验证工具包括 `tools/validate_behavior_replay.py`、`validate_inference_graphs.py`、`validate_plan4.py` 和 `validate_replay_efficiency.py`，输入样本位于 `runtime/fixtures/navigation/`。样本是工程验证数据，不是导航性能结果；输出写入 `runtime/reports/`。
+
+## 保存、恢复与变更卡数
+
+检查点包含 FP32 adapter、Adam、每 rank 的 RNG、导航 / grounding 采样状态、累计 frames、配方、基座 revision、数据哈希及源码快照。仿真与 KDA 状态恢复时重新创建，不能保证逐帧复现中断前的轨迹。超过恢复检查点的未保存日志会移入 `interrupted/` 并记录 `resume_events.jsonl`，避免同名 update 的两条分支混在曲线中。
+
+`--resume` 检查原数据与监督配方。需要修改监督时使用 `--fork-from CHECKPOINT --keep-schedule`，保持 Adam 和 PPO 进度，并记录配方分叉。`--initialize-from` 仅加载适配权重，重新初始化导航优化器与采样器。
 
 ```bash
-make viewer VIEWER_RUN_DIR=runs/pointcot_grounding_refined
-# http://127.0.0.1:8765/grounding_visualizations/
+# 六卡检查点扩为八卡，或其他显式卡数迁移
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/start_eight_gpu_training.sh \
+  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest \
+  --allow-world-size-change --skip-initial-eval
+# 缩为六卡
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 STREAMNAV_WORLD_SIZE=6 \
+  bash scripts/start_pointcot_training.sh \
+  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest \
+  --allow-world-size-change --skip-initial-eval
 ```
 
-训练日志、逐更新指标和验证指标分别为 `training.log`、`train_metrics.jsonl`、`grounding_eval.jsonl`。`training_progress.json` 和 `progress/rank_*.json` 记录加载、训练和评估进度；后台 monitor 每 30 秒更新 `health_status.json` 与 GPU 状态。grounding 监控使用点指标，非有限 loss/梯度、worker 异常退出或长时间无进展才建议暂停，不套用导航成功率的停止规则。使用 `python tools/training_status.py --root runs/pointcot_grounding_refined` 查询。
+卡数变化保留参数、Adam、update、frames 和 PPO 计划；存续 rank 保留各自 RNG / 两个 sampler，新增 rank 使用基种子、update 和 rank 派生独立种子。迁移写入 `world_size_changes.jsonl`，首个完整 update 立即保存新 rank 集合。之后同卡数恢复无需再次加迁移参数。当前运行沿用原 update 预算，卡数变化不自动缩放学习率。
 
-检查点保留最近两个与最佳权重，包含优化器、每 rank RNG/采样状态、配方、数据哈希和源码快照。`tools/watch_grounding_visualizations.py` 仅用于已有 checkpoint 补图，新训练直接在 eval 内输出可视化。
+## 评估与视频
 
-同一批 COCO 样本的单卡测试：串行视觉编码、batch 8、梯度检查点开启时约 14.4 查询/秒；批量视觉编码、batch 32、关闭检查点时约 34.0 查询/秒，batch 64 显存不足。八卡混合来源的实际吞吐与该单卡受控测试分别记录在 `runtime/reports/grounding_training_launch.json` 和 `grounding_benchmark_*.json`；评估及保存耗时另计，不将短程更新吞吐直接当作全程速度。
+每次评估在相同原始起点分别运行 `no_hint` 与 `simulated_hint`。每 split 日常固定 12 条，每 500 update 扩为 48 条，最多 500 步；每卡最多 8 个并行环境，日常最多 2 个。模拟提示只在当前目标可见且实例标签有效时给干净内部点，其余为 NULL；它不代表真实检测器性能。
 
-## Stage II：DAgger/PPO + grounding
+无提示指标写 `eval_metrics.jsonl`，作为 best / health 主成绩；有提示写 `eval_hint_metrics.jsonl`。SR 采用 geodesic 距离 <0.25 m 且执行 STOP，`success_strict_0_1` 是另外的 0.1 m 口径。`oracle_success` 表示这条模型轨迹曾进入成功距离，不是另跑专家的成功率。
+
+较大评估包含同样的日常前 12 条，单列 `selection_success`；best 按这组固定 anchor 的三个 split 平均 SR 选择。比较总体成绩时区分 36 与 144 条；已有小样本 best 不等于更大评估上的最优模型。训练混合近目标起点的成功率不能替代原始起点评估。
+
+每个设置 / split 保存两个固定视频，共 12 个，目录为 `evaluation/update_XXXXXXX/{no_hint,simulated_hint}/`，包含 MP4、trace、播放页和汇总。点位与标注口径见 [部署文档](deployment.md)。独立评估应指定新的 `run_dir`，保留活动训练的原始评估结果。
+
+monitor 每 30 秒更新 `health_status.json`、GPU 与 worker 进展。非有限数值、worker 异常、长时间停滞和持续感知 / 行为退化会触发检查或保存后停止。它只向当前 launcher 的存活 worker 请求正常退出，不直接中断 checkpoint I/O。完整指标和轨迹是判断收敛的依据。
+
+## Grounding 阶段
+
+已完成运行保留在 `runs/pointcot_grounding_refined`，best 为 800、最后一次为 2000。可用其 best 初始化新的导航运行：
 
 ```bash
-bash scripts/start_pointcot_training.sh --initialize-from runs/pointcot_grounding_refined/checkpoints/best
+STREAMNAV_RUN_DIR=runs/navigation_new bash scripts/start_eight_gpu_training.sh \
+  --initialize-from runs/pointcot_grounding_refined/checkpoints/best
+# 从冻结基座重新做 grounding，使用新目录和显式预算
+STREAMNAV_RUN_DIR=runs/grounding_new bash scripts/start_grounding_training.sh --updates 2000
 ```
 
-导航启动脚本默认使用 GPU 0–5 的六卡训练，GPU 6、7 保留。每卡两个环境，全局每 update 收集 1200 条导航转移，正式训练预算为 10000 update。
+Grounding 默认 GPU 0–5、每卡 batch 32，全局 192。`--updates` 优先于 `grounding.pretrain_updates`；仅两者都未设置时才按 `pretrain_epochs` 换算。带来源权重的采样不代表每张图恰好遍历同样次数。恢复已有 grounding 使用 `--resume`；`--initialize-from` 只载入 adapter，并重新建立 optimizer、sampler 与学习率曲线。
 
-默认每 rank 两个环境，一个持续执行专家动作，一个学生环境。DAgger 对两路访问状态都做教师动作 CE，混合实际点前缀与标注点前缀各 50%。point CE 使用实际预测点历史的回放 logits，对齐真实 rollout 的缓存；APOS 另加系数 2 的类型 CE，比较 NONE、像素路点、LEFT、RIGHT、STOP，像素路点使用 1296 个格子的概率总和。未知标注屏蔽这两项 loss，推理保持 flat token 解码。学生早期可混合教师动作；PPO 在 warmup 结束后才启用，此时学生环境完全按随机学生策略行动。专家环境和确定性 DAgger 环境不参与 PPO。
+静态图片每次从空缓存开始，只监督 OPOS；APOS 无标注时使用当前预测作为前缀并屏蔽 APOS loss，没有动作或 STOP loss。来源、区域监督、缺失采样和防泄漏见 [数据文档](datasets.md)。当前小学习率配方前 25 update warmup，再 cosine 降至 10%，梯度范数裁剪 1。
 
-默认 rollout=100、fragment=20。一个环境 step 是一次当前帧决策和仿真动作；一个 update 收集 `100 × num_envs × world_size` 条转移，进行一次同步参数更新。100 不是 episode 长度：episode 最多 500 步，可跨 update 延续。KDA 缓存在 fragment 起点 detach，20 步内反向传播。
+每 200 update 用固定分层的 1536 条查询验证，保存 32 个案例与全部预测。best 按真实点来源的宏平均可见目标定位选择，明确缺失准确率须 ≥85%；弱区域指标单列。图像保持比例、不裁切，批量冻结视觉编码，FP32 参数、语言 FP32/TF32，关闭常规梯度检查点。
 
-每卡环境共享一次批量视觉编码和一次批量自回归决策，保持 APOS → OPOS → action 顺序。不同指令长度的 padding 不进入原生 delta recurrence 或 KDA；每个环境独立保存、重置 cache。评估复用同一批量推理路径。默认关闭导航梯度检查点：20 帧回放的单卡峰值约 32 GiB，换取较少的重复计算。该计算开关允许在恢复训练时变化，权重、Adam、采样器和已完成 update 仍恢复；模型与监督配方的校验继续保留。
+## 项目保留规则
 
-PPO 系数在前 100 个 update 为零，随后 200 个 update 线性升到 0.5。使用固定 ramp，避免低成功率使 PPO 一直关闭。策略使用两点和动作的联合概率，clip=0.2。优势只在随机学生样本上归一化。默认超时不 bootstrap，与 OVSegDT 任务截断口径一致。
-
-每 rank 每个 update 继续混入 4 条 grounding 样本，全局 24 条，系数 0.5。默认 LoRA LR=2e-5、KDA LR=1e-4、point LR=1e-4、action/critic LR=3e-4；LoRA 和点表使用较小步长保护 grounding 初始化，KDA、动作与 critic 继续学习导航。梯度范数裁剪 1。所有 fragment 回放误差必须小于 0.05，打包误差过大则回退逐步回放，再次失败会拒绝更新。
-
-## 混合起点
-
-每次训练 reset：50% 保留原始起点，35% 采样 geodesic 距离 0.5–3 m 的近目标起点，15% 采样距离 0–0.2 m 的到达区域起点。这里距离指到合法目标视点集合的 geodesic，成功阈值为 0.25 m。near 起点 50% 朝向目标附近、50% 随机朝向；ready 起点朝向目标并校准相机俯仰，检查目标锚点未被遮挡，避免空缓存、背对目标的图像被直接标为 STOP。
-
-采样在当前机器人 navmesh 上直接选位置，检查楼层和实际距离；失败则保留原始起点并记录 fallback。ready 样本仍按真实成功条件标注 STOP。评估严格使用原始起点，禁止 curriculum metadata；仿真启用 `allow_sliding=true`，机器人高度/半径为 0.88/0.18 m。
-
-## 保存、暂停和恢复
-
-```bash
-# 保存后暂停 grounding
-bash scripts/stop_training.sh runs/pointcot_grounding_refined
-bash scripts/stop_training.sh runs/qwen35_pointcot_active
-bash scripts/start_pointcot_training.sh --resume runs/qwen35_pointcot_active/checkpoints/latest
-```
-
-checkpoint 包含 FP32 adapter、优化器、每 rank RNG 和两个数据源的采样状态、配置、基座 revision 与源码快照。导航恢复需同一 world size、数据和训练配方；仿真进程与缓存重新创建，不能保证复现中断前的逐步轨迹。`--initialize-from` 仅加载权重，重新初始化导航优化器。grounding 可通过其启动脚本的 `--resume` 恢复。需要缩减卡数时显式加 `--allow-world-size-change`，保留存续 rank 的 RNG/采样游标、权重、Adam 状态和累计样本数。训练终点与学习率曲线按原采样预算换算，避免换卡数后进度跳变；增加卡数仍会拒绝恢复。检查点与 resolved config 记录卡数变化。
-
-导航调整监督配方时用 `--fork-from CHECKPOINT`，保留权重、Adam 与采样状态，并在 `recipe_forks.jsonl` 记录来源和原配方。同目录继续须从该目录最新检查点开始；首个新配方 update 即保存，以便后续严格 `--resume`。当前 APOS 配方从 update 119 继续，首次新配方保存为 update 120。
-
-默认每 25 update 保存，每 100 update 评估，保留近期权重和最佳导航权重。导航日志记录各流成功率、碰撞、动作分布、教师 STOP 比例、起点类型、loss、PPO 系数及回放误差。`training_status.py --root DIR` 查询状态。
-
-APOS 的几何监督看 `apos_geometry_labels`、`apos_geometry_point_labels` 和左右/STOP 标签数量；`apos_loss` 按全部转移归一化，`apos_loss_per_labeled_frame` 按有标签的转移归一化。新增采样/greedy 格命中率与 `apos_parameter_gradient_norm`（同步、裁剪后的点表梯度范数）。`point_teacher_frames` 及对应旧 teacher agreement 字段仅指旧版视觉教师，不表示几何监督覆盖率；没有视觉教师时它们为 0/null。rollout 分项记录 oracle、批量策略、环境/重置和 bootstrap 耗时，各分项的全局值取最慢 rank，不能直接相加当作同一 rank 的总耗时。
-
-像素路点与 LEFT/RIGHT/STOP 的 greedy 成绩分开记录；像素路点同时报告精确格与归一化 5% 距离命中，避免转向分类掩盖真正的路点定位能力。真实导航帧的监督与批量推理验证使用 `tools/validate_navigation_batching.py`；单卡两环境完整推理实测约快 1.81 倍，六卡热身后的完整 update 从约 57 秒降至约 33 秒。启动、冷缓存、存盘和完整评估另计，不能把单卡推理倍数当作整个训练的倍数。
-
-`apos_type_loss` 记录类型 CE，`apos_teacher_prefix_loss` 仅诊断真值历史下的点 CE，不参与当前 point loss；类型 loss 也按全部转移归一化。`tools/validate_navigation_supervision.py` 使用已保存的真实帧检查实际前缀 CE、APOS 类型梯度、联合 PPO 梯度和基座冻结。
-
-## 测评和视频
-
-每 split 固定分层抽 48 条原始 episode，最多 500 步，不使用教师动作、深度标签或近目标采样。三个 split 分别报告 SR、SPL、距离、碰撞与吞吐，完整 split 与诊断子集不能混为一个成绩。
-
-```bash
-python -m streamnav.evaluation.runner checkpoint=runs/qwen35_pointcot_active/checkpoints/best
-make viewer
-```
-
-每个 eval 保存代表案例视频和 trace。APOS 荧光绿、OPOS 洋红，带白色边框，并与模型决策的原始帧对齐。失败视频与成功率应同时分析，不能用辅助专家流成功率代替学生评估。
-
-短程 canary 只验证数据、更新、PPO、保存和视频链路。短程 grounding 和少量导航更新不足以判断收敛或导航上限；应以正式 grounding 验证与导航原始起点评估判断效果。
+活动导航与已完成 grounding 的训练曲线、评估、源码、必要检查点保留；固定版本位于 `checkpoints/versions/`。数据、模型基座、安装环境、凭据、navmesh 与编译缓存不作实验垃圾清理。`runtime/reports/` 只保留当前验收、数据审计、恢复和性能分析；验证输入独立保存在 `runtime/fixtures/`，历史 canary、失败尝试、一次性对照输出不作为长期依赖。

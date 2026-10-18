@@ -98,6 +98,7 @@ def main():
                 expected_splits=len(cfg.get("eval", {}).get("manifests", [1, 2, 3])),
                 min_updates=supervision.get("min_updates", 500),
                 patience=supervision.get("zero_sr_patience", 5),
+                perception_start_update=cfg.get("fork_origin", {}).get("update", 0),
             )
         health.update(time=now, training_pid=args.pid, process_alive=alive)
         manual_stop = read_json(output / "stop_request.json", {}).get("training_pid") == args.pid
@@ -105,6 +106,11 @@ def main():
         workers = read_json(workers_file, [])
         # A resumed job may still have the previous launcher's worker file.
         workers = [w for w in workers if w.get("launcher_pid") == args.pid or w["pid"] == args.pid]
+        recipe_current = (
+            bool(workers)
+            and "source_snapshot" in cfg
+            and cfg_path.stat().st_mtime >= workers_file.stat().st_mtime
+        )
         health["workers"] = [{**w, "alive": worker_alive(w["pid"])} for w in workers]
         progress = latest_worker_progress(output, workers, now)
         if progress:
@@ -114,7 +120,7 @@ def main():
             ):
                 health["status"] = "evaluating"
         health["expected_workers"] = cfg.get("distributed", {}).get("world_size", 1)
-        if alive and not workers:
+        if alive and (not workers or not recipe_current):
             # During resume, config/metrics still belong to the prior run until
             # this launcher registers its workers. Do not terminate torchrun
             # using the old run's stopping rule before initialization finishes.
@@ -155,7 +161,10 @@ def main():
             health["stop_recommended"]
             and not manual_stop
             and not stopped_for_health
-            and (workers or "training_has_stopped_advancing" in health["warnings"])
+            and (
+                (workers and recipe_current)
+                or "training_has_stopped_advancing" in health["warnings"]
+            )
             and supervision.get("stop_on_failure", True)
         ):
             if worker_alive(args.pid):

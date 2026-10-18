@@ -47,6 +47,12 @@ class HabitatObjectNavEnv:
             self.sim.close()
         sim_cfg = habitat_sim.SimulatorConfiguration()
         sim_cfg.scene_id = scene
+        if self.config.get("object_label_source") == "semantic_instance":
+            asset = Path(scene).with_name(Path(scene).name.replace(".basis.glb", ".semantic.glb"))
+            if not asset.exists():
+                raise FileNotFoundError(f"Missing semantic instance asset: {asset}")
+            sim_cfg.scene_dataset_config_file = self.config["semantic_dataset_config"]
+            sim_cfg.load_semantic_mesh = True
         sim_cfg.gpu_device_id = self.config.get("gpu_device_id", 1)
         sim_cfg.enable_physics = False
         sim_cfg.allow_sliding = self.config.get("allow_sliding", False)
@@ -71,6 +77,15 @@ class HabitatObjectNavEnv:
             depth.hfov = sensor.hfov
             depth.near, depth.far = 0.05, 20.0
             agent.sensor_specifications.append(depth)
+        if self.config.get("object_label_source") == "semantic_instance":
+            semantic = habitat_sim.CameraSensorSpec()
+            semantic.uuid = "perception_semantic"
+            semantic.sensor_type = habitat_sim.SensorType.SEMANTIC
+            semantic.resolution = list(sensor.resolution)
+            semantic.position = list(sensor.position)
+            semantic.orientation = list(sensor.orientation)
+            semantic.hfov = sensor.hfov
+            agent.sensor_specifications.append(semantic)
         agent.action_space = {
             "move_forward": habitat_sim.agent.ActionSpec(
                 "move_forward",
@@ -94,6 +109,16 @@ class HabitatObjectNavEnv:
             ),
         }
         self.sim = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent]))
+        self.semantic_known_ids = (
+            {int(o.semantic_id) for o in self.sim.semantic_scene.objects if o is not None}
+            if self.config.get("object_label_source") == "semantic_instance"
+            else set()
+        )
+        if (
+            self.config.get("object_label_source") == "semantic_instance"
+            and not self.semantic_known_ids
+        ):
+            raise RuntimeError("Semantic mesh loaded without an instance registry")
         self.sim.seed(self.config.get("seed", 2025))
         if not self.sim.pathfinder.is_loaded:
             raise RuntimeError(f"Scene has no navigable mesh: {scene}")
@@ -285,6 +310,13 @@ class HabitatObjectNavEnv:
 
         action = self.oracle()
         return {"action": int(action), "perception": PerceptionLabeler(self).labels(action)}
+
+    def object_supervision(self):
+        # Evaluation labels are used by diagnostics and the explicitly named
+        # simulated-hint setting, never by no-hint policy inputs.
+        from perception_labels import PerceptionLabeler
+
+        return PerceptionLabeler(self).object_labels()
 
     def oracle(self):
         if self.ended:

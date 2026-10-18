@@ -3,6 +3,53 @@ import pytest
 from streamnav.training.health import grounding_learning_health, learning_health
 
 
+def test_opos_collapse_is_detected_and_old_recipe_results_do_not_stop_a_repair():
+    rows = [{"update": 1800, "loss": 1.0}]
+    cases = [
+        {
+            "update": update,
+            "split": split,
+            "success": 0.3,
+            "opos_visible_count": 100,
+            "opos_false_absence_rate": 0.99,
+        }
+        for update in (1600, 1700, 1800)
+        for split in ("seen", "synonyms", "unseen")
+    ]
+    health = learning_health(rows, cases)
+    assert health["stop_recommended"]
+    assert "opos_no_hint_visible_detection_collapse" in health["warnings"]
+    assert not learning_health(rows, cases, perception_start_update=1800)["stop_recommended"]
+    for case in cases:
+        case["opos_visible_count"] = 2
+    assert not learning_health(rows, cases)["stop_recommended"]
+
+
+def test_turning_collapse_cannot_be_hidden_by_a_few_easy_successes():
+    rows = [{"update": 1000, "schedule_update": 200, "loss": 1.0}]
+    evaluations = [
+        {
+            "update": u,
+            "split": s,
+            "success": 2 / 48 if s == "seen" else 0.0,
+            "episodes": 48,
+            "stationary_episode_rate": 0.9,
+            "greedy_action_histogram": [0.001, 0.001, 0.2, 0.798, 0.0, 0.0],
+        }
+        for u in (900, 1000)
+        for s in ("seen", "synonyms", "unseen")
+    ]
+    health = learning_health(rows, evaluations, min_updates=200)
+    assert "turning_without_progress_in_validation" in health["warnings"]
+    assert health["stop_recommended"]
+    rows[0]["schedule_update"] = 50
+    assert not learning_health(rows, evaluations, min_updates=200)["stop_recommended"]
+    for row in evaluations:
+        row["episodes"] = 6
+    rows[0]["schedule_update"] = 200
+    assert not learning_health(rows, evaluations, min_updates=200)["stop_recommended"]
+
+
 def test_grounding_monitor_tracks_points_and_never_invents_navigation_success():
     rows = [
         {

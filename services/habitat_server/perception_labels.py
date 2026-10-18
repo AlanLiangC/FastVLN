@@ -1,7 +1,8 @@
-"""Training-only geometric pointing labels; uncertain object visibility is masked.
+"""Training annotations for geometric affordances and visible object instances.
 
-No semantic sensor, learned detector, simulator step or observation transfer to the
-policy is used. Object points are weak 3D-anchor/depth labels, not instance masks.
+Instance mode uses aligned semantic rendering; the legacy depth projection remains
+available for old recipes. Only compact labels leave this service, never masks.
+Label queries do not step the simulator or invoke a learned detector.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import numpy as np
 from habitat_sim.utils.common import quat_rotate_vector
 
 from streamnav.contracts.action import NavigationAction as A
+from streamnav.contracts.object_labels import instance_object_label
 from streamnav.contracts.perception import (
     APOS_LEFT,
     APOS_RIGHT,
@@ -55,6 +57,24 @@ def path_point(points, distance):
 class PerceptionLabeler:
     def __init__(self, env):
         self.env = env
+
+    def object_labels(self):
+        env = self.env
+        if env.config.get("object_label_source") != "semantic_instance":
+            return {"opos": 0, "opos_valid": False, "opos_confidence": 0.0}
+        known = env.semantic_known_ids
+        try:
+            goal_ids = {int(str(g["object_id"]).rsplit("_", 1)[-1]) for g in env.episode["goals"]}
+        except (KeyError, ValueError):
+            goal_ids = set()
+        label = instance_object_label(
+            env._sensor_observations()["perception_semantic"],
+            goal_ids,
+            known,
+            min_pixels=env.config.get("opos_min_visible_pixels", 9),
+        )
+        label.update(episode_id=env.uid, frame_id=env.steps)
+        return label
 
     def labels(self, action):
         env = self.env
@@ -107,6 +127,9 @@ class PerceptionLabeler:
                     apos_confidence=1.0,
                 )
         if not env.config.get("perception_object_labels", True):
+            return result
+        if env.config.get("object_label_source") == "semantic_instance":
+            result.update(self.object_labels())
             return result
         candidates, definitely_out = [], []
         for goal in env.episode["goals"]:

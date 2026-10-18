@@ -1,8 +1,9 @@
 """Qwen3.5 point CoT with frame-local native mixers and persistent KDA memory."""
 
 import json
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
@@ -16,6 +17,9 @@ from torch.utils.checkpoint import checkpoint
 from streamnav.contracts.state import LayerState, StreamingState
 from streamnav.models.point_cot.adapters import KDAMemory, LoRALinear
 from streamnav.models.point_cot.delta import StreamingGatedDeltaNet
+from streamnav.models.point_cot.inference_graphs import InferenceGraphs
+from streamnav.models.point_cot.object_hint import ObjectHintToken
+from streamnav.models.point_cot.planning import FutureActionPlan
 from streamnav.models.policy.perception import decode_point_logits
 
 
@@ -25,6 +29,8 @@ class FrameFeatures:
     positions: torch.Tensor
     visual: torch.Tensor
     deepstack: tuple[torch.Tensor, ...]
+    hint_token: int = 0
+    has_hint_slot: bool = False
 
     def cpu(self):
         return FrameFeatures(
@@ -32,6 +38,8 @@ class FrameFeatures:
             self.positions.cpu(),
             self.visual.cpu(),
             tuple(x.cpu() for x in self.deepstack),
+            self.hint_token,
+            self.has_hint_slot,
         )
 
 
@@ -65,6 +73,7 @@ class TokenStep:
     action_logits: torch.Tensor
     value: torch.Tensor
     state: StreamingState
+    action_plan_logits: torch.Tensor | None = None
 
     @property
     def log_prob(self):
@@ -104,6 +113,9 @@ class Qwen35PointCoTPolicy(nn.Module):
         if layout.hidden_size != 1024 or len(text.layers) != 24:
             raise ValueError("This recipe requires the official Qwen3.5-0.8B multimodal base")
         self.processor = AutoProcessor.from_pretrained(self.base_path)
+        self.frame_prompts: OrderedDict[str, str] = OrderedDict()
+        self.frame_templates: OrderedDict[tuple, tuple] = OrderedDict()
+        self.frame_template_hits = self.frame_template_misses = 0
         # Bound visual token count even for unusually tall/wide source images.
         # Navigation's 448x256 view remains unchanged; there is no crop or pad.
         self.processor.image_processor.size["longest_edge"] = self.settings.get(
@@ -142,6 +154,16 @@ class Qwen35PointCoTPolicy(nn.Module):
         self.point_decoding = self.settings.get("point_decoding", "flat")
         if self.point_decoding not in ("flat", "hierarchical"):
             raise ValueError("Unsupported point decoding")
+        self.apos_decoding = self.settings.get("apos_decoding", self.point_decoding)
+        self.opos_decoding = self.settings.get("opos_decoding", self.point_decoding)
+        if any(
+            mode not in ("flat", "hierarchical")
+            for mode in (self.apos_decoding, self.opos_decoding)
+        ):
+            raise ValueError("Unsupported channel point decoding")
+        self.future_action_steps = self.settings.get("future_action_steps", 1)
+        if not 1 <= self.future_action_steps <= 8:
+            raise ValueError("Action horizon must be in [1, 8]")
         self.action_token_strings = tuple(
             f"<nav_{name}>" for name in ("stop", "forward", "left", "right", "up", "down")
         )
@@ -191,12 +213,24 @@ class Qwen35PointCoTPolicy(nn.Module):
         self.critic = nn.Linear(layout.hidden_size, 1, device=device, dtype=torch.float32)
         nn.init.zeros_(self.critic.weight)
         nn.init.zeros_(self.critic.bias)
+        self.future_plan = (
+            FutureActionPlan(layout.hidden_size, self.future_action_steps - 1, device=device)
+            if self.future_action_steps > 1
+            else None
+        )
+        self.object_hint = (
+            ObjectHintToken(rows(["no external object information"])[0])
+            if self.settings.get("object_hint_token", False)
+            else None
+        )
+        self.supports_object_hints = self.object_hint is not None
         self.loaded_checkpoint = self.base_path
         self.inference_compute_dtype = torch.bfloat16
         self.batch_chat_body = False
         self.perception = True
         self.perception_config = {"point_decoding": self.point_decoding}
         self._all_trainable = tuple(p for p in self.parameters() if p.requires_grad)
+        self.inference_graphs = InferenceGraphs()
 
     @property
     def backbone(self):
@@ -226,11 +260,16 @@ class Qwen35PointCoTPolicy(nn.Module):
         # Same chat prompt as navigation, without cropping. Vision is frozen;
         # one encoder call handles all independent images and variable grids.
         height, width = self.settings["image_size"]
+        cache_templates = self.settings.get("cache_frame_templates", False)
         prepared, prompts = [], []
         for image, instruction in zip(images, instructions, strict=True):
             image = image.copy()
             image.thumbnail((width, height), Image.Resampling.BILINEAR)
             prepared.append(image)
+            if cache_templates and instruction in self.frame_prompts:
+                prompts.append(self.frame_prompts[instruction])
+                self.frame_prompts.move_to_end(instruction)
+                continue
             messages = [
                 {
                     "role": "system",
@@ -254,6 +293,51 @@ class Qwen35PointCoTPolicy(nn.Module):
                     messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
                 )
             )
+            if cache_templates:
+                self.frame_prompts[instruction] = prompts[-1]
+                if len(self.frame_prompts) > 256:
+                    self.frame_prompts.popitem(last=False)
+        if cache_templates:
+            # RGB pixels are always encoded afresh. Only text IDs and spatial
+            # position indices depend on instruction/grid rather than pixels.
+            inputs = self.processor.image_processor(images=prepared, return_tensors="pt")
+            grids = inputs.image_grid_thw.tolist()
+            templates = []
+            for image, instruction, prompt, grid in zip(
+                prepared, instructions, prompts, grids, strict=True
+            ):
+                key = (instruction, tuple(grid))
+                if key not in self.frame_templates:
+                    encoded = self.processor(text=[prompt], images=[image], return_tensors="pt")
+                    positions, _ = self.native.model.get_rope_index(
+                        input_ids=encoded.input_ids,
+                        image_grid_thw=encoded.image_grid_thw,
+                        mm_token_type_ids=encoded.mm_token_type_ids,
+                        attention_mask=encoded.attention_mask,
+                    )
+                    self.frame_templates[key] = (
+                        encoded.input_ids.to(self.device),
+                        positions.to(self.device),
+                        int((encoded.input_ids == self.native.config.image_token_id).sum()),
+                    )
+                    self.frame_template_misses += 1
+                    if len(self.frame_templates) > 256:
+                        self.frame_templates.popitem(last=False)
+                else:
+                    self.frame_template_hits += 1
+                    self.frame_templates.move_to_end(key)
+                templates.append(self.frame_templates[key])
+            inputs = inputs.to(self.device)
+            visual = self.native.model.visual(
+                inputs.pixel_values.to(self.vision_compute_dtype),
+                grid_thw=inputs.image_grid_thw,
+                return_dict=True,
+            ).pooler_output
+            chunks = visual.split([template[2] for template in templates])
+            return [
+                FrameFeatures(ids, positions, chunk, ())
+                for (ids, positions, _), chunk in zip(templates, chunks, strict=True)
+            ]
         inputs = self.processor(
             text=prompts, images=prepared, padding=True, return_tensors="pt"
         ).to(self.device)
@@ -282,6 +366,51 @@ class Qwen35PointCoTPolicy(nn.Module):
                 )
             )
         return features
+
+    def condition_features(self, features, hint_tokens=None):
+        if self.object_hint is None:
+            if hint_tokens is not None and any(hint_tokens):
+                raise ValueError("This checkpoint has no object-hint input")
+            return features
+        if hint_tokens is not None and len(hint_tokens) != len(features):
+            raise ValueError("One hint token is required per frame")
+        conditioned = []
+        for i, feature in enumerate(features):
+            token = feature.hint_token if hint_tokens is None else int(hint_tokens[i])
+            if not 0 <= token <= 1296:
+                raise ValueError("Invalid object hint token")
+            if feature.has_hint_slot:
+                conditioned.append(replace(feature, hint_token=token))
+            else:
+                # A single soft token after the frame/text prefix. Its embedding
+                # is substituted at prefill/replay time so gradients stay live.
+                conditioned.append(
+                    FrameFeatures(
+                        torch.cat((feature.ids, feature.ids.new_zeros((1, 1))), -1),
+                        torch.cat(
+                            (
+                                feature.positions,
+                                feature.positions.new_full(
+                                    (3, 1, 1), int(feature.positions.max()) + 1
+                                ),
+                            ),
+                            -1,
+                        ),
+                        feature.visual,
+                        feature.deepstack,
+                        token,
+                        True,
+                    )
+                )
+        return conditioned
+
+    def embed_hints(self, x, features):
+        if self.object_hint is None:
+            return x
+        rows = torch.arange(len(features), device=x.device)
+        positions = torch.tensor([f.ids.shape[-1] - 1 for f in features], device=x.device)
+        tokens = torch.tensor([f.hint_token for f in features], device=x.device)
+        return x.index_put((rows, positions), self.object_hint(tokens, self.opos_rows).to(x.dtype))
 
     def start_episode(self, episode_id, instruction):
         return StreamingState(
@@ -332,9 +461,10 @@ class Qwen35PointCoTPolicy(nn.Module):
                     .view(b, length, -1)
                 )
             else:
-                y, next_local = StreamingGatedDeltaNet(layer.linear_attn)(
-                    norm, local, mode="chunk" if torch.is_grad_enabled() or length > 1 else "auto"
-                )
+                # Use the differentiable chunk equations during sampling too.
+                # Switching kernels for one-token decoding adds recurrent drift
+                # when PPO reconstructs the same decisions with gradients.
+                y, next_local = StreamingGatedDeltaNet(layer.linear_attn)(norm, local, mode="chunk")
             keys, values = next_local.conv, next_local.recurrent
         else:
             attention = layer.self_attn
@@ -374,9 +504,7 @@ class Qwen35PointCoTPolicy(nn.Module):
                 extra, recurrent = memory(
                     *inputs,
                     recurrent,
-                    mode="fused"
-                    if length == 1 and packing is None and not torch.is_grad_enabled()
-                    else "chunk",
+                    mode="chunk",
                     cu_seqlens=packing.cu_seqlens if packing else None,
                     cu_seqlens_cpu=packing.cu_seqlens_cpu if packing else None,
                 )
@@ -401,6 +529,14 @@ class Qwen35PointCoTPolicy(nn.Module):
             else nullcontext()
         )
         with context:
+            if (
+                self.settings.get("inference_cuda_graphs", False)
+                and self.language_compute_dtype == torch.float32
+                and not torch.is_grad_enabled()
+                and kwargs.get("key_mask") is not None
+            ):
+                tag = tuple(m.enabled for m in self.modules() if isinstance(m, LoRALinear))
+                return self.inference_graphs(self._forward_impl, args, kwargs, tag=tag)
             return self._forward_impl(*args, **kwargs)
 
     def _forward_impl(
@@ -467,10 +603,12 @@ class Qwen35PointCoTPolicy(nn.Module):
         )
 
     def begin(self, feature, state, *, native_only=False):
+        feature = self.condition_features([feature])[0]
         ids = feature.ids.to(self.device)
         x = self.native.model.language_model.embed_tokens(ids)
         mask = ids == self.native.config.image_token_id
         x = x.masked_scatter(mask.unsqueeze(-1), feature.visual.to(self.device, x.dtype))
+        x = self.embed_hints(x, [feature])
         empty = tuple(LayerState(None, None) for _ in state.kda_cache)
         return self._forward(
             x,
@@ -498,6 +636,7 @@ class Qwen35PointCoTPolicy(nn.Module):
 
     def begin_batch(self, features, states):
         """Prefill independent frames together without padding in either recurrence."""
+        features = self.condition_features(features)
         if not features or len(features) != len(states):
             raise ValueError("One state is required per independent frame")
         lengths = tuple(f.ids.shape[-1] for f in features)
@@ -520,6 +659,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             visual_mask.unsqueeze(-1),
             torch.cat([f.visual.to(self.device, x.dtype) for f in features]),
         )
+        x = self.embed_hints(x, features)
         memory = []
         for i in range(len(states[0].kda_cache)):
             values = [s.kda_cache[i].recurrent for s in states]
@@ -583,7 +723,11 @@ class Qwen35PointCoTPolicy(nn.Module):
 
         def choose(logits, channel):
             predicted = (
-                decode_point_logits(logits, hierarchical=self.point_decoding == "hierarchical")
+                decode_point_logits(
+                    logits,
+                    hierarchical=(self.apos_decoding if channel == 0 else self.opos_decoding)
+                    == "hierarchical",
+                )
                 if channel < 2
                 else logits.argmax(-1)
             )
@@ -607,6 +751,7 @@ class Qwen35PointCoTPolicy(nn.Module):
         action_logits = self.output_projection(context.hidden, self.action_rows, self.action_bias)
         actions = choose(action_logits, 2)
         context = self.append_batch(context, self.action_rows[actions])
+        plans = self.plan_logits(action_logits, context.hidden)
         return [
             TokenStep(
                 apos[i],
@@ -622,17 +767,19 @@ class Qwen35PointCoTPolicy(nn.Module):
                         for s in context.memory
                     )
                 ),
+                plans[i] if plans is not None else None,
             )
             for i in range(count)
         ]
 
-    def navigation_features(self, rgb, states):
+    def navigation_features(self, rgb, states, hint_tokens=None):
         from PIL import Image
 
-        return self.frame_features_batch(
+        features = self.frame_features_batch(
             [Image.fromarray(frame.cpu().numpy()) for frame in rgb],
             [s.instruction for s in states],
         )
+        return self.condition_features(features, hint_tokens)
 
     def point_logits(self, context, name):
         rows = getattr(self, name + "_rows")
@@ -648,6 +795,15 @@ class Qwen35PointCoTPolicy(nn.Module):
         with torch.autocast(self.device.type, enabled=False):
             return self.critic(hidden.float()).squeeze(-1)
 
+    def plan_logits(self, current_logits, action_hidden):
+        if self.future_plan is None:
+            return None
+        with torch.autocast(self.device.type, enabled=False):
+            future = self.output_projection(
+                self.future_plan(action_hidden), self.action_rows, self.action_bias
+            )
+        return torch.cat((current_logits.unsqueeze(-2), future), dim=-2)
+
     def replay_fragment(self, features, state, tokens, *, resets=None):
         """Teacher-force recorded tokens with frame-local attention and causal KDA.
 
@@ -655,6 +811,7 @@ class Qwen35PointCoTPolicy(nn.Module):
         tokens remain policy samples from the rollout. Episode boundaries reset
         KDA through cu_seqlens, while native attention never crosses a frame.
         """
+        features = self.condition_features(features)
         resets = resets or {}
         lengths = [f.ids.shape[-1] + 3 for f in features]
         width, count = max(lengths), len(features)
@@ -675,11 +832,14 @@ class Qwen35PointCoTPolicy(nn.Module):
                 int(feature.positions.max()) + 4,
                 device=self.device,
             )
-            hidden_indices.append([n - 1, n, n + 1])
+            hidden_indices.append(
+                [n - 1, n, n + 1, n + 2] if self.future_plan is not None else [n - 1, n, n + 1]
+            )
             valid_indices.extend(range(i * width, i * width + length))
             offsets.append(offsets[-1] + length)
         text = self.native.model.language_model
         x = text.embed_tokens(ids.clamp_max(text.embed_tokens.num_embeddings - 1))
+        x = self.embed_hints(x, features)
         rows = torch.arange(count, device=self.device)
         ns = torch.tensor([n - 3 for n in lengths], device=self.device)
         x = x.index_put((rows, ns), self.apos_rows[torch.stack([t[0] for t in tokens])].to(x.dtype))
@@ -756,6 +916,9 @@ class Qwen35PointCoTPolicy(nn.Module):
             action_logits,
             value,
             final,
+            self.plan_logits(action_logits, context.hidden[:, 3])
+            if self.future_plan is not None
+            else None,
         )
 
     def action_logits(self, context):
@@ -769,7 +932,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             tokens[0]
             if tokens is not None and tokens[0] is not None
             else (
-                decode_point_logits(apos_logits, hierarchical=self.point_decoding == "hierarchical")
+                decode_point_logits(apos_logits, hierarchical=self.apos_decoding == "hierarchical")
                 if deterministic
                 else Categorical(logits=apos_logits).sample()
             )
@@ -780,7 +943,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             tokens[1]
             if tokens is not None and tokens[1] is not None
             else (
-                decode_point_logits(opos_logits, hierarchical=self.point_decoding == "hierarchical")
+                decode_point_logits(opos_logits, hierarchical=self.opos_decoding == "hierarchical")
                 if deterministic
                 else Categorical(logits=opos_logits).sample()
             )
@@ -802,6 +965,9 @@ class Qwen35PointCoTPolicy(nn.Module):
             logits,
             value,
             state.with_cache(context.memory),
+            self.plan_logits(logits.unsqueeze(0), context.hidden).squeeze(0)
+            if self.future_plan is not None
+            else None,
         )
 
     @contextmanager
@@ -816,8 +982,10 @@ class Qwen35PointCoTPolicy(nn.Module):
             for m, enabled in zip(adapters, previous, strict=True):
                 m.enabled = enabled
 
-    def forward_batch(self, rgb, states, *, return_perception=False):
-        steps = self.step_batch(self.navigation_features(rgb, states), states, deterministic=True)
+    def forward_batch(self, rgb, states, *, return_perception=False, hint_tokens=None):
+        steps = self.step_batch(
+            self.navigation_features(rgb, states, hint_tokens), states, deterministic=True
+        )
         result = (
             torch.stack([s.action_logits for s in steps]),
             torch.stack([s.value for s in steps]),
@@ -832,6 +1000,14 @@ class Qwen35PointCoTPolicy(nn.Module):
                     "apos_tokens": torch.stack([s.apos for s in steps]),
                     "opos_tokens": torch.stack([s.opos for s in steps]),
                     "point_cot": True,
+                    "object_hint_tokens": hint_tokens
+                    if hint_tokens is not None
+                    else [0] * len(states),
+                    **(
+                        {"action_plan_logits": torch.stack([s.action_plan_logits for s in steps])}
+                        if self.future_plan is not None
+                        else {}
+                    ),
                 },
             )
         return result
@@ -860,6 +1036,10 @@ class Qwen35PointCoTPolicy(nn.Module):
             "language_compute_dtype": str(self.language_compute_dtype),
             "vision_compute_dtype": str(self.vision_compute_dtype),
             "point_decoding": self.point_decoding,
+            "apos_decoding": self.apos_decoding,
+            "opos_decoding": self.opos_decoding,
+            "future_action_steps": self.future_action_steps,
+            "object_hint_token": self.supports_object_hints,
             "action_token_strings": self.action_token_strings,
             "source_revision": json.loads(Path(self.base_path, "source_revision.json").read_text()),
         }

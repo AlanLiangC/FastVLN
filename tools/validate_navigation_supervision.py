@@ -16,7 +16,7 @@ from streamnav.utils.seed import seed_everything
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--inputs", default="runtime/reports/navigation_speed_inputs.pt")
+    parser.add_argument("--inputs", default="runtime/fixtures/navigation/rgb_inputs.pt")
     parser.add_argument(
         "--output", default="runtime/reports/navigation_supervision_validation.json"
     )
@@ -24,7 +24,7 @@ def main():
     config = yaml.safe_load(Path("configs/pointcot.yaml").read_text())
     seed_everything(config["seed"])
     policy = Qwen35PointCoTPolicy(config).train()
-    load_adapters(policy, args.checkpoint)
+    load_adapters(policy, args.checkpoint, allow_new_plan=True)
     rows = torch.load(args.inputs, weights_only=False)
     initial = policy.start_episode(rows[0]["episode_id"], rows[0]["instruction"])
     state, records, resets = initial, [], {}

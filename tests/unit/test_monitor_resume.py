@@ -8,8 +8,9 @@ from tools import monitor_training
 
 
 @pytest.mark.parametrize("workers_registered", [False, True])
+@pytest.mark.parametrize("recipe_current", [False, True])
 def test_resume_does_not_signal_launcher_using_previous_worker_snapshot(
-    tmp_path, monkeypatch, workers_registered
+    tmp_path, monkeypatch, workers_registered, recipe_current
 ):
     # Old metrics already satisfy the old stopping rule when resume starts.
     (tmp_path / "resolved_config.yaml").write_text(
@@ -22,6 +23,15 @@ def test_resume_does_not_signal_launcher_using_previous_worker_snapshot(
     (tmp_path / "training_workers.json").write_text(
         json.dumps([{"pid": 11, "launcher_pid": 10 if workers_registered else 9}])
     )
+    if recipe_current:
+        (tmp_path / "resolved_config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "trainer": {"supervision": {"min_updates": 50, "zero_sr_patience": 1}},
+                    "source_snapshot": {"sha256": "current"},
+                }
+            )
+        )
     monkeypatch.setattr("sys.argv", ["monitor", "--pid", "10", "--run-dir", str(tmp_path)])
     monkeypatch.setattr(monitor_training, "worker_alive", lambda pid: True)
     monkeypatch.setattr(
@@ -42,8 +52,10 @@ def test_resume_does_not_signal_launcher_using_previous_worker_snapshot(
     with pytest.raises(StopIteration):
         monitor_training.main()
     snapshot = json.loads((tmp_path / "health_status.json").read_text())
-    assert signals == ([11] if workers_registered else [])
-    assert snapshot["status"] == ("stopping_for_review" if workers_registered else "starting")
+    assert signals == ([11] if workers_registered and recipe_current else [])
+    assert snapshot["status"] == (
+        "stopping_for_review" if workers_registered and recipe_current else "starting"
+    )
 
 
 def test_evaluation_heartbeat_from_other_active_rank_is_not_ignored(tmp_path):

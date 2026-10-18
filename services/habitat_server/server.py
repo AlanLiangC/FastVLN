@@ -36,6 +36,8 @@ def main():
                     info = {"action": int(env.oracle())}
                 elif command == "GET_ORACLE_SUPERVISION":
                     info = env.oracle_supervision()
+                elif command == "GET_OBJECT_SUPERVISION":
+                    info = env.object_supervision()
                 elif command == "CLOSE":
                     info = {"closed": True}
                 else:

@@ -4,3 +4,6 @@
 [submodule "third_party/LightNav-0"]
         path = third_party/LightNav-0
         url = https://github.com/lightorigins/LightNav-0.git
+[submodule "third_party/Uni-NaVid"]
+        path = third_party/Uni-NaVid
+        url = https://github.com/jzhzhang/Uni-NaVid.git

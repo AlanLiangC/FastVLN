@@ -51,7 +51,7 @@ def render_checkpoint(policy, source, root, result, count):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", default="runs/pointcot_grounding")
+    parser.add_argument("--run-dir", default="runs/pointcot_grounding_refined")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()

@@ -1,15 +1,30 @@
 """Prediction-only pointing diagnostics shared by case videos and audits."""
 
+from typing import Any
+
 from streamnav.contracts.perception import POINT_CELLS
 from streamnav.models.policy.perception import decode_point_logits, point_type_logits
 
 
 def perception_records(predictions, *, hierarchical=False):
+    records: list[dict[str, Any]]
     if predictions.get("point_cot", False):
         records = [{"point_cot": True} for _ in predictions["apos"]]
     else:
         arrival = predictions["arrival"].softmax(-1).tolist()
         records = [{"arrival_probabilities": probabilities} for probabilities in arrival]
+    if "object_hint_tokens" in predictions:
+        for record, token in zip(records, predictions["object_hint_tokens"], strict=True):
+            record["object_hint_token"] = int(token)
+    if "action_plan_logits" in predictions:
+        plans = predictions["action_plan_logits"]
+        for record, tokens, probabilities in zip(
+            records, plans.argmax(-1).tolist(), plans.softmax(-1).tolist(), strict=True
+        ):
+            end = tokens.index(0) + 1 if 0 in tokens else len(tokens)
+            tokens, probabilities = tokens[:end], probabilities[:end]
+            record["action_plan"] = tokens
+            record["action_plan_probabilities"] = probabilities
     for name in ("apos", "opos"):
         logits = predictions[name]
         tokens = decode_point_logits(logits, hierarchical=hierarchical).tolist()

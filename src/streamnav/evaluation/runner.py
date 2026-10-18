@@ -1,6 +1,7 @@
 import json
 import textwrap
 import time
+from copy import deepcopy
 from itertools import islice
 from pathlib import Path
 from typing import Any, cast
@@ -27,6 +28,7 @@ from streamnav.evaluation.video_cases import (
 )
 from streamnav.training import distributed as parallel
 from streamnav.training.checkpoint import load_policy
+from streamnav.training.object_hints import evaluation_object_hint_packet
 from streamnav.utils.logging import append_json
 from streamnav.utils.progress import write_worker_progress
 from streamnav.utils.seed import seed_everything
@@ -37,7 +39,7 @@ def video_frame(
 ):
     image = Image.fromarray(rgb.cpu().numpy())
     width, height = image.size
-    canvas = Image.new("RGB", (width, ((height + 128 + 15) // 16) * 16), "#121827")
+    canvas = Image.new("RGB", (width, ((height + 152 + 15) // 16) * 16), "#121827")
     canvas.paste(image, (0, 0))
     if perception is not None:
         draw_pointing_overlay(canvas, perception, (width, height))
@@ -75,7 +77,25 @@ def video_frame(
                 f" | P(ready)={perception['arrival_probabilities'][2]:.3f}"
                 if "arrival_probabilities" in perception
                 else " | point CoT"
+            )
+            + (
+                " | GT-O="
+                + (
+                    "unknown"
+                    if not perception.get("opos_ground_truth_valid")
+                    else "point"
+                    if perception.get("opos_ground_truth_token")
+                    else "NONE"
+                )
+                if "opos_ground_truth_valid" in perception
+                else ""
             ),
+            fill="white",
+        )
+    if perception is not None and "object_hint_source" in perception:
+        draw.text(
+            (10, height + 137),
+            f"HINT source: {perception['object_hint_source']} | GT-O: diagnostics only",
             fill="white",
         )
     if perception is not None and "apos_point_probability" in perception:
@@ -93,7 +113,9 @@ def video_frame(
         )
         draw.text(
             (10, height + 117),
-            "Markers: decoded point tokens; action conditioned on APOS -> OPOS"
+            "Plan: " + " > ".join(NavigationAction(a).name for a in perception["action_plan"])
+            if "action_plan" in perception
+            else "Markers: decoded point tokens; action conditioned on APOS -> OPOS"
             if perception.get("point_cot", False)
             else "Markers: MAP locations; "
             + (
@@ -110,9 +132,44 @@ def video_frame(
 
 @torch.no_grad()
 def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=False):
+    settings = config["eval"].get("settings")
+    if not settings:
+        return _evaluate_setting(policy, config, update, episodes, max_steps, video)
+    if "no_hint" not in settings or len(set(settings)) != len(settings):
+        raise ValueError("Evaluation settings must include one no_hint primary setting")
+    results = {}
+    for setting in settings:
+        if setting not in ("no_hint", "simulated_hint"):
+            raise ValueError("Unknown evaluation hint setting")
+        selected = deepcopy(config)
+        selected["eval"]["selection_episodes"] = selected["eval"]["episodes"]
+        full_interval = selected["eval"].get("full_eval_interval", 500)
+        if update and update % full_interval == 0 and episodes is None:
+            selected["eval"]["episodes"] = selected["eval"].get("full_episodes", 48)
+        results[setting] = _evaluate_setting(
+            policy, selected, update, episodes, max_steps, video, setting
+        )
+    output = Path(config["run_dir"]) / "evaluation" / f"update_{update:07d}"
+    if parallel.rank() == 0:
+        (output / "settings_summary.json").write_text(json.dumps(results, indent=2))
+        (output / "index.html").write_text(
+            '<meta charset="utf-8"><h1>Evaluation settings</h1>'
+            + "".join(f'<p><a href="{s}/index.html">{s}</a></p>' for s in settings)
+        )
+    return results["no_hint"]
+
+
+@torch.no_grad()
+def _evaluate_setting(
+    policy, config, update=0, episodes=None, max_steps=None, video=False, setting=None
+):
+    if setting == "simulated_hint" and not getattr(policy, "supports_object_hints", False):
+        raise ValueError("Simulated-hint evaluation requires a hint-enabled checkpoint")
     was_training = policy.training
     policy.eval()
     output = Path(config["run_dir"]) / "evaluation" / f"update_{update:07d}"
+    if setting:
+        output = output / setting
     output.mkdir(parents=True, exist_ok=True)
     worker_output = output / f"rank_{parallel.rank():03d}" if parallel.world_size() > 1 else output
     worker_output.mkdir(parents=True, exist_ok=True)
@@ -120,7 +177,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
         **config["habitat"],
         "max_episode_steps": max_steps or config["eval"]["max_steps"],
         # Evaluation predictions never require a privileged training sensor.
-        "perception_labels": False,
+        "perception_labels": config["habitat"].get("object_label_source") == "semantic_instance",
     }
     limit = episodes if episodes is not None else config["eval"]["episodes"]
     count = config["eval"].get("num_envs", 1)
@@ -136,6 +193,9 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
     results = {}
     cases_by_split = {}
     dtype = getattr(torch, config["model"]["dtype"])
+    hint_noise = config["eval"].get(
+        "hint_noise", config.get("trainer", {}).get("object_hints", {}).get("noise", {})
+    )
     video_limit = config["eval"].get("video_episodes", 1)
     video_selection = config["eval"].get("video_selection", "first")
     if video_limit < 0 or video_selection not in ("first", "representative"):
@@ -159,6 +219,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
     envs = VectorHabitatEnvs(env_config, count)
     try:
         for manifest in config["eval"]["manifests"]:
+            split_started = time.monotonic()
             source = HabitatEpisodeSource(manifest, seed=config["seed"])
             split = source.manifest["dataset_id"] + "_" + source.manifest["split"]
             metrics, times, batch_times, video_records = [], [], [], []
@@ -210,6 +271,15 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                         "max_forward_collision_streak": 0,
                         "after_collision_steps": 0,
                         "after_collision_forward_steps": 0,
+                        "opos_label_count": 0,
+                        "opos_visible_count": 0,
+                        "opos_absent_count": 0,
+                        "opos_false_presence_count": 0,
+                        "opos_false_absence_count": 0,
+                        "opos_location_hits": 0,
+                        "object_hint_count": 0,
+                        "object_hint_random_count": 0,
+                        "object_hint_off_target_count": 0,
                     }
                     for _ in batch
                 ]
@@ -226,6 +296,28 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                             else None
                         )
                     while active:
+                        labels = (
+                            list(
+                                envs.executor.map(
+                                    lambda i: envs.clients[i].get_object_supervision(), active
+                                )
+                            )
+                            if env_config.get("object_label_source") == "semantic_instance"
+                            else [None] * len(active)
+                        )
+                        hint_packets = [
+                            evaluation_object_hint_packet(
+                                label,
+                                batch[i][1].uid,
+                                observations[i]["frame_id"],
+                                config["seed"],
+                                hint_noise,
+                            )
+                            if setting == "simulated_hint"
+                            else {"token": 0, "source": "no_hint"}
+                            for i, label in zip(active, labels, strict=True)
+                        ]
+                        hint_tokens = [packet["token"] for packet in hint_packets]
                         torch.cuda.synchronize(device)
                         start = time.perf_counter()
                         with torch.autocast(
@@ -236,6 +328,11 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                                 torch.stack([observations[i]["rgb"] for i in active]),
                                 [states[i] for i in active],
                                 **({"return_perception": True} if pointing else {}),
+                                **(
+                                    {"hint_tokens": hint_tokens}
+                                    if getattr(policy, "supports_object_hints", False)
+                                    else {}
+                                ),
                             )
                             logits, _, next_states = output_batch[:3]
                             actions = [NavigationAction(a) for a in logits.argmax(-1).tolist()]
@@ -250,6 +347,49 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                                 == "hierarchical",
                             )
                         perception_by_slot = dict(zip(active, perception_records, strict=True))
+                        for i, label, perception, packet in zip(
+                            active, labels, perception_records, hint_packets, strict=True
+                        ):
+                            if perception is None:
+                                continue
+                            label = label or {}
+                            valid = bool(label and label.get("opos_valid"))
+                            on_target = (
+                                packet["token"] in label.get("opos_targets", [label["opos"]])
+                                if valid and packet["token"]
+                                else None
+                            )
+                            perception.update(
+                                object_hint_source=packet["source"],
+                                object_hint_on_target=on_target,
+                                opos_ground_truth_valid=valid,
+                                opos_ground_truth_token=label["opos"] if valid else None,
+                            )
+                            diagnostic = stop_diagnostics[i]
+                            diagnostic["object_hint_count"] += int(bool(packet["token"]))
+                            diagnostic["object_hint_random_count"] += int(
+                                packet["source"] == "false_positive"
+                            )
+                            diagnostic["object_hint_off_target_count"] += int(on_target is False)
+                        for i, label, perception in zip(
+                            active, labels, perception_records, strict=True
+                        ):
+                            if not label or not label.get("opos_valid") or perception is None:
+                                continue
+                            visible, prediction = label["opos"] > 0, perception["opos"]
+                            diagnostic = stop_diagnostics[i]
+                            diagnostic["opos_label_count"] += 1
+                            diagnostic["opos_visible_count"] += int(visible)
+                            diagnostic["opos_absent_count"] += int(not visible)
+                            diagnostic["opos_false_presence_count"] += int(
+                                not visible and prediction > 0
+                            )
+                            diagnostic["opos_false_absence_count"] += int(
+                                visible and prediction == 0
+                            )
+                            diagnostic["opos_location_hits"] += int(
+                                visible and prediction in label.get("opos_targets", [label["opos"]])
+                            )
                         for action in actions:
                             action_counts[int(action)] += 1
                         torch.cuda.synchronize(device)
@@ -440,6 +580,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                     "cache_bytes": cache_bytes,
                     "peak_vram": torch.cuda.max_memory_allocated(device),
                     "video_records": video_records,
+                    "wall_seconds": time.monotonic() - split_started,
                 }
             )
             metrics = [m for p in payloads for m in p["metrics"]]
@@ -468,12 +609,18 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                     append_json(output / f"{split}_episodes.jsonl", record)
             result = {
                 "update": update,
+                "setting": setting or "no_hint",
+                "hint_source": "simulated_instance_labels"
+                if setting == "simulated_hint"
+                else "none",
+                "hint_noise": hint_noise if setting == "simulated_hint" else None,
                 "split": split,
                 "episodes": len(metrics),
                 **aggregate_metrics(metrics),
                 **latency_summary(times),
                 "evaluation_batch_size": count * parallel.world_size(),
                 "world_size": parallel.world_size(),
+                "evaluation_wall_seconds": max(p["wall_seconds"] for p in payloads),
                 "success_distance": env_config.get("success_distance", 0.1),
                 "inference_mode": config["model"].get("inference_mode", "auto"),
                 "compute_dtype": config["model"]["dtype"],
@@ -481,6 +628,9 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                     getattr(policy, "language_compute_dtype", "unknown")
                 ).removeprefix("torch."),
                 "point_decoding": getattr(policy, "point_decoding", "legacy"),
+                "apos_decoding": getattr(policy, "apos_decoding", "legacy"),
+                "opos_decoding": getattr(policy, "opos_decoding", "legacy"),
+                "future_action_steps": getattr(policy, "future_action_steps", 1),
                 "parameter_dtype": str(next(policy.parameters()).dtype).removeprefix("torch."),
                 "batch_chat_body": getattr(policy, "batch_chat_body", False),
                 "loaded_checkpoint": str(getattr(policy, "loaded_checkpoint", "unknown")),
@@ -498,9 +648,46 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
                 "saved_video_cases": len(selected_videos),
                 "video_selection": video_selection if video else "disabled",
             }
+            label_count = sum(m.get("opos_label_count", 0) for m in metrics)
+            visible_count = sum(m.get("opos_visible_count", 0) for m in metrics)
+            absent_count = sum(m.get("opos_absent_count", 0) for m in metrics)
+            result.update(
+                opos_label_count=label_count,
+                opos_visible_count=visible_count,
+                opos_absent_count=absent_count,
+                opos_false_presence_rate=sum(m.get("opos_false_presence_count", 0) for m in metrics)
+                / absent_count
+                if absent_count
+                else None,
+                opos_false_absence_rate=sum(m.get("opos_false_absence_count", 0) for m in metrics)
+                / visible_count
+                if visible_count
+                else None,
+                opos_visible_location_accuracy=sum(m.get("opos_location_hits", 0) for m in metrics)
+                / visible_count
+                if visible_count
+                else None,
+            )
+            for key in (
+                "object_hint_count",
+                "object_hint_random_count",
+                "object_hint_off_target_count",
+            ):
+                result[key] = sum(m.get(key, 0) for m in metrics)
+            anchor_limit = config["eval"].get("selection_episodes", limit or len(metrics))
+            anchors = [m for m in metrics if m["episode_index"] < anchor_limit]
+            result.update(
+                selection_episodes=len(anchors),
+                selection_success=sum(m["success"] for m in anchors) / len(anchors),
+            )
             results[split] = result
             if parallel.rank() == 0:
-                append_json(Path(config["run_dir"]) / "eval_metrics.jsonl", result)
+                name = (
+                    "eval_hint_metrics.jsonl"
+                    if setting == "simulated_hint"
+                    else "eval_metrics.jsonl"
+                )
+                append_json(Path(config["run_dir"]) / name, result)
                 print(json.dumps({"evaluation": result}), flush=True)
         if parallel.rank() == 0:
             (output / "summary.json").write_text(json.dumps(results, indent=2))

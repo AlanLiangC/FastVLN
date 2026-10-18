@@ -5,7 +5,9 @@ import statistics
 from typing import Any
 
 
-def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patience=5):
+def learning_health(
+    rows, evaluations, expected_splits=3, min_updates=500, patience=5, perception_start_update=0
+):
     result: dict[str, Any] = {
         "status": "starting",
         "update": 0,
@@ -16,6 +18,7 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         return result
     recent = rows[-50:]
     update = rows[-1]["update"]
+    age = rows[-1].get("schedule_update", update)
     result.update(status="training", update=update)
     if any(not math.isfinite(r.get("total_loss", r.get("loss", 0))) for r in recent):
         result["warnings"].append("nonfinite_loss")
@@ -25,9 +28,16 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         "affordance_loss",
         "apos_loss",
         "apos_type_loss",
+        "apos_forward_intent_loss",
+        "future_action_loss",
+        "ppo_approx_kl",
         "apos_teacher_prefix_loss",
         "apos_parameter_gradient_norm",
+        "opos_parameter_gradient_norm",
+        "opos_no_hint_positive_gradient_norm",
         "opos_loss",
+        "opos_visibility_loss",
+        "opos_location_loss",
         "opos_anchor_loss",
         "opos_support_loss",
         "ppo_loss",
@@ -140,7 +150,7 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         if max(means) >= 0.95:
             result["warnings"].append("deterministic_action_collapse")
             gains = [r.get("il_gain_over_prior", 0) for r in recent]
-            if update >= min_updates and len(greedy) >= 50 and statistics.mean(gains) < 0.05:
+            if age >= min_updates and len(greedy) >= 50 and statistics.mean(gains) < 0.05:
                 result["stop_recommended"] = True
     groups: dict[int, dict[str, Any]] = {}
     for row in evaluations:
@@ -148,7 +158,10 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
     complete = [groups[u] for u in sorted(groups) if len(groups[u]) == expected_splits]
     result["complete_evaluations"] = len(complete)
     if complete:
-        macro_scores = [statistics.mean(r["success"] for r in group.values()) for group in complete]
+        macro_scores = [
+            statistics.mean(r.get("selection_success", r["success"]) for r in group.values())
+            for group in complete
+        ]
         best_index = max(range(len(complete)), key=lambda i: macro_scores[i])
         best_update = next(iter(complete[best_index].values()))["update"]
         latest_update = next(iter(complete[-1].values()))["update"]
@@ -166,6 +179,31 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         result["macro_autonomous_sr"] = statistics.mean(result["last_autonomous_sr"].values())
         result["last_evaluation_update"] = next(iter(complete[-1].values()))["update"]
         latest = list(complete[-1].values())
+        perception_evaluations = [
+            list(group.values())
+            for group in complete
+            if next(iter(group.values()))["update"] > perception_start_update
+            and all(
+                "opos_visible_count" in r and r.get("opos_false_absence_rate") is not None
+                for r in group.values()
+            )
+        ]
+
+        def missed_objects(values):
+            count = sum(r["opos_visible_count"] for r in values)
+            missed = sum(r["opos_visible_count"] * r["opos_false_absence_rate"] for r in values)
+            return count, missed / max(count, 1)
+
+        if perception_evaluations:
+            visible, miss_rate = missed_objects(perception_evaluations[-1])
+            result["opos_no_hint_visible_recall"] = 1 - miss_rate if visible else None
+            if visible >= 100 and miss_rate >= 0.95:
+                result["warnings"].append("opos_no_hint_visible_detection_collapse")
+                if len(perception_evaluations) >= 3 and all(
+                    n >= 100 and rate >= 0.95
+                    for n, rate in map(missed_objects, perception_evaluations[-3:])
+                ):
+                    result["stop_recommended"] = True
         if all("collision_rate" in r for r in latest):
             collisions = statistics.mean(r["collision_rate"] for r in latest)
             result["macro_validation_collision_rate"] = collisions
@@ -173,6 +211,22 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
                 result["warnings"].append("high_validation_collision_rate")
         if all("oracle_success" in r for r in latest):
             result["macro_oracle_success"] = statistics.mean(r["oracle_success"] for r in latest)
+
+        def collapsed(group):
+            values = list(group.values())
+            return (
+                sum(r.get("episodes", 0) for r in values) >= 100
+                and all("greedy_action_histogram" in r for r in values)
+                and statistics.mean(sum(r["greedy_action_histogram"][2:4]) for r in values) >= 0.98
+                and statistics.mean(r["greedy_action_histogram"][1] for r in values) <= 0.005
+                and statistics.mean(r["success"] for r in values) < 0.05
+                and statistics.mean(r.get("stationary_episode_rate", 1.0) for r in values) >= 0.8
+            )
+
+        if collapsed(complete[-1]):
+            result["warnings"].append("turning_without_progress_in_validation")
+            if age >= min_updates and len(complete) >= 2 and collapsed(complete[-2]):
+                result["stop_recommended"] = True
         for field, warning, threshold in (
             ("false_stop_rate", "frequent_false_stops_in_validation", 0.5),
             ("alternating_turn_episode_rate", "alternating_turns_in_validation", 0.5),
@@ -188,7 +242,7 @@ def learning_health(rows, evaluations, expected_splits=3, min_updates=500, patie
         elif result["zero_success_splits"]:
             result["warnings"].append("zero_success_on_some_splits")
         if (
-            update >= min_updates
+            age >= min_updates
             and latest_update >= min_updates
             and len(complete) >= patience
             and all(r["success"] == 0 for group in complete[-patience:] for r in group.values())

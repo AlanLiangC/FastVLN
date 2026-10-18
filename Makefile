@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
-VIEWER_RUN_DIR ?= $(if $(wildcard runs/qwen35_pointcot_active/evaluation),runs/qwen35_pointcot_active,runs/pointcot_grounding_refined)
+VIEWER_RUN_DIR ?= $(if $(wildcard runs/qwen35_pointcot_opos_hint/evaluation),runs/qwen35_pointcot_opos_hint,runs/pointcot_grounding_refined)
 .PHONY: check unit gpu integration smoke grounding train pipeline viewer
 check:
 	source scripts/env.sh

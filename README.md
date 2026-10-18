@@ -1,48 +1,59 @@
 # FastVLN
 
-当前实现：**Qwen3.5-0.8B + 跨帧 KDA + APOS → OPOS → 六动作 point CoT**。策略输入为目标文本、当前 RGB 和 episode 独立缓存。基座冻结，约 0.98% 参数训练；先学习 grounding，再单独启动 HM3D-OVON 的 DAgger/PPO。
+当前节点：**`qwen35_pointcot_20261017`**。模型为 **Qwen3.5-0.8B + 跨帧 KDA + APOS → OPOS → 当前动作 + 四步动作计划**，使用 grounding 和专家 / DAgger / PPO 混合训练。基座冻结，可训练参数约 897.8 万，占总参数 1.04%。
 
-主配置：[configs/pointcot.yaml](configs/pointcot.yaml)。当前 grounding 数据为 **1,025,912 条训练查询**：COCO 实例、RefCOCO/+/g 指代表达、ScanNet 室内实例、ImageNet 弱区域和已有自然图像 PixMo。约 49.9 万条训练查询包含真实实例的有效点区域，明确缺失采样率 2.5%；详情见 [数据文档](docs/datasets.md)。
+每步输入目标文本、当前 RGB、一个可选目标点 token 和该 episode 的缓存；输出两个点、六动作 logits、四步计划、value 和下一状态。模型不输入历史 RGB、深度、语义图、地图或真值位姿，也没有分割分支。跨帧缓存为固定 12 MiB。
 
-## 准备与启动
+## 当前入口
+
+| 内容 | 路径 |
+|---|---|
+| 配置 | [configs/pointcot.yaml](configs/pointcot.yaml) |
+| 活动导航训练 | `runs/qwen35_pointcot_opos_hint` |
+| 已完成 grounding | `runs/pointcot_grounding_refined`，best 为 update 800 |
+| 固定节点 | [checkpoints/versions/qwen35_pointcot_20261017/manifest.json](checkpoints/versions/qwen35_pointcot_20261017/manifest.json) |
+| 固定训练权重 | `checkpoints/versions/qwen35_pointcot_20261017/navigation`，update 5155 |
+| 节点选中的 best | `checkpoints/versions/qwen35_pointcot_20261017/best`，update 4400 |
+| 验证样本 | `runtime/fixtures/navigation/`，与实验输出分开保存 |
+
+固定节点包含完整训练权重、Adam、八路 RNG / 采样状态、配置、源码及校验清单。活动训练继续更新 `checkpoints/latest`，节点不参与滚动清理。节点源代码入口为 [source.zip](checkpoints/versions/qwen35_pointcot_20261017/source.zip)；原训练使用的源码快照另存于节点目录。冻结基座、数据和运行环境继续使用本项目已有路径。
+
+## 恢复训练与查看结果
 
 ```bash
 source scripts/env.sh
-python tools/download_qwen_weights.py
-python tools/download_referring_annotations.py
-python tools/prepare_public_grounding.py --workers 24
-python tools/prepare_grounding_support.py --workers 12
-make unit
-make check
-# 六卡 grounding，GPU 6、7 留给其他任务
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 STREAMNAV_WORLD_SIZE=6 bash scripts/start_grounding_training.sh --initialize-from runs/pointcot_grounding/checkpoints/update_0004400
+# 当前八卡训练的恢复入口；运行中的任务无需重复启动
+bash scripts/start_eight_gpu_training.sh \
+  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest --skip-initial-eval
+python tools/training_status.py --root runs/qwen35_pointcot_opos_hint
+# 保存一个完整 update 后暂停
+bash scripts/stop_training.sh runs/qwen35_pointcot_opos_hint
+# 静态视频查看，不占用推理 GPU
+make viewer
+# http://127.0.0.1:8765/evaluation/
 ```
 
-公共图像直接从 `/inspire/hdd/global_public/public_datas` 读取。ScanNet 仅导出筛选后的 RGB；实例掩码只用于离线生成点及有效网格区域。学生不接收语义、深度、地图或真值位姿，也没有分割预测分支。
+导航默认 GPU 0–7，每卡 3 个环境，rollout=100、反向 fragment=20，每 update 共 2400 条转移和两次同步 optimizer step。每 5 update 保存，每 100 update 双设置评估；日常每 split 12 条，每 500 update 扩至 48 条。每次评估保存 12 个视频。换卡数时显式使用 `--allow-world-size-change`，详见训练文档。
 
-当前运行目录为 `runs/pointcot_grounding_refined`。每卡 batch 32，全局 batch 192；当前配置是从保留的 4400 权重进行 2000 次小学习率改进更新，重新初始化优化器和采样器，update 从 0 计数。原训练的最佳和暂停权重保留在 `runs/pointcot_grounding`。从基座开始训练时需另设完整训练预算和学习率，不能把这 2000 次改进更新当作完整预训练。使用批量视觉编码、并行图像读取、FP32/TF32 计算和 fused AdamW。先保存、评估并保留 update 0 的定位基线，然后每 200 update 验证同一组 1,536 条查询并保存 32 个案例及全部验证预测。
+## 结果口径
 
-```bash
-make viewer VIEWER_RUN_DIR=runs/pointcot_grounding_refined
-# http://127.0.0.1:8765/grounding_visualizations/
-bash scripts/stop_training.sh runs/pointcot_grounding_refined
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 STREAMNAV_WORLD_SIZE=6 bash scripts/start_grounding_training.sh --resume runs/pointcot_grounding_refined/checkpoints/latest
-```
+以 0.25 m 内执行 STOP 为成功。最近较大评估 update 5000 共 144 条：无提示 SR **33.3%**、SPL **18.4%**；模拟干净实例点提示 SR **34.0%**、SPL **19.7%**。update 5100 的 36 条日常评估为 **27.8% / 30.6%**；5000 在同一组无提示 anchor 上也是 27.8%。这些成绩属于对应评估权重，固定节点 5155 尚无独立评估。
 
-可视化包含原图、预测、真值、有效实例轮廓、总览和逐例 JSON。洋红菱形为预测 OPOS，青绿圆圈为标注点，绿色轮廓为真实实例有效区域，橙框为弱区域。实例内部命中、标注点距离命中、误判缺失率和验证 loss 分开报告；弱框不计入可见目标主指标。日志和分来源评估分别为 `training.log`、`train_metrics.jsonl`、`grounding_eval.jsonl`。
+当前瓶颈是错误 STOP 和目标接近控制；5000 无提示中 72/144 条错误停止。best=4400 按固定 36 条 anchor 选择，不能与 144 条评估直接混比。详情见 `runtime/reports/success_rate_5100_analysis.json`。推理计时口径见 [部署文档](docs/deployment.md)。
 
-导航需要经过定位验证的 grounding 权重，单独启动：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 STREAMNAV_WORLD_SIZE=6 bash scripts/start_pointcot_training.sh --initialize-from runs/pointcot_grounding_refined/checkpoints/best
-```
-
-## 文档
+## 文档与检查
 
 - [架构与缓存](docs/architecture.md)
-- [point CoT 与监督](docs/perception.md)
-- [训练、暂停、评估](docs/training.md)
-- [数据与下载](docs/datasets.md)
-- [推理与视频](docs/deployment.md)
+- [Point CoT、提示与 loss](docs/perception.md)
+- [训练、保存、恢复和评估](docs/training.md)
+- [数据、资产准备与防泄漏](docs/datasets.md)
+- [推理接口、延迟与视频](docs/deployment.md)
 
-基座来自 [官方 Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)。point CoT 参考 [LightNav-0](https://github.com/lightorigins/LightNav-0)，动作模仿与 PPO 参考本地 [OVSegDT](third_party/OVSegDT)。
+```bash
+make check
+make unit
+```
+
+环境安装入口为 `scripts/setup.sh`，基座下载入口为 `tools/download_qwen_weights.py`。公开数据从 `/inspire/hdd/global_public/public_datas` 读取，当前 grounding 共 1,025,912 条训练查询；数据、安装环境、navmesh 和 Triton 缓存均保留。凭据位于 `.config/`，不进入版本快照。
+
+参考实现保留在 `third_party/LightNav-0`、`third_party/OVSegDT` 和 `third_party/Uni-NaVid`。Qwen 基座固定为官方 revision，见数据文档。
