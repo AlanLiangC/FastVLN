@@ -93,7 +93,7 @@ def test_planning_branch_has_distinct_horizon_gradients():
     assert hidden.grad.norm() > 0
 
 
-@pytest.mark.parametrize("new_group", ["planning", "hint"])
+@pytest.mark.parametrize("new_group", ["planning", "hint", "arrival"])
 def test_added_optimizer_group_preserves_adam_moments_by_group(new_group):
     original = torch.nn.Parameter(torch.ones(3))
     old = torch.optim.AdamW([{"params": [original], "name": "action"}], lr=0.1)

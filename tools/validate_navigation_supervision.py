@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from streamnav.models.point_cot.policy import Qwen35PointCoTPolicy
+from streamnav.training.arrival_supervision import prepare_arrival_supervision
 from streamnav.training.point_supervision import marginal_point_loss, targets_from_label
 from streamnav.training.pointcot_trainer import load_adapters, replay_losses, replay_records
 from streamnav.utils.seed import seed_everything
@@ -47,6 +48,7 @@ def main():
                 }
             )
             state = sampled.state
+    prepare_arrival_supervision([records], policy.device)
     replay = replay_records(policy, records, initial, resets=resets)
     loss, components, error = replay_losses(
         policy,
@@ -77,6 +79,7 @@ def main():
     )
     assert all(torch.isfinite(g).all() and g.norm() > 0 for g in witness)
     loss.mean().backward()
+    assert policy.arrival_head.weight.grad.norm() > 0
     assert all(torch.isfinite(p.grad).all() for p in policy._all_trainable if p.grad is not None)
     assert all(p.grad is None for p in policy.parameters() if not p.requires_grad)
     result = {
@@ -90,6 +93,7 @@ def main():
         "apos_rows_gradient_norms": gradients,
         "ppo_token_gradient_norms": [float(g.norm()) for g in witness],
         "frozen_parameter_gradients_absent": True,
+        "arrival_head_gradient_norm": float(policy.arrival_head.weight.grad.norm()),
     }
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)

@@ -208,6 +208,8 @@ class HabitatObjectNavEnv:
         if episode["scene_id"] != self.scene:
             self._make_sim(episode["scene_id"])
         self.episode = episode
+        # Mixed-start visibility queries carry frame metadata before reset returns.
+        self.steps = 0
         self.sim.reset()
         state = habitat_sim.AgentState()
         state.position = episode["start_position"]

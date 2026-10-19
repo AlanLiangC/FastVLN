@@ -60,6 +60,7 @@ def test_legacy_checkpoint_can_only_add_an_explicit_planning_branch(tmp_path):
     )
     policy = Policy()
     policy.future_plan = nn.Linear(3, 3)
+    policy.arrival_head = nn.Linear(3, 3)
     with pytest.raises(ValueError, match="recipe"):
         load_adapters(policy, tmp_path)
     before = policy.future_plan.weight.detach().clone()

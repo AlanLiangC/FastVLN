@@ -1,6 +1,6 @@
 # Point CoT 与监督
 
-每步输出顺序为 **APOS → OPOS → action**。动作直接使用 STOP、MOVE_FORWARD、TURN_LEFT、TURN_RIGHT、LOOK_UP、LOOK_DOWN 六个 token。APOS 是可行局部路点或转向意图，OPOS 是指令指定的可见目标点。没有单独的并行感知头或 arrival 分类头。
+每步输出顺序为 **APOS → OPOS → action**。动作直接使用 STOP、MOVE_FORWARD、TURN_LEFT、TURN_RIGHT、LOOK_UP、LOOK_DOWN 六个 token。APOS 是可行局部路点或转向意图，OPOS 是指令指定的可见目标点。另有一个 3075 参数的到达辅助头，在读取 APOS 之前预测远、近、已到达，不增加自回归 token。
 
 ## 词表与坐标
 
@@ -30,7 +30,11 @@ ImageNet 框是弱区域，使用框内候选格集合的概率质量，loss 权
 
 ## Loss
 
-`L = L_action_CE + 0.25 × (L_APOS + L_OPOS + L_forward_intent) + 0.25 × L_future_actions + ppo_coef × L_joint_PPO + value_coef × L_value - ppo_coef × entropy_coef × H + grounding_coef × L_grounding`。
+`L = L_action_CE + 0.25 × (L_APOS + L_OPOS + L_forward_intent) + 0.25 × L_future_actions + 0.2 × L_arrival + 0.1 × L_stop_calibration + 0.05 × L_apos_stop_calibration + 0.2 × L_stop_hard_negative + ppo_coef × L_joint_PPO + value_coef × L_value - ppo_coef × entropy_coef × H + grounding_coef × L_grounding`。
+
+到达标签为测地距离 <0.25 m 的 READY、[0.25,0.75) m 的 NEAR、其余 FAR；严格使用与成功判据一致的边界。到达 CE 使用全 rollout 平方根逆频率权重，归一化前最大为 4。STOP 和 APOS_STOP 的二分类校准作用于实际预测点前缀：成功范围内为正例，范围外为负例；两侧 <0.75 m 样本同样加权 2，避免只提高正例先验。原动作 CE 的 STOP 额外权重恢复为 1。
+
+难负例指 rollout 实际执行或条件 greedy 预测 STOP、但教师要求继续移动的帧。其 STOP 概率额外受惩罚；按完整分布式 rollout 的密度归一化，密度下限 0.02，防止孤立帧主导梯度。所有权重在切分 fragment 前确定，不在每片内重新平衡；未知到达标签屏蔽。教师 STOP、READY 与真实成功距离不一致时拒绝训练。
 
 导航 OPOS 使用 `L_OPOS = c_visible × mean_visible(L_visibility) + c_absent × mean_absent(L_visibility) + mean_visible(L_location|visible)`，其中 `c_class ∝ sqrt(global_class_fraction)`；某一类缺失时只对现有类归一化。可见性采用平方根频率修正，在保留负类先验的同时提高少数可见帧的有效权重；例如可见/不可见各占 20%/80% 时，两类可见性 loss 的总权重为 1/3、2/3。`visibility_balance_power=0` 对应原分布，1 对应正负各一半，当前为 0.5。
 
@@ -44,4 +48,4 @@ OPOS 的确定性解码先比较 `P(NONE)` 与全部像素的 `P(POINT)` 总量�
 
 PPO 使用 `log p(APOS) + log p(OPOS|APOS) + log p(action|APOS,OPOS)`，不包含未执行的未来动作。专家和确定性 DAgger 流不参与 PPO 或 critic loss。未来计划每步重新生成，执行第一步；视频中的计划在预测 STOP 处截断。
 
-APOS 使用导航几何标签；OPOS 同时接受导航实例的可见性、位置监督和开放词汇图像监督。目标距离与 STOP 仍需单独校准；近目标混合起点补充导航的到达/停止经验，最终判断仍需普通原始起点评估。
+APOS 使用导航几何标签；OPOS 同时接受导航实例的可见性、位置监督和开放词汇图像监督。到达与 STOP 使用上述辅助监督，近目标及停止边界起点补充接近/停止经验，最终判断仍需普通原始起点评估。视频和 trace 额外记录预测的 `P(ready)`；它不读取真值距离，也不作为强制停止门控。

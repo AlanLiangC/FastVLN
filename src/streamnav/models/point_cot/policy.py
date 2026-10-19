@@ -74,6 +74,7 @@ class TokenStep:
     value: torch.Tensor
     state: StreamingState
     action_plan_logits: torch.Tensor | None = None
+    arrival_logits: torch.Tensor | None = None
 
     @property
     def log_prob(self):
@@ -213,6 +214,14 @@ class Qwen35PointCoTPolicy(nn.Module):
         self.critic = nn.Linear(layout.hidden_size, 1, device=device, dtype=torch.float32)
         nn.init.zeros_(self.critic.weight)
         nn.init.zeros_(self.critic.bias)
+        self.arrival_head = (
+            nn.Linear(layout.hidden_size, 3, device=device, dtype=torch.float32)
+            if self.settings.get("arrival_head", False)
+            else None
+        )
+        if self.arrival_head is not None:
+            nn.init.zeros_(self.arrival_head.weight)
+            nn.init.zeros_(self.arrival_head.bias)
         self.future_plan = (
             FutureActionPlan(layout.hidden_size, self.future_action_steps - 1, device=device)
             if self.future_action_steps > 1
@@ -742,6 +751,7 @@ class Qwen35PointCoTPolicy(nn.Module):
 
         context = self.begin_batch(features, states)
         value = self.read_value(context.hidden)
+        arrival = self.read_arrival(context.hidden)
         apos_logits = self.output_projection(context.hidden, self.apos_rows)
         apos = choose(apos_logits, 0)
         context = self.append_batch(context, self.apos_rows[apos])
@@ -768,6 +778,7 @@ class Qwen35PointCoTPolicy(nn.Module):
                     )
                 ),
                 plans[i] if plans is not None else None,
+                arrival[i] if arrival is not None else None,
             )
             for i in range(count)
         ]
@@ -794,6 +805,13 @@ class Qwen35PointCoTPolicy(nn.Module):
     def read_value(self, hidden):
         with torch.autocast(self.device.type, enabled=False):
             return self.critic(hidden.float()).squeeze(-1)
+
+    def read_arrival(self, hidden):
+        # Read before APOS: arrival must not copy a teacher-forced STOP token.
+        if self.arrival_head is None:
+            return None
+        with torch.autocast(self.device.type, enabled=False):
+            return self.arrival_head(hidden.float())
 
     def plan_logits(self, current_logits, action_hidden):
         if self.future_plan is None:
@@ -919,6 +937,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             self.plan_logits(action_logits, context.hidden[:, 3])
             if self.future_plan is not None
             else None,
+            self.read_arrival(context.hidden[:, 0]),
         )
 
     def action_logits(self, context):
@@ -927,6 +946,7 @@ class Qwen35PointCoTPolicy(nn.Module):
     def step(self, feature, state, *, tokens=None, deterministic=False):
         context = self.begin(feature, state)
         value = self.read_value(context.hidden).squeeze()
+        arrival = self.read_arrival(context.hidden)
         apos_logits = self.point_logits(context, "apos")
         apos = (
             tokens[0]
@@ -968,6 +988,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             self.plan_logits(logits.unsqueeze(0), context.hidden).squeeze(0)
             if self.future_plan is not None
             else None,
+            arrival.squeeze(0) if arrival is not None else None,
         )
 
     @contextmanager
@@ -1000,6 +1021,11 @@ class Qwen35PointCoTPolicy(nn.Module):
                     "apos_tokens": torch.stack([s.apos for s in steps]),
                     "opos_tokens": torch.stack([s.opos for s in steps]),
                     "point_cot": True,
+                    **(
+                        {"arrival": torch.stack([s.arrival_logits for s in steps])}
+                        if self.arrival_head is not None
+                        else {}
+                    ),
                     "object_hint_tokens": hint_tokens
                     if hint_tokens is not None
                     else [0] * len(states),
@@ -1040,6 +1066,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             "opos_decoding": self.opos_decoding,
             "future_action_steps": self.future_action_steps,
             "object_hint_token": self.supports_object_hints,
+            "arrival_head": self.arrival_head is not None,
             "action_token_strings": self.action_token_strings,
             "source_revision": json.loads(Path(self.base_path, "source_revision.json").read_text()),
         }

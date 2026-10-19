@@ -13,6 +13,11 @@ def perception_records(predictions, *, hierarchical=False):
     else:
         arrival = predictions["arrival"].softmax(-1).tolist()
         records = [{"arrival_probabilities": probabilities} for probabilities in arrival]
+    if predictions.get("point_cot", False) and "arrival" in predictions:
+        for record, probabilities in zip(
+            records, predictions["arrival"].softmax(-1).tolist(), strict=True
+        ):
+            record["arrival_probabilities"] = probabilities
     if "object_hint_tokens" in predictions:
         for record, token in zip(records, predictions["object_hint_tokens"], strict=True):
             record["object_hint_token"] = int(token)

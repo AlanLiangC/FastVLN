@@ -1,6 +1,6 @@
 # 推理、延迟与视频
 
-模型配置为 [pointcot.yaml](../configs/pointcot.yaml)，检查点格式为 `qwen35-pointcot-adapters-v1`。部署需要官方基座和 adapter；加载时校验基座 revision、参数名称、形状和权重校验和。当前固定节点位于 `checkpoints/versions/qwen35_pointcot_20261017/navigation`，活动模型位于 `runs/qwen35_pointcot_opos_hint/checkpoints/{latest,best}`。
+模型配置为 [pointcot.yaml](../configs/pointcot.yaml)，检查点格式为 `qwen35-pointcot-adapters-v1`。部署需要官方基座 `checkpoints/qwen35_0p8b_base` 和导航 adapter；加载时校验基座 revision、参数名称、形状和权重校验和。导航模型入口为 `runs/qwen35_pointcot_opos_hint/checkpoints/{latest,best}`：`latest` 是最近保存的训练状态，`best` 是固定验证集选中的候选，两者的 update 以各自 `manifest.json` 为准。Grounding 权重用于导航初始化，不作为训练完成的导航模型。
 
 ## 单步接口
 
@@ -30,7 +30,7 @@ RTX 4090、当前参数 / 计算配置下，已记录的单卡推理延迟如下
 ```bash
 source scripts/env.sh
 CUDA_VISIBLE_DEVICES=0 python tools/benchmark_hint_eval.py \
-  --checkpoint checkpoints/versions/qwen35_pointcot_20261017/navigation \
+  --checkpoint runs/qwen35_pointcot_opos_hint/checkpoints/best \
   --batch 1 --warmup 8 --iterations 40
 ```
 
@@ -43,8 +43,8 @@ make viewer
 # http://127.0.0.1:8765/evaluation/
 # 独立评估写入新目录，保留训练原始记录
 python -m streamnav.evaluation.runner \
-  checkpoint=checkpoints/versions/qwen35_pointcot_20261017/navigation \
-  run_dir=runs/manual_node_eval
+  checkpoint=runs/qwen35_pointcot_opos_hint/checkpoints/best \
+  run_dir=runs/manual_navigation_eval
 ```
 
 视频目录为 `RUN_DIR/evaluation/update_XXXXXXX/{no_hint,simulated_hint}/`，包含 MP4、逐步 trace、播放页和 split 汇总。APOS 荧光绿、预测 OPOS 洋红、外部提示橙色，均加白边并与当前帧对齐。HINT 方框是单点标记，尺寸不表示目标边界。NONE、LEFT/RIGHT、STOP 等特殊 token 不伪造像素点；四步计划在预测 STOP 处截断。

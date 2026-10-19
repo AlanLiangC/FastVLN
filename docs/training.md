@@ -1,17 +1,15 @@
 # 训练与评估
 
-当前配置为 [pointcot.yaml](../configs/pointcot.yaml)，模型与监督接口分别见 [架构](architecture.md) 和 [Point CoT](perception.md)。当前节点为 `checkpoints/versions/qwen35_pointcot_20261017`：navigation 固定 update 5155，best 固定 update 4400。活动运行继续写入 `runs/qwen35_pointcot_opos_hint`。
+当前配置为 [pointcot.yaml](../configs/pointcot.yaml)，模型与监督接口分别见 [架构](architecture.md) 和 [Point CoT](perception.md)。活动运行写入 `runs/qwen35_pointcot_opos_hint`；续训使用其中的 `checkpoints/latest`，部署候选使用 `checkpoints/best`，实际 update 以各自 `manifest.json` 为准。
 
 ## 导航训练
 
 ```bash
 source scripts/env.sh
-# 当前八卡运行恢复；保留权重、Adam、数据游标和 PPO 进度
-bash scripts/start_eight_gpu_training.sh \
+# 当前四卡运行恢复；保留权重、Adam、数据游标和 PPO 进度
+CUDA_VISIBLE_DEVICES=0,1,2,3 STREAMNAV_WORLD_SIZE=4 \
+  bash scripts/start_pointcot_training.sh \
   --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest --skip-initial-eval
-# 从固定节点恢复到新目录
-STREAMNAV_RUN_DIR=runs/navigation_from_node bash scripts/start_eight_gpu_training.sh \
-  --resume checkpoints/versions/qwen35_pointcot_20261017/navigation --skip-initial-eval
 # 保存完整 update 后暂停
 bash scripts/stop_training.sh runs/qwen35_pointcot_opos_hint
 python tools/training_status.py --root runs/qwen35_pointcot_opos_hint
@@ -19,20 +17,21 @@ python tools/training_status.py --root runs/qwen35_pointcot_opos_hint
 
 | 项目 | 当前设置 |
 |---|---|
-| GPU / 环境 | 默认 GPU 0–7；每卡专家、greedy DAgger、随机 PPO 各 1 个环境 |
+| GPU / 环境 | 当前 GPU 0–3；每卡专家、greedy DAgger、随机 PPO 各 1 个环境 |
 | rollout / fragment | 100 步 / 20 步 |
-| update | 2400 条转移，2 次同步 mini-batch optimizer step |
+| update | 当前四卡 1200 条转移，2 次同步 mini-batch optimizer step |
 | 预算 | 累计 update 10000 |
 | PPO | 系数 0.25，clip=0.2；仅随机学生参与 PPO 和 critic |
 | 动作 IL | 实际预测点前缀与标注点前缀各 50%，三路环境都接受教师动作 CE |
 | 辅助项 | point=0.25，未来动作=0.25，grounding=0.5 |
-| grounding 混合 | 每 rank 每 mini-batch 4 条，八卡每 update 64 条 |
+| 到达 / 停止 | arrival=0.2，动作 STOP 校准=0.1，APOS_STOP 校准=0.05，误停难负例=0.2 |
+| grounding 混合 | 每 rank 每 mini-batch 4 条，四卡每 update 32 条 |
 | 优化器 | fused AdamW，梯度同步后裁剪到范数 1 |
-| 保存 / 评估 | 每 5 / 100 update，最近 2 个检查点及 best、配方初始检查点保留 |
+| 保存 / 评估 | 每 5 / 100 update，保留最近 2 个、best 及本次配方父检查点用于回退 |
 
-LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-4，hint LR=1e-4。PPO 原计划为预热 50 update，再用 200 update 升至 0.25；当前延续的 `schedule_origin_update=1403` 已进入完整 PPO 阶段，恢复不重新预热。
+LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-4，hint / arrival LR=1e-4。PPO 原计划为预热 50 update，再用 200 update 升至 0.25；当前延续的 `schedule_origin_update=1403` 已进入完整 PPO 阶段，恢复不重新预热。
 
-一个环境 step 是一次当前帧决策及仿真动作；一个 update 汇集全部环境的 100 步转移后更新参数。100 不是 episode 长度：episode 最多 500 步，可跨 update 延续。KDA 只在反向 fragment 起点 detach，20 步内保留梯度。六卡每 update 为 1800 条转移，跨卡数比较使用累计 `frames`。
+一个环境 step 是一次当前帧决策及仿真动作；一个 update 汇集全部环境的 100 步转移后更新参数。100 不是 episode 长度：episode 最多 500 步，可跨 update 延续。KDA 只在反向 fragment 起点 detach，20 步内保留梯度。四 / 六 / 八卡每 update 分别为 1200 / 1800 / 2400 条转移，跨卡数比较使用累计 `frames`。脚本未指定卡数时默认八卡，当前四卡运行需使用上面的显式设置。
 
 动作 CE 对碰撞恢复、STOP 样本的加权在整个分布式 rollout 上归一化。PPO 使用实际 APOS、OPOS、当前动作的联合概率，专家覆盖动作与 greedy DAgger 不使用伪造的 on-policy 概率。四步规划只用专家连续轨迹后续三步作辅助监督，跨 STOP、episode 或 rollout 边界的标签屏蔽；部署执行当前一步后重新观测规划。
 
@@ -40,7 +39,7 @@ LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-
 
 使用 HM3D-OVON train 和官方 HM3D-Semantics 实例资产，路径与准备方式见 [数据文档](datasets.md)。缺少实例资产或整次 rollout 的 OPOS 有效标签为零时拒绝训练。机器人 `allow_sliding=true`，高 0.88 m、半径 0.18 m，前进 0.25 m、转向 30°，成功距离 0.25 m。
 
-训练 reset 按 episode 选择 50% 原始起点、35% 距目标合法视点 geodesic 0.5–3 m 的 near 起点、15% 距离 0–0.2 m 的 ready 起点。near 有 50% 概率朝向目标；ready 朝向目标并检查可见性。采样失败保留原始起点。比例针对 reset，不代表转移或 STOP 标签比例。评估只用原始起点。
+训练 reset 按 episode 选择 50% 原始起点、20% 距目标合法视点 geodesic 0.75–3 m 的 near 起点、10% 距离 0–0.25 m 的 ready 起点、20% 距离 0.25–0.75 m 的 boundary 起点。near 有 50% 概率朝向目标；ready 与 boundary 使用相同的相机朝向/俯仰对齐和实例可见性检查，让阈值两侧的视觉条件可比较。boundary 的实际测地距离必须在成功范围外。采样失败保留原始起点。比例针对 reset，不代表转移或 STOP 标签比例。评估只用原始起点。
 
 每 rank 的 sampler 按约 2000 次环境 step 驻留场景，带 20% jitter。约一半 episode 全程 NULL，其余用训练实例点模拟提示，并加入 20% 缺失、±1 格内部扰动、1% 随机误报。NULL 只表示没有外部信息，目标可见时仍监督 OPOS 像素位置。训练深度与实例图仅用于生成标签，不进入策略输入。
 
@@ -71,6 +70,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/start_eight_gpu_training.sh \
   --allow-world-size-change --skip-initial-eval
 # 缩为六卡
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 STREAMNAV_WORLD_SIZE=6 \
+  bash scripts/start_pointcot_training.sh \
+  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest \
+  --allow-world-size-change --skip-initial-eval
+# 缩为四卡
+CUDA_VISIBLE_DEVICES=0,1,2,3 STREAMNAV_WORLD_SIZE=4 \
   bash scripts/start_pointcot_training.sh \
   --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest \
   --allow-world-size-change --skip-initial-eval
@@ -109,4 +113,6 @@ Grounding 默认 GPU 0–5、每卡 batch 32，全局 192。`--updates` 优先�
 
 ## 项目保留规则
 
-活动导航与已完成 grounding 的训练曲线、评估、源码、必要检查点保留；固定版本位于 `checkpoints/versions/`。数据、模型基座、安装环境、凭据、navmesh 与编译缓存不作实验垃圾清理。`runtime/reports/` 只保留当前验收、数据审计、恢复和性能分析；验证输入独立保存在 `runtime/fixtures/`，历史 canary、失败尝试、一次性对照输出不作为长期依赖。
+权重入口以 README 的表格为准：官方 Qwen 基座、活动导航最近两个检查点和 best、已完成 grounding 的 best 与最终检查点。本次配方父检查点保留用于回退；旧节点副本与 grounding 中间权重不作为加载入口。训练曲线、评估、源码与验证样本继续保留。
+
+数据、安装环境、凭据、navmesh 与编译缓存不作实验垃圾清理。`runtime/reports/` 只保留当前验收、数据审计、恢复和性能分析；验证输入独立保存在 `runtime/fixtures/`，历史 canary、失败尝试、一次性对照输出不作为长期依赖。

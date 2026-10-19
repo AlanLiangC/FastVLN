@@ -45,7 +45,7 @@ def apply_mixed_start(env, specification):
             )
         agent.set_state(state)
         env._cached_observations = None
-        if ready:
+        if ready or (specification["kind"] == "boundary" and facing):
             # A fresh cache cannot infer that an invisible object is behind it.
             # Align the camera in 3D, including high objects at a low mounting
             # height, then reject occluded goal anchors. These are sampling
@@ -71,7 +71,13 @@ def apply_mixed_start(env, specification):
             pixel, z = project_camera(
                 np.asarray(goal["position"]), camera, w, h, env.config.get("hfov", 120)
             )
-            if pixel is None or not depth_agrees(depth, pixel, z, 0.3 + 0.04 * z):
+            if env.config.get("object_label_source") == "semantic_instance":
+                from perception_labels import PerceptionLabeler
+
+                label = PerceptionLabeler(env).object_labels()
+                if not label.get("opos_valid") or not label.get("opos"):
+                    continue
+            elif pixel is None or not depth_agrees(depth, pixel, z, 0.3 + 0.04 * z):
                 continue
         return {
             "kind": specification["kind"],

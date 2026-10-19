@@ -48,6 +48,11 @@ from streamnav.training.affordance_loss import (
     imitation_weight,
     validate_affordance_label,
 )
+from streamnav.training.arrival_supervision import (
+    ARRIVAL_METRICS,
+    arrival_losses,
+    prepare_arrival_supervision,
+)
 from streamnav.training.diagnostics import (
     merge_diagnostics,
     observation_distance,
@@ -110,6 +115,9 @@ def stack_steps(steps):
         steps[-1].state,
         torch.stack([s.action_plan_logits for s in steps])
         if steps[0].action_plan_logits is not None
+        else None,
+        torch.stack([s.arrival_logits for s in steps])
+        if steps[0].arrival_logits is not None
         else None,
     )
 
@@ -292,8 +300,10 @@ def replay_losses(
         * eligible
         * weights
     )
+    arrival_loss, arrival_metrics = arrival_losses(step, records, cfg)
     loss = (
         il
+        + arrival_loss
         + cfg["point_il_coef"]
         * (
             apos
@@ -309,6 +319,7 @@ def replay_losses(
     return (
         loss,
         {
+            **arrival_metrics,
             "il_loss": il,
             "apos_loss": apos,
             "apos_type_loss": apos_type,
@@ -512,7 +523,7 @@ def optimize_rollout(
         torch.cuda.empty_cache()
 
     totals: dict[str, float] = {}
-    peaks, norms, apos_norms, opos_norms, auxiliary_metrics = [], [], [], [], []
+    peaks, norms, apos_norms, opos_norms, arrival_norms, auxiliary_metrics = [], [], [], [], [], []
     opos_no_hint_gradient = 0.0
     policy_change, ppo_gradient, differentiable_error = 0.0, 0.0, 0.0
     clips, kls, eligible_count, completed = 0.0, 0.0, 0, 0
@@ -653,6 +664,8 @@ def optimize_rollout(
         )
         apos_norms.append(float(policy.apos_rows.grad.norm()))
         opos_norms.append(float(policy.opos_rows.grad.norm()))
+        head = getattr(policy, "arrival_head", None)
+        arrival_norms.append(float(head.weight.grad.norm()) if head is not None else 0.0)
     return {
         **totals,
         "grounding_loss": sum(x[0] for x in auxiliary_metrics) / batches,
@@ -660,6 +673,7 @@ def optimize_rollout(
         "grad_norm": max(norms),
         "apos_parameter_gradient_norm": max(apos_norms),
         "opos_parameter_gradient_norm": max(opos_norms),
+        "arrival_parameter_gradient_norm": max(arrival_norms),
         "opos_no_hint_positive_gradient_norm": opos_no_hint_gradient,
         "ppo_token_gradient_norm": ppo_gradient,
         "replay_log_prob_error_max": replay_error,
@@ -835,7 +849,9 @@ def load_adapters(policy, folder, *, allow_new_plan=False):
         added
         and not (
             allow_new_plan
-            and all(name.startswith(("future_plan.", "object_hint.")) for name in added)
+            and all(
+                name.startswith(("future_plan.", "object_hint.", "arrival_head.")) for name in added
+            )
         )
     ):
         raise ValueError("Adapter recipe differs from the saved checkpoint")
@@ -893,6 +909,9 @@ def fork_signature(config):
     recipe.pop("trainer")
     recipe["model"].pop("future_action_steps", None)
     recipe["model"].pop("object_hint_token", None)
+    recipe["model"].pop("arrival_head", None)
+    # Start-pose sampling changes only in an explicit training recipe fork.
+    recipe.pop("curriculum")
     recipe["data"] = dict(recipe["data"])
     recipe["data"].pop("iterator_options", None)
     recipe["habitat"].pop("reward", None)
@@ -1032,10 +1051,24 @@ def main():
     parallel.initialize(config)
     cfg = config["trainer"]
     validate_expert_streams(cfg)
+    if any(
+        cfg.get(k, 0)
+        for k in (
+            "arrival_loss_coef",
+            "stop_calibration_coef",
+            "apos_stop_calibration_coef",
+            "stop_hard_negative_coef",
+        )
+    ) and not config["model"].get("arrival_head", False):
+        raise ValueError("Arrival and STOP supervision require model.arrival_head")
     if not 0 <= cfg["teacher_action_mix"] <= 1:
         raise ValueError("Teacher action mixture must be in [0, 1]")
     if config["curriculum"]["ready_distance"][1] > config["habitat"]["success_distance"]:
         raise ValueError("STOP-ready starts must be inside the success radius")
+    if config["curriculum"].get("boundary_probability", 0) and (
+        config["curriculum"]["boundary_distance"][0] < config["habitat"]["success_distance"]
+    ):
+        raise ValueError("Boundary negative starts must be outside the success radius")
     config["grounding"]["manifest_sha256"] = {
         p: sha256(Path(p).read_bytes()).hexdigest()
         for p in (config["grounding"]["train_manifest"], config["grounding"]["val_manifest"])
@@ -1072,7 +1105,14 @@ def main():
         <= cfg["rollout_steps"] // cfg["sequence_length"]
     ):
         raise ValueError("Mini-batches must contain complete time blocks for every stream")
-    for key in ("apos_forward_intent_coef", "future_action_loss_coef"):
+    for key in (
+        "apos_forward_intent_coef",
+        "future_action_loss_coef",
+        "arrival_loss_coef",
+        "stop_calibration_coef",
+        "apos_stop_calibration_coef",
+        "stop_hard_negative_coef",
+    ):
         if not math.isfinite(cfg.get(key, 0)) or cfg.get(key, 0) < 0:
             raise ValueError(f"{key} must be finite and nonnegative")
     if cfg.get("point_supervision_prefix", "teacher") not in ("actual", "teacher"):
@@ -1110,11 +1150,14 @@ def main():
         "critic": [],
         "planning": [],
         "hint": [],
+        "arrival": [],
     }
     for name, parameter in policy.named_parameters():
         if parameter.requires_grad:
             group = (
-                "hint"
+                "arrival"
+                if name.startswith("arrival_head.")
+                else "hint"
                 if name.startswith("object_hint.")
                 else "planning"
                 if name.startswith("future_plan.")
@@ -1628,6 +1671,13 @@ def main():
             for row in records:
                 for record in row:
                     record["il_weight"] = imitation_weight(record, cfg) / mean_il_weight
+            if config["model"].get("arrival_head", False):
+                prepare_arrival_supervision(
+                    records,
+                    policy.device,
+                    success_distance=config["habitat"]["success_distance"],
+                    near_distance=config["habitat"].get("arrival_near_distance", 0.75),
+                )
             rewards = torch.tensor([[r["reward"] for r in row] for row in records])
             dones = torch.tensor([[r["done"] for r in row] for row in records])
             values = torch.stack([torch.stack([r["value"] for r in row]) for row in records])
@@ -1647,6 +1697,7 @@ def main():
             totals = {
                 k: 0.0
                 for k in (
+                    *ARRIVAL_METRICS,
                     "il_loss",
                     "apos_loss",
                     "apos_type_loss",
@@ -1733,7 +1784,7 @@ def main():
                 ).tolist(),
                 "start_kind_transitions": {
                     kind: sum(r["start_kind"] == kind for row in records for r in row)
-                    for kind in ("original", "near", "ready")
+                    for kind in ("original", "near", "ready", "boundary")
                 },
                 "peak_vram_bytes": torch.cuda.max_memory_allocated(policy.device),
                 "replay_mode": cfg.get("replay_mode", "packed"),
@@ -1793,6 +1844,9 @@ def main():
                     opos_parameter_gradient_norm=max(
                         m["opos_parameter_gradient_norm"] for m in all_metrics
                     ),
+                    arrival_parameter_gradient_norm=max(
+                        m["arrival_parameter_gradient_norm"] for m in all_metrics
+                    ),
                     opos_no_hint_positive_gradient_norm=max(
                         m["opos_no_hint_positive_gradient_norm"] for m in all_metrics
                     ),
@@ -1813,7 +1867,7 @@ def main():
                     ],
                     start_kind_transitions={
                         kind: sum(m["start_kind_transitions"][kind] for m in all_metrics)
-                        for kind in ("original", "near", "ready")
+                        for kind in ("original", "near", "ready", "boundary")
                     },
                     opos_peak_probability=sum(m["opos_peak_probability"] for m in all_metrics)
                     / len(all_metrics),

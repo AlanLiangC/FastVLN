@@ -6,17 +6,22 @@ from dataclasses import replace
 
 def validate_curriculum(config):
     keys = ("original_probability", "near_probability", "ready_probability")
-    ps = [config[k] for k in keys]
+    ps = [config[k] for k in keys] + [config.get("boundary_probability", 0)]
     if any(not math.isfinite(p) or p < 0 for p in ps) or not math.isclose(sum(ps), 1):
         raise ValueError("Start probabilities must be finite, nonnegative and sum to one")
     if ps[0] <= 0:
         raise ValueError("Preserve original starts to learn search")
-    for key in ("near_distance", "ready_distance"):
+    bands = ["near_distance", "ready_distance"]
+    if config.get("boundary_probability", 0):
+        bands.append("boundary_distance")
+    for key in bands:
         lo, hi = config[key]
         if not 0 <= lo < hi <= 20:
             raise ValueError("Invalid geodesic start-distance band")
     if not 0 <= config["goal_facing_probability"] <= 1:
         raise ValueError("Invalid start orientation probability")
+    if not 0 <= config.get("boundary_goal_facing_probability", 1) <= 1:
+        raise ValueError("Invalid boundary orientation probability")
 
 
 class MixedStartEpisodeSource:
@@ -32,7 +37,14 @@ class MixedStartEpisodeSource:
         value = rng.random()
         if value < cfg["original_probability"]:
             return episode
-        kind = "near" if value < cfg["original_probability"] + cfg["near_probability"] else "ready"
+        if value < cfg["original_probability"] + cfg["near_probability"]:
+            kind = "near"
+        elif value < sum(
+            cfg[k] for k in ("original_probability", "near_probability", "ready_probability")
+        ):
+            kind = "ready"
+        else:
+            kind = "boundary"
         return replace(
             episode,
             metadata={
@@ -40,7 +52,9 @@ class MixedStartEpisodeSource:
                 "training_start": {
                     "kind": kind,
                     "distance_band": cfg[kind + "_distance"],
-                    "goal_facing_probability": cfg["goal_facing_probability"],
+                    "goal_facing_probability": cfg.get("boundary_goal_facing_probability", 1)
+                    if kind == "boundary"
+                    else cfg["goal_facing_probability"],
                     "seed": rng.getrandbits(31),
                 },
             },

@@ -12,6 +12,7 @@ model:
   opos_decoding: hierarchical
   future_action_steps: 4
   object_hint_token: true
+  arrival_head: true
   action_dim: 6
   image_size:
   - 256
@@ -50,6 +51,7 @@ trainer:
     critic: 0.00015
     planning: 0.0003
     hint: 0.0001
+    arrival: 0.0001
   object_hints:
     episode_probability: 0.5
     noise:
@@ -63,7 +65,11 @@ trainer:
   ppo_ramp_updates: 200
   ppo_weight: 0.25
   recovery_il_weight: 3.0
-  stop_il_weight: 2.0
+  stop_il_weight: 1.0
+  arrival_loss_coef: 0.2
+  stop_calibration_coef: 0.1
+  apos_stop_calibration_coef: 0.05
+  stop_hard_negative_coef: 0.2
   value_loss_coef: 0.5
   entropy_coef: 0.005
   max_grad_norm: 1.0
@@ -156,14 +162,19 @@ distributed:
   gradient_sync: manual
 curriculum:
   original_probability: 0.5
-  near_probability: 0.35
-  ready_probability: 0.15
+  near_probability: 0.2
+  ready_probability: 0.1
+  boundary_probability: 0.2
   near_distance:
-  - 0.5
+  - 0.75
   - 3.0
   ready_distance:
   - 0.0
-  - 0.2
+  - 0.25
+  boundary_distance:
+  - 0.25
+  - 0.75
+  boundary_goal_facing_probability: 1.0
   goal_facing_probability: 0.5
 grounding:
   train_manifest: runtime/data/grounding/public_v2/train.jsonl

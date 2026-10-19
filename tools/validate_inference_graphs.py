@@ -14,8 +14,18 @@ from streamnav.training.pointcot_trainer import load_adapters
 def difference(expected, actual):
     errors = []
     for a, b in zip(expected, actual, strict=True):
-        for name in ("apos_logits", "opos_logits", "action_logits", "action_plan_logits", "value"):
-            errors.append(float((getattr(a, name) - getattr(b, name)).abs().max()))
+        for name in (
+            "apos_logits",
+            "opos_logits",
+            "action_logits",
+            "action_plan_logits",
+            "arrival_logits",
+            "value",
+        ):
+            x, y = getattr(a, name), getattr(b, name)
+            assert (x is None) == (y is None)
+            if x is not None:
+                errors.append(float((x - y).abs().max()))
         errors.append(float((a.log_prob - b.log_prob).abs()))
         for x, y in zip(a.state.kda_cache, b.state.kda_cache, strict=True):
             if x.recurrent is not None:
