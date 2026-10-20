@@ -2,7 +2,7 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "$STREAMNAV_ROOT"
-run_dir="$(realpath -m "${STREAMNAV_RUN_DIR:-runs/qwen35_pointcot_opos_hint}")"
+run_dir="$(realpath -m "${STREAMNAV_RUN_DIR:-runs/qwen35_pointcot_temporal}")"
 world="${STREAMNAV_WORLD_SIZE:-8}"
 if [[ ! "$world" =~ ^[1-9][0-9]*$ ]]; then
   echo "STREAMNAV_WORLD_SIZE must be a positive integer" >&2
@@ -19,4 +19,5 @@ if [[ $# -eq 0 ]]; then
 fi
 exec python tools/launch_job.py --name training --run-dir "$run_dir" --monitor -- \
   -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$world" \
-  --module streamnav.training.pointcot_trainer --run-dir "$run_dir" "$@"
+  --module streamnav.training.pointcot_trainer --run-dir "$run_dir" \
+  --config "${STREAMNAV_TRAIN_CONFIG:-configs/pointcot_temporal.yaml}" "$@"

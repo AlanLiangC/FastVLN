@@ -21,6 +21,14 @@ def perception_records(predictions, *, hierarchical=False):
     if "object_hint_tokens" in predictions:
         for record, token in zip(records, predictions["object_hint_tokens"], strict=True):
             record["object_hint_token"] = int(token)
+    if "current_action_logits" in predictions:
+        probabilities = predictions["current_action_logits"].softmax(-1).tolist()
+        tokens = predictions["selected_action_tokens"].tolist()
+        for record, probs, selected in zip(records, probabilities, tokens, strict=True):
+            record["current_action_probabilities"] = probs
+            record["temporal_action_changed"] = selected != max(
+                range(len(probs)), key=probs.__getitem__
+            )
     if "action_plan_logits" in predictions:
         plans = predictions["action_plan_logits"]
         for record, tokens, probabilities in zip(

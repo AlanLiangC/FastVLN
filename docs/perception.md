@@ -28,6 +28,12 @@ ImageNet 框是弱区域，使用框内候选格集合的概率质量，loss 权
 
 常规 `simulated_hint` 评估使用干净实例点：目标可见且标注有效时提供一个内部点，否则为 NULL。评估噪声由 `eval.hint_noise` 独立控制，不能直接复用训练噪声。该设置反映理想点提示的收益，不代表真实检测器成绩；与带噪声评估比较时需核对日志中的 `hint_noise`。视频 trace 记录输入点来源、是否落在目标上和 OPOS 标注状态，标注仅供诊断。
 
+当前 [训练配方](../configs/pointcot_temporal.yaml) 继续保留 HINT 条件监督：训练服务先生成实际输入点，再按该网格中心的实例归属选择候选的合法目标视点。教师动作与 APOS 都沿此候选的可执行路线生成；OPOS 有效区域收紧到当前绑定实例，不要求精确复制输入坐标。实例 ID、导航路径和深度不进入策略输入，也不增加模型参数。
+
+只有实际交给策略的有效点能建立或切换绑定；NULL 帧不能根据未提供给策略的真值更新候选。已有候选在最后一次有效提示后的 40 步内可继续用于接近监督，暂时不可见时 OPOS 按该实例的可见性标注。超过期限、候选不可达或离散路线不可执行时回到原任务教师。全程 NULL 的 episode 保持原有类别目标监督；已有提示历史后的 NULL 不等于从未获得提示。
+
+到达判据仍是任务合法目标视点的测地距离 <0.25 m，接近子路点不能产生 STOP 标签。四步计划在候选绑定变化时截断。输入 HINT 原样进入 rollout、回放与 value bootstrap；同一帧的重复标签查询不重复推进教师状态。当前继续保留无提示比例、起点分布、学习率、grounding 和 PPO 主任务奖励。
+
 ## Loss
 
 `L = L_action_CE + 0.25 × (L_APOS + L_OPOS + L_forward_intent) + 0.25 × L_future_actions + 0.2 × L_arrival + 0.1 × L_stop_calibration + 0.05 × L_apos_stop_calibration + 0.2 × L_stop_hard_negative + ppo_coef × L_joint_PPO + value_coef × L_value - ppo_coef × entropy_coef × H + grounding_coef × L_grounding`。
@@ -44,7 +50,7 @@ OPOS 的确定性解码先比较 `P(NONE)` 与全部像素的 `P(POINT)` 总量�
 
 导航 point CE 使用实际预测历史的回放 logits；action CE 默认各有 50% 来自实际预测点前缀和标注点前缀，均对齐教师动作。完整 APOS CE 已包含类型分类，因此额外类型 CE 系数为 0；APOS 在推理时使用类别概率总量，再在像素类别内选位置。可靠几何坐标及左右/STOP 标注保持原义。坐标未知且教师要求前进时，`L_forward_intent = -log(P(NONE)+P(POINT))`，允许未知可见性但抑制错误转向/停止意图，不伪造像素或缺失标签。
 
-未来动作 CE 仅使用实际执行专家动作的连续轨迹；标签包括当前动作与后续三步，当前动作已有 IL/PPO，辅助项只训练后续三步。episode 结束、STOP、rollout 末尾或专家流中断后屏蔽剩余标签，不能将随机/greedy 学生访问状态上的后续教师动作拼成专家未来轨迹。未来 CE 按每帧有效 horizon 平均，并按全局有效专家帧比例归一化；也混合实际/标注点前缀各 50%。
+未来动作 CE 使用 `executed_prefix`。头部已读实际 a_t，所以三路环境都可监督实际 s_(t+1) 上的教师动作；再往后要求中间执行动作与教师相同，不能将任意学生轨迹拼成专家计划。例如 a_(t+1) 与教师不同，第二步标签仍有效，第三、四步屏蔽。当前动作已有 IL/PPO，辅助项只训练后续三步；episode 结束、STOP、rollout 末尾或候选绑定变化均截断。未来 CE 按每帧有效 horizon 平均，再按全局有有效未来标签的帧比例归一化；实际/标注点前缀各占 50%，两者都以实际动作 token 为条件。旧 `expert_only` 模式继续供历史配方恢复使用。
 
 PPO 使用 `log p(APOS) + log p(OPOS|APOS) + log p(action|APOS,OPOS)`，不包含未执行的未来动作。专家和确定性 DAgger 流不参与 PPO 或 critic loss。未来计划每步重新生成，执行第一步；视频中的计划在预测 STOP 处截断。
 

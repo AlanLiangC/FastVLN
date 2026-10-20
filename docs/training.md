@@ -1,39 +1,67 @@
 # 训练与评估
 
-当前配置为 [pointcot.yaml](../configs/pointcot.yaml)，模型与监督接口分别见 [架构](architecture.md) 和 [Point CoT](perception.md)。活动运行写入 `runs/qwen35_pointcot_opos_hint`；续训使用其中的 `checkpoints/latest`，部署候选使用 `checkpoints/best`，实际 update 以各自 `manifest.json` 为准。
+当前配置为 [pointcot_temporal.yaml](../configs/pointcot_temporal.yaml)，模型与监督接口分别见 [架构](architecture.md) 和 [Point CoT](perception.md)。活动运行写入 `runs/qwen35_pointcot_temporal`；续训使用其中的 `checkpoints/latest`，部署候选使用 `checkpoints/best`，实际 update 以各自 `manifest.json` 为准。
 
 ## 导航训练
 
 ```bash
 source scripts/env.sh
-# 当前四卡运行恢复；保留权重、Adam、数据游标和 PPO 进度
-CUDA_VISIBLE_DEVICES=0,1,2,3 STREAMNAV_WORLD_SIZE=4 \
+# 当前八卡运行恢复；保留权重、Adam、数据游标和 PPO 进度
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 STREAMNAV_WORLD_SIZE=8 \
   bash scripts/start_pointcot_training.sh \
-  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest --skip-initial-eval
+  --resume runs/qwen35_pointcot_temporal/checkpoints/latest --skip-initial-eval
 # 保存完整 update 后暂停
-bash scripts/stop_training.sh runs/qwen35_pointcot_opos_hint
-python tools/training_status.py --root runs/qwen35_pointcot_opos_hint
+bash scripts/stop_training.sh runs/qwen35_pointcot_temporal
+python tools/training_status.py --root runs/qwen35_pointcot_temporal
 ```
 
 | 项目 | 当前设置 |
 |---|---|
-| GPU / 环境 | 当前 GPU 0–3；每卡专家、greedy DAgger、随机 PPO 各 1 个环境 |
+| GPU / 环境 | 当前 GPU 0–7；每卡专家、greedy DAgger、随机 PPO 各 1 个环境 |
 | rollout / fragment | 100 步 / 20 步 |
-| update | 当前四卡 1200 条转移，2 次同步 mini-batch optimizer step |
-| 预算 | 累计 update 10000 |
+| update | 当前八卡 2400 条转移，2 次同步 mini-batch optimizer step |
+| 预算 | 累计 update 20000；从 10380 保留优化器状态与 PPO 计划建立独立分支 |
 | PPO | 系数 0.25，clip=0.2；仅随机学生参与 PPO 和 critic |
 | 动作 IL | 实际预测点前缀与标注点前缀各 50%，三路环境都接受教师动作 CE |
 | 辅助项 | point=0.25，未来动作=0.25，grounding=0.5 |
 | 到达 / 停止 | arrival=0.2，动作 STOP 校准=0.1，APOS_STOP 校准=0.05，误停难负例=0.2 |
-| grounding 混合 | 每 rank 每 mini-batch 4 条，四卡每 update 32 条 |
+| grounding 混合 | 每 rank 每 mini-batch 4 条，八卡每 update 64 条 |
 | 优化器 | fused AdamW，梯度同步后裁剪到范数 1 |
 | 保存 / 评估 | 每 5 / 100 update，保留最近 2 个、best 及本次配方父检查点用于回退 |
 
 LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-4，hint / arrival LR=1e-4。PPO 原计划为预热 50 update，再用 200 update 升至 0.25；当前延续的 `schedule_origin_update=1403` 已进入完整 PPO 阶段，恢复不重新预热。
 
-一个环境 step 是一次当前帧决策及仿真动作；一个 update 汇集全部环境的 100 步转移后更新参数。100 不是 episode 长度：episode 最多 500 步，可跨 update 延续。KDA 只在反向 fragment 起点 detach，20 步内保留梯度。四 / 六 / 八卡每 update 分别为 1200 / 1800 / 2400 条转移，跨卡数比较使用累计 `frames`。脚本未指定卡数时默认八卡，当前四卡运行需使用上面的显式设置。
+一个环境 step 是一次当前帧决策及仿真动作；一个 update 汇集全部环境的 100 步转移后更新参数。100 不是 episode 长度：episode 最多 500 步，可跨 update 延续。KDA 只在反向 fragment 起点 detach，20 步内保留梯度。四 / 六 / 八卡每 update 分别为 1200 / 1800 / 2400 条转移，跨卡数比较使用累计 `frames`。脚本未指定卡数时默认八卡；缩减卡数时需显式设置并允许迁移。
 
-动作 CE 对碰撞恢复、STOP 样本的加权在整个分布式 rollout 上归一化。PPO 使用实际 APOS、OPOS、当前动作的联合概率，专家覆盖动作与 greedy DAgger 不使用伪造的 on-policy 概率。四步规划只用专家连续轨迹后续三步作辅助监督，跨 STOP、episode 或 rollout 边界的标签屏蔽；部署执行当前一步后重新观测规划。
+OVSegDT 的 [DAgger+PPO 配置](../third_party/OVSegDT/config/experiments/transformer_dagger_ppo_no_segm_loss.yaml) 使用 `total_num_steps=1000000000`、每环境 rollout 100 步；这是配置预算，不代表已核实其发布权重实际训练了十亿步。当前 update 10000 累计 20,038,920 条环境转移，其中从 9720 开始的 HINT 条件监督只有 672,000 条。保持八卡训练到 20000 将再采集 24,000,000 条，累计 44,038,920 条。近期训练约 34 秒 / update，新增预算约 94 小时，另加评估与保存时间。延长预算不重置 Adam、采样器或 PPO 计划；是否改善按固定评估案例的双设置成绩判断。
+
+动作 CE 对碰撞恢复、STOP 样本的加权在整个分布式 rollout 上归一化。PPO 使用实际 APOS、OPOS、当前动作的联合概率，专家覆盖动作与 greedy DAgger 不使用伪造的 on-policy 概率。四步规划采用下述因果监督，部署执行当前一步后重新观测规划。
+
+## 学生轨迹上的未来动作监督
+
+从完整 update 10380 建立新分支，`trainer.future_action_supervision=executed_prefix`。原配方只在专家流上训练未来三步，规划头缺少学生实际发生的错误和恢复状态。新配方在三路流中均监督“执行 a_t 后，实际下一状态的教师动作”，更远两步只保留教师前缀与实际执行一致的部分，不把连续错误学生动作作为真值。STOP、episode、rollout 和 HINT 候选绑定边界均截断，未来监督在全局有效帧上归一化，loss 系数继续为 0.25。
+
+```bash
+# 仅用于首次建立分支；已有本分支时使用上面的 --resume
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 STREAMNAV_WORLD_SIZE=8 \
+  bash scripts/start_pointcot_training.sh \
+  --fork-from runs/qwen35_pointcot_hint_conditioned/checkpoints/update_0010380 --keep-schedule
+```
+
+分支保留相同基座、adapter、Adam、8 个 rank 的采样状态和 `schedule_origin_update=1403`，首次先做双设置评估，再开始更新。重点监控 `future_action_target_counts`、`future_action_label_density`、四个 horizon 的准确率、回放误差和固定案例成功率。首个 horizon 的计数涵盖三路当前教师标签，但未来 loss 只作用于后三个 horizon。
+
+冻结相同 update 10380、相同 36 个原始起点、batch=1，四个候选各跑有／无 HINT，共 288 条闭环轨迹：
+
+| 推理选择 | no_hint 成功 | simulated_hint 成功 | 有提示最长左右交替 ≥100 的案例 | 有提示误停 |
+|---|---:|---:|---:|---:|
+| 原策略 | 14/36 | 19/36 | 4 | 7 |
+| 0.25 短期融合 | 13/36 | 20/36 | 0 | 6 |
+| 融合 + 0.1 到达概率校准 | 12/36 | 21/36 | 0 | 5 |
+| 仅连续非空 HINT 帧融合 | 14/36 | 19/36 | 2 | 9 |
+
+前三组新控制器均未通过预设回归标准：全局融合降低无提示成功率；HINT 限制版有提示 SPL 从 0.3411 降至 0.3276、误停增多。最后一组的 36 条 no_hint 完整动作序列与原策略一致，但不代表有提示也无回归。当前保留原动作选择，`temporal_action_weight=arrival_stop_weight=0`；代码保留为显式对照开关，先训练规划头后再验证。它们不是已经证实提升的默认功能。
+
+对照视频和逐步 trace 见 [实验页](../runs/temporal_policy_validation_20261020/index.html)，逐项回归标准见同目录 `comparison.json`。这些是同权重推理对照，不是新分支训练后的成功率。真实 GPU 的混合流回放与规划梯度校验见 `replay_validation.json`。
 
 ## 场景、起点与提示
 
@@ -42,6 +70,26 @@ LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-
 训练 reset 按 episode 选择 50% 原始起点、20% 距目标合法视点 geodesic 0.75–3 m 的 near 起点、10% 距离 0–0.25 m 的 ready 起点、20% 距离 0.25–0.75 m 的 boundary 起点。near 有 50% 概率朝向目标；ready 与 boundary 使用相同的相机朝向/俯仰对齐和实例可见性检查，让阈值两侧的视觉条件可比较。boundary 的实际测地距离必须在成功范围外。采样失败保留原始起点。比例针对 reset，不代表转移或 STOP 标签比例。评估只用原始起点。
 
 每 rank 的 sampler 按约 2000 次环境 step 驻留场景，带 20% jitter。约一半 episode 全程 NULL，其余用训练实例点模拟提示，并加入 20% 缺失、±1 格内部扰动、1% 随机误报。NULL 只表示没有外部信息，目标可见时仍监督 OPOS 像素位置。训练深度与实例图仅用于生成标签，不进入策略输入。
+
+### 父分支的 HINT 条件监督
+
+[pointcot_hint_conditioned.yaml](../configs/pointcot_hint_conditioned.yaml) 从旧运行 update 9720 开启 `trainer.object_hints.conditioned_supervision`，旧配方保留为 `configs/pointcot.yaml`。它先绑定实际提示指向的候选，再生成一致的 APOS / OPOS / 动作监督，见 [Point CoT](perception.md)。当前 temporal 分支继续保留该监督。配方变更必须使用 `--fork-from --keep-schedule`，不能作为原配方的 exact resume；原检查点与运行目录保留。
+
+```bash
+source scripts/env.sh
+# 先验证真实教师路线、提示缺失延续、全 NULL 标签与旧教师一致
+CUDA_VISIBLE_DEVICES=0 python tools/validate_hint_conditioning.py
+# 历史父分支的首次启动示例；当前活动分支请使用上面的 temporal 入口
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 STREAMNAV_WORLD_SIZE=8 \
+  STREAMNAV_RUN_DIR=runs/qwen35_pointcot_hint_conditioned \
+  bash scripts/start_pointcot_training.sh \
+  --config configs/pointcot_hint_conditioned.yaml \
+  --fork-from runs/qwen35_pointcot_opos_hint/checkpoints/update_0009720 --keep-schedule --allow-world-size-change
+```
+
+`hint_route_active_fraction` 表示实际使用候选接近监督的帧比例，包含此前获得提示但本帧为 NULL 的情况；`hint_route_fallback_count` 记录候选或路线不可执行而退回原教师的次数。它们不等同于非空输入比例 `object_hint_fraction`。首次对照保留原训练比例和奖励，避免把候选绑定与起点采样、学习率变更混在一起。后续是否提高提示接近片段覆盖，应根据分支的有 / 无提示评估决定。
+
+教师闭环测试只验证标签与执行链路，不是模型成功率。分支启动前保留原权重，先记录同权重双设置基线，再比较续训后的同组原始起点；评估 no_hint SR / SPL、STOP、碰撞和 simulated_hint 成绩后再决定是否采用。仅 HINT 成绩上升不能证明能力保留。
 
 ## 计算与回放校验
 
@@ -66,17 +114,17 @@ LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-
 ```bash
 # 六卡检查点扩为八卡，或其他显式卡数迁移
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/start_eight_gpu_training.sh \
-  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest \
+  --resume runs/qwen35_pointcot_temporal/checkpoints/latest \
   --allow-world-size-change --skip-initial-eval
 # 缩为六卡
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 STREAMNAV_WORLD_SIZE=6 \
   bash scripts/start_pointcot_training.sh \
-  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest \
+  --resume runs/qwen35_pointcot_temporal/checkpoints/latest \
   --allow-world-size-change --skip-initial-eval
 # 缩为四卡
 CUDA_VISIBLE_DEVICES=0,1,2,3 STREAMNAV_WORLD_SIZE=4 \
   bash scripts/start_pointcot_training.sh \
-  --resume runs/qwen35_pointcot_opos_hint/checkpoints/latest \
+  --resume runs/qwen35_pointcot_temporal/checkpoints/latest \
   --allow-world-size-change --skip-initial-eval
 ```
 
@@ -86,9 +134,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 STREAMNAV_WORLD_SIZE=4 \
 
 每次评估在相同原始起点分别运行 `no_hint` 与 `simulated_hint`。每 split 日常固定 12 条，每 500 update 扩为 48 条，最多 500 步；每卡最多 8 个并行环境，日常最多 2 个。模拟提示只在当前目标可见且实例标签有效时给干净内部点，其余为 NULL；它不代表真实检测器性能。
 
-无提示指标写 `eval_metrics.jsonl`，作为 best / health 主成绩；有提示写 `eval_hint_metrics.jsonl`。SR 采用 geodesic 距离 <0.25 m 且执行 STOP，`success_strict_0_1` 是另外的 0.1 m 口径。`oracle_success` 表示这条模型轨迹曾进入成功距离，不是另跑专家的成功率。
+无提示指标写 `eval_metrics.jsonl`，继续用于自主导航 health 检查；有提示写 `eval_hint_metrics.jsonl`，用于 best 选择（`eval.best_setting=simulated_hint`）。SR 采用 geodesic 距离 <0.25 m 且执行 STOP，`success_strict_0_1` 是另外的 0.1 m 口径。`oracle_success` 表示这条模型轨迹曾进入成功距离，不是另跑专家的成功率。
 
-较大评估包含同样的日常前 12 条，单列 `selection_success`；best 按这组固定 anchor 的三个 split 平均 SR 选择。比较总体成绩时区分 36 与 144 条；已有小样本 best 不等于更大评估上的最优模型。训练混合近目标起点的成功率不能替代原始起点评估。
+较大评估包含同样的日常前 12 条，单列 `selection_success`；best 按 simulated_hint 下这组固定 anchor 的三个 split 平均 SR 选择。比较以整数成功数构成的精确分数计算，同分不替换，SPL 不参与排名。切换 setting 时从仍有完整权重的历史评估重新选择；已被清理的历史高分只记录在 `best_selection_changes.jsonl`，不能作为可加载权重。`best_evaluation.json` 显式记录 `selection_setting` 和精确分数。
+
+比较总体成绩时区分 36 与 144 条；已有小样本 best 不等于更大评估上的最优模型。训练混合近目标起点的成功率不能替代原始起点评估。
 
 每个设置 / split 保存两个固定视频，共 12 个，目录为 `evaluation/update_XXXXXXX/{no_hint,simulated_hint}/`，包含 MP4、trace、播放页和汇总。点位与标注口径见 [部署文档](deployment.md)。独立评估应指定新的 `run_dir`，保留活动训练的原始评估结果。
 

@@ -1,10 +1,12 @@
 # 推理、延迟与视频
 
-模型配置为 [pointcot.yaml](../configs/pointcot.yaml)，检查点格式为 `qwen35-pointcot-adapters-v1`。部署需要官方基座 `checkpoints/qwen35_0p8b_base` 和导航 adapter；加载时校验基座 revision、参数名称、形状和权重校验和。导航模型入口为 `runs/qwen35_pointcot_opos_hint/checkpoints/{latest,best}`：`latest` 是最近保存的训练状态，`best` 是固定验证集选中的候选，两者的 update 以各自 `manifest.json` 为准。Grounding 权重用于导航初始化，不作为训练完成的导航模型。
+模型配置为 [pointcot_temporal.yaml](../configs/pointcot_temporal.yaml)，检查点格式为 `qwen35-pointcot-adapters-v1`。部署需要官方基座 `checkpoints/qwen35_0p8b_base` 和导航 adapter；加载时校验基座 revision、参数名称、形状和权重校验和。导航模型入口为 `runs/qwen35_pointcot_temporal/checkpoints/{latest,best}`：`latest` 是最近保存的训练状态，`best` 是 simulated_hint 固定验证集选中的候选，两者的 update 以各自 `manifest.json` 为准。父分支 `runs/qwen35_pointcot_hint_conditioned/checkpoints/update_0010380` 保留作回退；新分支候选需同时检查有／无提示成绩。Grounding 权重用于导航初始化，不作为训练完成的导航模型。
 
 ## 单步接口
 
-每个 episode 调用 `start_episode(uid, instruction)`，随后每步输入当前 uint8 RGB 和该 episode 的状态，输出 APOS、OPOS、六动作 logits、value、四步计划和下一状态。跨帧只保留 KDA，加载新权重或切换 episode 后重置缓存。规划执行当前一步，下一帧重新规划。
+每个 episode 调用 `start_episode(uid, instruction)`，随后每步输入当前 uint8 RGB 和该 episode 的状态，输出 APOS、OPOS、六动作 logits、value、四步计划和下一状态。加载新权重或切换 episode 后重置缓存。当前执行一步后重新观测，不排队执行未来 STOP。
+
+动作融合为可选实验开关，当前配置权重为 0。启用时还保存上一帧对本时刻的六动作概率（24 字节）；`action_logits` 是实际 greedy 选择分数，`current_action_logits` 是原始当前动作分数，`selected_action_tokens` 与已写入 KDA 的动作一致。单步或 batch API 可传 `previous_collision=true` 表示上一动作碰撞，在处理当前帧前清空旧规划概率而保留 KDA。内置 Habitat、训练和评估已自动反馈碰撞。`temporal_action_requires_hint=true` 时仅连续非空提示帧融合，NULL 和随机 PPO 不参与该选择器。
 
 `forward_batch(..., hint_tokens=[k,...])` 每帧只接受一个可选提示：1–1296 表示图像 48×27 网格的坐标，0 表示独立可学习输入 NULL；NULL 不等于输出端表示不可见的 OPOS_0。模型不依赖历史图片、深度、语义图、地图、真值距离或教师。
 
@@ -30,7 +32,7 @@ RTX 4090、当前参数 / 计算配置下，已记录的单卡推理延迟如下
 ```bash
 source scripts/env.sh
 CUDA_VISIBLE_DEVICES=0 python tools/benchmark_hint_eval.py \
-  --checkpoint runs/qwen35_pointcot_opos_hint/checkpoints/best \
+  --checkpoint runs/qwen35_pointcot_temporal/checkpoints/best \
   --batch 1 --warmup 8 --iterations 40
 ```
 
@@ -43,11 +45,13 @@ make viewer
 # http://127.0.0.1:8765/evaluation/
 # 独立评估写入新目录，保留训练原始记录
 python -m streamnav.evaluation.runner \
-  checkpoint=runs/qwen35_pointcot_opos_hint/checkpoints/best \
+  checkpoint=runs/qwen35_pointcot_temporal/checkpoints/best \
   run_dir=runs/manual_navigation_eval
 ```
 
 视频目录为 `RUN_DIR/evaluation/update_XXXXXXX/{no_hint,simulated_hint}/`，包含 MP4、逐步 trace、播放页和 split 汇总。APOS 荧光绿、预测 OPOS 洋红、外部提示橙色，均加白边并与当前帧对齐。HINT 方框是单点标记，尺寸不表示目标边界。NONE、LEFT/RIGHT、STOP 等特殊 token 不伪造像素点；四步计划在预测 STOP 处截断。
+
+实验性融合改变本帧动作时，视频显示亮青色 `PLAN FUSION`，trace 记录 `temporal_action_changed` 与原始当前动作概率。该标记只说明控制器改变了选择，不表示动作正确。
 
 画面与 trace 的 GT-O、hint 来源用于诊断，不进入无提示输入。没有洋红点时先看 `opos`：0 表示实际预测 NONE，导航成功不要求输出位置点。`simulated_hint` 使用干净的实例内部点，只反映理想点提示，不代表真实检测器。可用 `tools/audit_eval_pointing.py --run-dir RUN_DIR --update UPDATE` 重放保存动作核验标记对齐。
 

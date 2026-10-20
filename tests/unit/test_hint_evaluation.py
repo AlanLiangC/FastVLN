@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from streamnav.evaluation import runner
@@ -80,3 +81,30 @@ def test_serving_routes_one_hint_and_resets_without_leaking_session_state():
     assert [r["object_hint_token"] for r in results] == [0, 649]
     manager.reset(a, "lamp")
     assert manager.sessions[a].state.step_index == 0
+
+
+def test_best_can_use_hint_while_both_settings_keep_the_same_fixed_anchors(tmp_path, monkeypatch):
+    calls = []
+
+    def evaluate(policy, config, update, episodes, max_steps, video, setting):
+        calls.append((setting, config["eval"]["episodes"], config["eval"]["selection_episodes"]))
+        path = Path(config["run_dir"]) / "evaluation" / f"update_{update:07d}"
+        path.mkdir(parents=True, exist_ok=True)
+        return {"seen": {"success": 0.25 if setting == "no_hint" else 0.75}}
+
+    monkeypatch.setattr(runner, "_evaluate_setting", evaluate)
+    config = {
+        "run_dir": str(tmp_path),
+        "eval": {
+            "settings": ["no_hint", "simulated_hint"],
+            "best_setting": "simulated_hint",
+            "episodes": 12,
+            "full_episodes": 48,
+        },
+    }
+    results = runner.evaluate(None, config, update=9500)
+    assert results["seen"]["success"] == 0.75
+    assert calls == [("no_hint", 48, 12), ("simulated_hint", 48, 12)]
+    config["eval"]["settings"] = ["no_hint"]
+    with pytest.raises(ValueError, match="included"):
+        runner.evaluate(None, config)

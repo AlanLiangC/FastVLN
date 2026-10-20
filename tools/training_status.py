@@ -22,7 +22,7 @@ def rows(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default="runs/qwen35_pointcot_opos_hint")
+    parser.add_argument("--root", default="runs/qwen35_pointcot_temporal")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     reports = []
@@ -97,6 +97,8 @@ def main():
                         "opos_hint_visible_detection_hits",
                         "opos_hint_visible_location_hits",
                         "object_hint_fraction",
+                        "hint_route_active_fraction",
+                        "hint_route_fallback_count",
                     )
                 }
                 if "apos_geometry_labels" in last
@@ -144,7 +146,8 @@ def main():
                 if best.get("selection_metric") == "fixed_anchor_success"
                 else "macro_SR"
             )
-            print(f"  best: update={best['update']} {metric}={score:.4f}")
+            setting = best.get("selection_setting", "no_hint")
+            print(f"  best: update={best['update']} setting={setting} {metric}={score:.4f}")
         if report["grounding_evaluation"]:
             evaluation = report["grounding_evaluation"]
             print(

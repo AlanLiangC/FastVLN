@@ -18,6 +18,10 @@ def batch_steps(manager, requests, max_batch_size=8):
     with manager.lock:
         manager._expire()
         sessions = [manager.sessions[sid] for sid in ids]
+        for request, session in zip(requests, sessions, strict=True):
+            session.state = session.state.after_action(
+                bool(request[3]) if len(request) > 3 else False
+            )
         hints = [
             object_hint_token(
                 request[2] if len(request) > 2 else None,

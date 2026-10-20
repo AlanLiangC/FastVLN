@@ -1,0 +1,224 @@
+seed: 2025
+device: cuda:0
+run_dir: runs/qwen35_pointcot_hint_conditioned
+model:
+  family: qwen35_pointcot
+  checkpoint: checkpoints/qwen35_0p8b_base
+  dtype: bfloat16
+  language_compute_dtype: float32
+  float32_matmul_precision: high
+  point_decoding: flat
+  apos_decoding: hierarchical
+  opos_decoding: hierarchical
+  future_action_steps: 4
+  object_hint_token: true
+  arrival_head: true
+  action_dim: 6
+  image_size:
+  - 256
+  - 448
+  lora_rank: 8
+  lora_alpha: 16
+  gate_rank: 8
+  gradient_checkpointing: false
+  inference_cuda_graphs: true
+  cache_frame_templates: true
+  inference_mode: frame_local_native_plus_kda
+  vision_compute_dtype: float32
+data:
+  iterator_options:
+    max_scene_repeat_steps: 2000
+    step_repetition_range: 0.2
+  sources:
+  - manifest: runtime/data/manifests/hm3d_ovon_train.json
+    weight: 1.0
+trainer:
+  num_updates: 20000
+  num_envs: 3
+  num_expert_envs: 1
+  num_dagger_envs: 1
+  rollout_steps: 100
+  sequence_length: 20
+  replay_mode: packed
+  split_teacher_replay: true
+  overlap_perception_oracle: true
+  ppo_num_mini_batches: 2
+  learning_rates:
+    lora: 1.0e-05
+    memory: 5.0e-05
+    point: 5.0e-05
+    action: 0.00015
+    critic: 0.00015
+    planning: 0.0003
+    hint: 0.0001
+    arrival: 0.0001
+  object_hints:
+    episode_probability: 0.5
+    noise:
+      dropout: 0.2
+      jitter: 1
+      false_positive: 0.01
+      constrain_to_support: true
+    conditioned_supervision:
+      enabled: true
+      memory_steps: 40
+  warmup_updates: 50
+  schedule_from_fork: true
+  expert_warmup_probability: 0.0
+  ppo_ramp_updates: 200
+  ppo_weight: 0.25
+  recovery_il_weight: 3.0
+  stop_il_weight: 1.0
+  arrival_loss_coef: 0.2
+  stop_calibration_coef: 0.1
+  apos_stop_calibration_coef: 0.05
+  stop_hard_negative_coef: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.005
+  max_grad_norm: 1.0
+  replay_tolerance: 0.05
+  checkpoint_interval: 5
+  eval_interval: 100
+  keep_checkpoints: 2
+  supervision:
+    stale_seconds: 3600
+    min_updates: 200
+    zero_sr_patience: 5
+    stop_on_failure: true
+  point_il_coef: 0.25
+  opos_supervision:
+    anchor_weight: 0.2
+    balanced_visibility: true
+    visibility_balance_power: 0.5
+  point_supervision_prefix: actual
+  apos_type_il_coef: 0.0
+  apos_forward_intent_coef: 1.0
+  future_action_loss_coef: 0.25
+  grounding_coef: 0.5
+  grounding_batch_size: 4
+  bootstrap_time_limits: false
+  ppo_clip: 0.2
+  teacher_action_mix: 0.5
+eval:
+  manifests:
+  - runtime/data/manifests/hm3d_ovon_val_seen.json
+  - runtime/data/manifests/hm3d_ovon_val_seen_synonyms.json
+  - runtime/data/manifests/hm3d_ovon_val_unseen.json
+  episodes: 12
+  full_episodes: 48
+  full_eval_interval: 500
+  settings:
+  - no_hint
+  - simulated_hint
+  best_setting: simulated_hint
+  hint_noise:
+    dropout: 0.0
+    jitter: 0
+    false_positive: 0.0
+    constrain_to_support: true
+  max_steps: 500
+  video: true
+  num_envs: 8
+  stratified: true
+  video_episodes: 2
+  video_selection: first
+  video_anchor_episodes: 1
+habitat:
+  python: runtime/habitat-env/bin/python
+  allow_sliding: true
+  gpu_device_id: 0
+  width: 480
+  height: 270
+  sensor_height: 0.88
+  sensor_pitch_deg: 0.0
+  hfov: 120
+  agent_height: 0.88
+  agent_radius: 0.18
+  navmesh_agent_max_climb: 0.1
+  navmesh_cell_height: 0.05
+  navmesh_cache: runtime/cache/navmesh
+  forward_step: 0.25
+  turn_angle: 30
+  tilt_angle: 30
+  oracle: objnav_explorer
+  oracle_execution: collision_safe
+  oracle_success_stop: true
+  oracle_config:
+    map_resolution: 128
+    beeline_dist_thresh: 3.5
+    visibility_dist: 3.0
+    area_thresh: 1.5
+  success_distance: 0.25
+  max_episode_steps: 500
+  timeout_s: 120
+  perception_labels: true
+  perception_object_labels: true
+  object_label_source: semantic_instance
+  semantic_dataset_config: runtime/data/scene_datasets/hm3d/hm3d_annotated_basis.scene_dataset_config.json
+  opos_min_visible_pixels: 9
+  reward:
+    success_reward: 5.0
+    slack_penalty: 0.001
+    progress_scale: 0.1
+    collision_penalty: 0.03
+    false_stop_penalty: 5.0
+distributed:
+  gpu_offset: 0
+  world_size: 8
+  gradient_sync: manual
+curriculum:
+  original_probability: 0.5
+  near_probability: 0.2
+  ready_probability: 0.1
+  boundary_probability: 0.2
+  near_distance:
+  - 0.75
+  - 3.0
+  ready_distance:
+  - 0.0
+  - 0.25
+  boundary_distance:
+  - 0.25
+  - 0.75
+  boundary_goal_facing_probability: 1.0
+  goal_facing_probability: 0.5
+grounding:
+  train_manifest: runtime/data/grounding/public_v2/train.jsonl
+  val_manifest: runtime/data/grounding/public_v2/val.jsonl
+  pretrain_updates: 2000
+  batch_size: 32
+  learning_rates:
+    lora: 1.0e-05
+    memory: 1.0e-05
+    point: 5.0e-05
+    action: 0.0003
+    critic: 0.0003
+  eval_interval: 200
+  val_samples: 1536
+  visualization_cases: 32
+  checkpoint_interval: 200
+  keep_checkpoints: 2
+  pretrain_epochs: 3.0
+  source_weights:
+    coco-instance: 0.38
+    referring: 0.48
+    scannet-instance: 0.11
+    imagenet-loc: 0.02
+    pixmo-points: 0.01
+  gradient_checkpointing: false
+  absence_probability: 0.025
+  anchor_weight: 0.2
+  point_radius: 0.025
+  best_metric: macro_visible_grounding_accuracy
+  best_min_absence_accuracy: 0.85
+  warmup_updates: 25
+  min_lr_ratio: 0.1
+checkpoint: null
+serving:
+  host: 127.0.0.1
+  port: 8765
+  max_sessions: 16
+  session_ttl_s: 900
+  max_batch_size: 8
+  reload_on_demo_reset: true
+  demo_episodes: 48

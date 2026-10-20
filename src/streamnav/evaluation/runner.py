@@ -28,6 +28,7 @@ from streamnav.evaluation.video_cases import (
 )
 from streamnav.training import distributed as parallel
 from streamnav.training.checkpoint import load_policy
+from streamnav.training.navigation_selection import best_setting
 from streamnav.training.object_hints import evaluation_object_hint_packet
 from streamnav.utils.logging import append_json
 from streamnav.utils.progress import write_worker_progress
@@ -44,6 +45,9 @@ def video_frame(
     if perception is not None:
         draw_pointing_overlay(canvas, perception, (width, height))
     draw = ImageDraw.Draw(canvas)
+    if perception is not None and perception.get("temporal_action_changed"):
+        draw.rounded_rectangle((width - 138, 5, width - 5, 25), radius=4, fill="#39e7ff")
+        draw.text((width - 132, 8), "PLAN FUSION", fill="#071422")
     draw.multiline_text(
         (10, height + 4), "\n".join(textwrap.wrap(instruction, 65)[:2]), fill="white"
     )
@@ -137,6 +141,9 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
         return _evaluate_setting(policy, config, update, episodes, max_steps, video)
     if "no_hint" not in settings or len(set(settings)) != len(settings):
         raise ValueError("Evaluation settings must include one no_hint primary setting")
+    selection = best_setting(config)
+    if selection not in settings:
+        raise ValueError("Best setting must be included in evaluation settings")
     results = {}
     for setting in settings:
         if setting not in ("no_hint", "simulated_hint"):
@@ -156,7 +163,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
             '<meta charset="utf-8"><h1>Evaluation settings</h1>'
             + "".join(f'<p><a href="{s}/index.html">{s}</a></p>' for s in settings)
         )
-    return results["no_hint"]
+    return results[selection]
 
 
 @torch.no_grad()
@@ -476,7 +483,10 @@ def _evaluate_setting(
                             strict=True,
                         ):
                             before = observations[i]
-                            states[i], observations[i] = state, observation
+                            states[i], observations[i] = (
+                                state.after_action(observation.get("collision", False)),
+                                observation,
+                            )
                             cache_bytes = state_bytes(state)
                             episode = batch[i][1]
                             forward_collision_streaks[i] = (

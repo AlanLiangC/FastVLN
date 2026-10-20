@@ -15,6 +15,10 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from streamnav.contracts.state import LayerState, StreamingState
+from streamnav.models.point_cot.action_selection import (
+    calibrated_action_logits,
+    temporal_greedy_logits,
+)
 from streamnav.models.point_cot.adapters import KDAMemory, LoRALinear
 from streamnav.models.point_cot.delta import StreamingGatedDeltaNet
 from streamnav.models.point_cot.inference_graphs import InferenceGraphs
@@ -75,6 +79,7 @@ class TokenStep:
     state: StreamingState
     action_plan_logits: torch.Tensor | None = None
     arrival_logits: torch.Tensor | None = None
+    decision_logits: torch.Tensor | None = None
 
     @property
     def log_prob(self):
@@ -165,6 +170,17 @@ class Qwen35PointCoTPolicy(nn.Module):
         self.future_action_steps = self.settings.get("future_action_steps", 1)
         if not 1 <= self.future_action_steps <= 8:
             raise ValueError("Action horizon must be in [1, 8]")
+        self.temporal_action_weight = float(self.settings.get("temporal_action_weight", 0.0))
+        self.temporal_action_requires_hint = bool(
+            self.settings.get("temporal_action_requires_hint", False)
+        )
+        self.arrival_stop_weight = float(self.settings.get("arrival_stop_weight", 0.0))
+        if not 0 <= self.temporal_action_weight < 1 or not 0 <= self.arrival_stop_weight <= 1:
+            raise ValueError("Invalid action selection weights")
+        if self.temporal_action_weight and self.future_action_steps < 2:
+            raise ValueError("Temporal action fusion requires a next-step planning head")
+        if self.arrival_stop_weight and not self.settings.get("arrival_head", False):
+            raise ValueError("Arrival STOP calibration requires an arrival head")
         self.action_token_strings = tuple(
             f"<nav_{name}>" for name in ("stop", "forward", "left", "right", "up", "down")
         )
@@ -758,8 +774,11 @@ class Qwen35PointCoTPolicy(nn.Module):
         opos_logits = self.output_projection(context.hidden, self.opos_rows)
         opos = choose(opos_logits, 1)
         context = self.append_batch(context, self.opos_rows[opos])
-        action_logits = self.output_projection(context.hidden, self.action_rows, self.action_bias)
-        actions = choose(action_logits, 2)
+        action_logits = self.project_actions(context.hidden, arrival)
+        decision_logits = self.greedy_action_logits(
+            action_logits, states, greedy, [f.hint_token for f in features]
+        )
+        actions = choose(decision_logits, 2)
         context = self.append_batch(context, self.action_rows[actions])
         plans = self.plan_logits(action_logits, context.hidden)
         return [
@@ -775,10 +794,16 @@ class Qwen35PointCoTPolicy(nn.Module):
                     tuple(
                         LayerState(None, s.recurrent[i : i + 1]) if s.recurrent is not None else s
                         for s in context.memory
-                    )
+                    ),
+                    next_action_probabilities=plans[i, 1].softmax(-1).detach()
+                    if self.temporal_action_weight
+                    and plans is not None
+                    and (not self.temporal_action_requires_hint or features[i].hint_token > 0)
+                    else None,
                 ),
                 plans[i] if plans is not None else None,
                 arrival[i] if arrival is not None else None,
+                decision_logits[i],
             )
             for i in range(count)
         ]
@@ -801,6 +826,31 @@ class Qwen35PointCoTPolicy(nn.Module):
         # between token-at-a-time sampling and batched PPO probability replay.
         with torch.autocast(self.device.type, enabled=False):
             return F.linear(hidden.float(), rows, bias)
+
+    def project_actions(self, hidden, arrival):
+        logits = self.output_projection(hidden, self.action_rows, self.action_bias)
+        return calibrated_action_logits(logits, arrival, self.arrival_stop_weight)
+
+    def greedy_action_logits(self, logits, states, greedy, hints=None):
+        # Fusion is a deterministic selector for greedy DAgger/evaluation only.
+        # Pure stochastic PPO and its replay retain exactly the same logits.
+        if self.temporal_action_requires_hint:
+            greedy = [
+                g and bool(h) for g, h in zip(greedy, hints or [0] * len(greedy), strict=True)
+            ]
+        if not self.temporal_action_weight or not any(greedy):
+            return logits
+        previous = torch.stack(
+            [
+                s.next_action_probabilities.to(self.device)
+                if s.next_action_probabilities is not None
+                else torch.zeros_like(logits[i])
+                for i, s in enumerate(states)
+            ]
+        )
+        fused = temporal_greedy_logits(logits, previous, self.temporal_action_weight)
+        mask = torch.tensor(greedy, device=logits.device, dtype=torch.bool)
+        return torch.where(mask[:, None], fused, logits)
 
     def read_value(self, hidden):
         with torch.autocast(self.device.type, enabled=False):
@@ -912,9 +962,8 @@ class Qwen35PointCoTPolicy(nn.Module):
         )
         apos_logits = self.output_projection(context.hidden[:, 0], self.apos_rows)
         opos_logits = self.output_projection(context.hidden[:, 1], self.opos_rows)
-        action_logits = self.output_projection(
-            context.hidden[:, 2], self.action_rows, self.action_bias
-        )
+        arrival = self.read_arrival(context.hidden[:, 0])
+        action_logits = self.project_actions(context.hidden[:, 2], arrival)
         value = self.read_value(context.hidden[:, 0])
         final = state
         if resets:
@@ -924,7 +973,21 @@ class Qwen35PointCoTPolicy(nn.Module):
             final_steps = state.step_index + count
         from dataclasses import replace
 
-        final = replace(final, kda_cache=context.memory, step_index=final_steps)
+        plans = (
+            self.plan_logits(action_logits, context.hidden[:, 3])
+            if self.future_plan is not None
+            else None
+        )
+        final = replace(
+            final,
+            kda_cache=context.memory,
+            step_index=final_steps,
+            next_action_probabilities=plans[-1, 1].softmax(-1).detach()
+            if self.temporal_action_weight
+            and plans is not None
+            and (not self.temporal_action_requires_hint or features[-1].hint_token > 0)
+            else None,
+        )
         return TokenStep(
             torch.stack([t[0] for t in tokens]),
             torch.stack([t[1] for t in tokens]),
@@ -934,14 +997,12 @@ class Qwen35PointCoTPolicy(nn.Module):
             action_logits,
             value,
             final,
-            self.plan_logits(action_logits, context.hidden[:, 3])
-            if self.future_plan is not None
-            else None,
-            self.read_arrival(context.hidden[:, 0]),
+            plans,
+            arrival,
         )
 
-    def action_logits(self, context):
-        return self.output_projection(context.hidden, self.action_rows, self.action_bias).squeeze(0)
+    def action_logits(self, context, arrival=None):
+        return self.project_actions(context.hidden, arrival).squeeze(0)
 
     def step(self, feature, state, *, tokens=None, deterministic=False):
         context = self.begin(feature, state)
@@ -969,13 +1030,23 @@ class Qwen35PointCoTPolicy(nn.Module):
             )
         )
         context = self.append(context, self.opos_rows[opos])
-        logits = self.action_logits(context)
+        logits = self.action_logits(context, arrival)
+        decision_logits = self.greedy_action_logits(
+            logits[None], [state], [deterministic], [feature.hint_token]
+        )[0]
         action = (
             tokens[2]
             if tokens is not None and tokens[2] is not None
-            else (logits.argmax() if deterministic else Categorical(logits=logits).sample())
+            else (
+                decision_logits.argmax() if deterministic else Categorical(logits=logits).sample()
+            )
         )
         context = self.append(context, self.action_rows[action])
+        plans = (
+            self.plan_logits(logits.unsqueeze(0), context.hidden).squeeze(0)
+            if self.future_plan is not None
+            else None
+        )
         return TokenStep(
             apos,
             opos,
@@ -984,11 +1055,17 @@ class Qwen35PointCoTPolicy(nn.Module):
             opos_logits,
             logits,
             value,
-            state.with_cache(context.memory),
-            self.plan_logits(logits.unsqueeze(0), context.hidden).squeeze(0)
-            if self.future_plan is not None
-            else None,
+            state.with_cache(
+                context.memory,
+                next_action_probabilities=plans[1].softmax(-1).detach()
+                if self.temporal_action_weight
+                and plans is not None
+                and (not self.temporal_action_requires_hint or feature.hint_token > 0)
+                else None,
+            ),
+            plans,
             arrival.squeeze(0) if arrival is not None else None,
+            decision_logits,
         )
 
     @contextmanager
@@ -1008,7 +1085,12 @@ class Qwen35PointCoTPolicy(nn.Module):
             self.navigation_features(rgb, states, hint_tokens), states, deterministic=True
         )
         result = (
-            torch.stack([s.action_logits for s in steps]),
+            torch.stack(
+                [
+                    s.decision_logits if s.decision_logits is not None else s.action_logits
+                    for s in steps
+                ]
+            ),
             torch.stack([s.value for s in steps]),
             [s.state for s in steps],
         )
@@ -1021,6 +1103,8 @@ class Qwen35PointCoTPolicy(nn.Module):
                     "apos_tokens": torch.stack([s.apos for s in steps]),
                     "opos_tokens": torch.stack([s.opos for s in steps]),
                     "point_cot": True,
+                    "current_action_logits": torch.stack([s.action_logits for s in steps]),
+                    "selected_action_tokens": torch.stack([s.action for s in steps]),
                     **(
                         {"arrival": torch.stack([s.arrival_logits for s in steps])}
                         if self.arrival_head is not None
@@ -1030,7 +1114,14 @@ class Qwen35PointCoTPolicy(nn.Module):
                     if hint_tokens is not None
                     else [0] * len(states),
                     **(
-                        {"action_plan_logits": torch.stack([s.action_plan_logits for s in steps])}
+                        {
+                            "action_plan_logits": torch.stack(
+                                [
+                                    torch.cat((result[0][i : i + 1], s.action_plan_logits[1:]), 0)
+                                    for i, s in enumerate(steps)
+                                ]
+                            )
+                        }
                         if self.future_plan is not None
                         else {}
                     ),
@@ -1064,6 +1155,10 @@ class Qwen35PointCoTPolicy(nn.Module):
             "point_decoding": self.point_decoding,
             "apos_decoding": self.apos_decoding,
             "opos_decoding": self.opos_decoding,
+            "temporal_action_weight": self.temporal_action_weight,
+            "temporal_action_requires_hint": self.temporal_action_requires_hint,
+            "temporal_action_scope": "greedy_only",
+            "arrival_stop_weight": self.arrival_stop_weight,
             "future_action_steps": self.future_action_steps,
             "object_hint_token": self.supports_object_hints,
             "arrival_head": self.arrival_head is not None,

@@ -32,6 +32,7 @@ class StartRequest(BaseModel):
 class FrameRequest(BaseModel):
     rgb_base64: str = Field(max_length=6_000_000)
     object_hint: dict[str, Any] | None = None
+    previous_collision: bool = False
 
 
 class BatchItem(FrameRequest):
@@ -146,7 +147,12 @@ def create_app(policy, config):
 
     @app.post("/sessions/{session_id}/step")
     def step(session_id: str, request: FrameRequest):
-        return manager.step(session_id, decode_rgb(request.rgb_base64), request.object_hint)
+        return manager.step(
+            session_id,
+            decode_rgb(request.rgb_base64),
+            request.object_hint,
+            request.previous_collision,
+        )
 
     @app.post("/sessions/{session_id}/reset")
     def reset(session_id: str, request: StartRequest):
@@ -162,7 +168,10 @@ def create_app(policy, config):
     def batch(requests: list[BatchItem]):
         return batch_steps(
             manager,
-            [(r.session_id, decode_rgb(r.rgb_base64), r.object_hint) for r in requests],
+            [
+                (r.session_id, decode_rgb(r.rgb_base64), r.object_hint, r.previous_collision)
+                for r in requests
+            ],
             serving["max_batch_size"],
         )
 
@@ -256,7 +265,11 @@ def create_app(policy, config):
         with manager.lock:
             if demo["observation"] is None or demo["observation"].get("done"):
                 raise ValueError("Reset an episode first")
-            prediction = manager.step(demo["session"], demo["observation"]["rgb"])
+            prediction = manager.step(
+                demo["session"],
+                demo["observation"]["rgb"],
+                previous_collision=demo["observation"].get("collision", False),
+            )
             action = NavigationAction(
                 prediction["action"] if request.action is None else request.action
             )

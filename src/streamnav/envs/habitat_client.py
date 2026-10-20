@@ -88,14 +88,18 @@ class HabitatClient:
     def get_oracle_action(self):
         return NavigationAction(self.request("GET_ORACLE_ACTION")["action"])
 
-    def get_oracle_supervision(self):
-        result = self.request("GET_ORACLE_SUPERVISION")
+    def get_oracle_supervision(self, hint_config=None):
+        result = self.request(
+            "GET_ORACLE_SUPERVISION", **({"hint_config": hint_config} if hint_config else {})
+        )
         if result["perception"]["episode_id"] != self.episode_id:
             raise EpisodeMismatchError("Perception labels belong to another episode")
         return result
 
-    def get_object_supervision(self):
-        result = self.request("GET_OBJECT_SUPERVISION")
+    def get_object_supervision(self, hint_config=None):
+        result = self.request(
+            "GET_OBJECT_SUPERVISION", **({"hint_config": hint_config} if hint_config else {})
+        )
         if result.get("episode_id") != self.episode_id:
             raise EpisodeMismatchError("Object labels belong to a different episode")
         return result
@@ -163,15 +167,19 @@ class VectorHabitatEnvs:
 
         return list(self.executor.map(oracle, self.clients))
 
-    def get_oracle_supervisions(self):
-        return [future.result() for future in self.submit_oracle_supervisions()]
+    def get_oracle_supervisions(self, hint_config=None):
+        return [future.result() for future in self.submit_oracle_supervisions(hint_config)]
 
-    def submit_oracle_supervisions(self):
+    def submit_oracle_supervisions(self, hint_config=None):
         """One request per socket; caller must finish these before step/reset."""
 
         def oracle(client):
             try:
-                return client.get_oracle_supervision()
+                return (
+                    client.get_oracle_supervision(hint_config)
+                    if hint_config is not None
+                    else client.get_oracle_supervision()
+                )
             except OracleUnavailableError as exc:
                 return exc
 

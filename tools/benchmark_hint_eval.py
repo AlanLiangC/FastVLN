@@ -17,7 +17,7 @@ from streamnav.training.pointcot_trainer import load_adapters
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, required=True)
-    parser.add_argument("--checkpoint", default="runs/qwen35_pointcot_opos_hint/checkpoints/latest")
+    parser.add_argument("--checkpoint", default="runs/qwen35_pointcot_temporal/checkpoints/latest")
     parser.add_argument("--inputs", default="runtime/fixtures/navigation/rgb_inputs.pt")
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=40)

@@ -208,6 +208,7 @@ class HabitatObjectNavEnv:
         if episode["scene_id"] != self.scene:
             self._make_sim(episode["scene_id"])
         self.episode = episode
+        self.hint_conditioner = None
         # Mixed-start visibility queries carry frame metadata before reset returns.
         self.steps = 0
         self.sim.reset()
@@ -305,19 +306,35 @@ class HabitatObjectNavEnv:
     def _observation(self):
         return np.ascontiguousarray(self._sensor_observations()["rgb"][:, :, :3])
 
-    def oracle_supervision(self):
+    def _hint_supervision(self, config):
+        from hint_conditioning import HintConditionedSupervision
+
+        if self.episode["split"] != "train":
+            raise ValueError("Hint-conditioned teachers are training-only")
+        signature = json.dumps(config, sort_keys=True)
+        if self.hint_conditioner is None:
+            self.hint_conditioner = HintConditionedSupervision(self, config)
+        elif self.hint_conditioner.signature != signature:
+            raise ValueError("Hint supervision configuration changed within an episode")
+        return self.hint_conditioner
+
+    def oracle_supervision(self, hint_config=None):
         if not self.config.get("perception_labels", False) or self.episode["split"] != "train":
             raise ValueError("Perception labels require opt-in training episodes")
         from perception_labels import PerceptionLabeler
 
+        if hint_config is not None:
+            return self._hint_supervision(hint_config).supervision()
         action = self.oracle()
         return {"action": int(action), "perception": PerceptionLabeler(self).labels(action)}
 
-    def object_supervision(self):
+    def object_supervision(self, hint_config=None):
         # Evaluation labels are used by diagnostics and the explicitly named
         # simulated-hint setting, never by no-hint policy inputs.
         from perception_labels import PerceptionLabeler
 
+        if hint_config is not None:
+            return self._hint_supervision(hint_config).object_supervision()
         return PerceptionLabeler(self).object_labels()
 
     def oracle(self):

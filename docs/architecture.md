@@ -1,6 +1,6 @@
 # 架构
 
-唯一活动模型族为 `qwen35_pointcot`，实现见 [policy.py](../src/streamnav/models/point_cot/policy.py)，配置见 [pointcot.yaml](../configs/pointcot.yaml)。它直接加载固定 revision 的官方多模态 [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
+唯一活动模型族为 `qwen35_pointcot`，实现见 [policy.py](../src/streamnav/models/point_cot/policy.py)，配置见 [pointcot_temporal.yaml](../configs/pointcot_temporal.yaml)。它直接加载固定 revision 的官方多模态 [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
 
 ## 当前帧与历史
 
@@ -31,3 +31,9 @@
 PPO 和导航 point CE 使用 rollout 实际生成的两个点与动作历史；动作 IL 另混入标注点前缀的 teacher forcing，不能替换 PPO 前缀，也不能覆盖行为概率。APOS 先按 NONE/POINT/LEFT/RIGHT/STOP 的概率总量选择类别，再在 POINT 内选位置；OPOS 先判定 NONE/POINT，再选择像素位置。两个阶段共同确定真正送入动作预测和缓存的 token。坐标未知的前进样本只约束 APOS 为 NONE 或 POINT 的兼容意图，不生成像素真值。grounding 的每张静态图像都从空缓存开始，不影响导航缓存。
 
 四步计划的第一步是原动作头。追加实际动作 token 后，将其 hidden state 输入 LayerNorm → 128 维瓶颈 → 三个 1024 维残差特征，并共享动作输出表，预测后续三步。该分支没有再次调用语言模型，不追加未来 token，不修改 episode cache。它借鉴 Uni-NaVid 的四动作监督，但采用小型并行预测分支，保持当前帧与 KDA 缓存的接口。
+
+当前 `executed_prefix` 监督覆盖专家、greedy DAgger 和随机 PPO 三路：规划头已读实际执行的 a_t，因此实际下一状态的教师 a*_(t+1) 可用于监督第二步；第三、四步只在中间执行动作与对应教师动作一致时有效。遇到 STOP、episode 终止、候选目标绑定变化或 rollout 末尾即屏蔽后续标签。监督密度在完整分布式 rollout 上归一化，不因扩大覆盖自动放大未来动作 loss 系数。
+
+可选的无参数动作选择器融合当前动作的运动概率与上一帧对本时刻的预测，继续每步读取新 RGB。它只用于 greedy DAgger、评估和部署，随机 PPO 与概率回放始终使用同一原始当前动作分布。实际选中动作先写入 KDA，再生成下一时刻预测。额外状态仅为六个 FP32 概率（24 字节），碰撞时清除，episode 重置时与 KDA 一起重置。可用 `temporal_action_requires_hint` 限制连续非空提示帧；该开关不读取真值可见性。
+
+融合保持当前 STOP 概率，并在 STOP 概率 ≥1/6 时旁路，因此同一观测上的 greedy STOP 判定不变；未来 STOP 不作为待执行命令。可选 `arrival_stop_weight` 将当前 STOP 与当前 READY 概率混合，若启用则采样、训练和回放统一采用该分布。update 10380 的闭环回归未通过，当前两项权重均为 0，到达头继续只做辅助监督与诊断。

@@ -58,15 +58,18 @@ class PerceptionLabeler:
     def __init__(self, env):
         self.env = env
 
-    def object_labels(self):
+    def object_labels(self, goal_ids=None):
         env = self.env
         if env.config.get("object_label_source") != "semantic_instance":
             return {"opos": 0, "opos_valid": False, "opos_confidence": 0.0}
         known = env.semantic_known_ids
-        try:
-            goal_ids = {int(str(g["object_id"]).rsplit("_", 1)[-1]) for g in env.episode["goals"]}
-        except (KeyError, ValueError):
-            goal_ids = set()
+        if goal_ids is None:
+            try:
+                goal_ids = {
+                    int(str(g["object_id"]).rsplit("_", 1)[-1]) for g in env.episode["goals"]
+                }
+            except (KeyError, ValueError):
+                goal_ids = set()
         label = instance_object_label(
             env._sensor_observations()["perception_semantic"],
             goal_ids,
@@ -76,7 +79,7 @@ class PerceptionLabeler:
         label.update(episode_id=env.uid, frame_id=env.steps)
         return label
 
-    def labels(self, action):
+    def labels(self, action, *, navigation_target=None, goal_ids=None):
         env = self.env
         state = env.sim.get_agent(0).get_state()
         camera = state.sensor_states["rgb"]
@@ -111,9 +114,13 @@ class PerceptionLabeler:
                 result.update(apos=APOS_STOP, apos_valid=True, apos_confidence=1.0)
         else:
             target = (
-                env.explorer.current_navigation_target
-                if env.explorer is not None
-                else env.oracle_goal
+                navigation_target
+                if navigation_target is not None
+                else (
+                    env.explorer.current_navigation_target
+                    if env.explorer is not None
+                    else env.oracle_goal
+                )
             )
             point = self.affordance(target, camera, depth, width, height, hfov)
             if point is not None:
@@ -129,7 +136,7 @@ class PerceptionLabeler:
         if not env.config.get("perception_object_labels", True):
             return result
         if env.config.get("object_label_source") == "semantic_instance":
-            result.update(self.object_labels())
+            result.update(self.object_labels(goal_ids))
             return result
         candidates, definitely_out = [], []
         for goal in env.episode["goals"]:

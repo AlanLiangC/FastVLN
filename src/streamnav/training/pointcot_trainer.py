@@ -65,7 +65,13 @@ from streamnav.training.expert_stream import (
     student_rl_weights,
     validate_expert_streams,
 )
-from streamnav.training.object_hints import episode_hint_enabled, simulated_object_hint
+from streamnav.training.navigation_selection import best_setting, ensure_best_setting, update_best
+from streamnav.training.object_hints import (
+    conditioned_hint_config,
+    episode_hint_enabled,
+    simulated_object_hint,
+    summarize_hint_routes,
+)
 from streamnav.training.object_supervision import object_loss_weights, summarize_object_predictions
 from streamnav.training.optimizer_migration import load_optimizer_with_added_groups
 from streamnav.training.point_supervision import (
@@ -92,6 +98,9 @@ def cache_copy(state, device="cpu"):
             )
             for s in state.kda_cache
         ),
+        next_action_probabilities=state.next_action_probabilities.detach().to(device).clone()
+        if state.next_action_probabilities is not None
+        else None,
     )
 
 
@@ -910,6 +919,9 @@ def fork_signature(config):
     recipe["model"].pop("future_action_steps", None)
     recipe["model"].pop("object_hint_token", None)
     recipe["model"].pop("arrival_head", None)
+    recipe["model"].pop("temporal_action_weight", None)
+    recipe["model"].pop("temporal_action_requires_hint", None)
+    recipe["model"].pop("arrival_stop_weight", None)
     # Start-pose sampling changes only in an explicit training recipe fork.
     recipe.pop("curriculum")
     recipe["data"] = dict(recipe["data"])
@@ -971,37 +983,13 @@ def synchronized_optimizer_step(parameters, optimizer, max_grad_norm):
 
 def record_best(config, update, results):
     if parallel.rank() == 0:
-        root = Path(config["run_dir"])
-        score = sum(r.get("selection_success", r["success"]) for r in results.values()) / len(
-            results
-        )
-        best_file = root / "best_evaluation.json"
-        previous = json.loads(best_file.read_text())["success"] if best_file.exists() else -1
-        if score > previous:
-            folder = root / "checkpoints" / f"update_{update:07d}"
-            if not folder.exists():
-                raise RuntimeError("Best evaluation must refer to a saved checkpoint")
-            link = folder.parent / ".best-new"
-            link.unlink(missing_ok=True)
-            link.symlink_to(folder.name)
-            link.replace(folder.parent / "best")
-            best_file.write_text(
-                json.dumps(
-                    {
-                        "update": update,
-                        "success": score,
-                        "selection_metric": "fixed_anchor_success",
-                        "results": results,
-                    },
-                    indent=2,
-                )
-            )
+        update_best(config["run_dir"], update, results, best_setting(config))
     parallel.barrier()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/pointcot.yaml")
+    parser.add_argument("--config", default="configs/pointcot_temporal.yaml")
     parser.add_argument("--run-dir")
     parser.add_argument(
         "--initialize-from", help="Grounding adapters; fresh navigation optimizer and sampler"
@@ -1050,6 +1038,7 @@ def main():
         config["eval"]["max_steps"] = args.eval_max_steps
     parallel.initialize(config)
     cfg = config["trainer"]
+    conditional_hints = conditioned_hint_config(config)
     validate_expert_streams(cfg)
     if any(
         cfg.get(k, 0)
@@ -1117,6 +1106,11 @@ def main():
             raise ValueError(f"{key} must be finite and nonnegative")
     if cfg.get("point_supervision_prefix", "teacher") not in ("actual", "teacher"):
         raise ValueError("Unknown point supervision prefix")
+    if cfg.get("future_action_supervision", "expert_only") not in (
+        "expert_only",
+        "executed_prefix",
+    ):
+        raise ValueError("Unknown future-action supervision mode")
     type_coef = cfg.get("apos_type_il_coef", 0)
     if not math.isfinite(type_coef) or type_coef < 0:
         raise ValueError("APOS type coefficient must be finite and nonnegative")
@@ -1304,6 +1298,8 @@ def main():
     config["source_snapshot"] = snapshot_sources(root)
     if parallel.rank() == 0:
         (root / "resolved_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+        ensure_best_setting(root, best_setting(config))
+    parallel.barrier()
     stop = [False]
 
     def request_stop(signum, frame):
@@ -1360,7 +1356,7 @@ def main():
                     supervisions: list[Any] | None
                     prefetched_features, prefetch_seconds = None, 0.0
                     if geometry and cfg.get("overlap_perception_oracle", False):
-                        pending = envs.submit_oracle_supervisions()
+                        pending = envs.submit_oracle_supervisions(conditional_hints)
                         prefetch_started = time.monotonic()
                         try:
                             # Vision and prompt encoding do not depend on the
@@ -1375,7 +1371,9 @@ def main():
                             wait(pending)
                         supervisions = [future.result() for future in pending]
                     else:
-                        supervisions = envs.get_oracle_supervisions() if geometry else None
+                        supervisions = (
+                            envs.get_oracle_supervisions(conditional_hints) if geometry else None
+                        )
                     experts = (
                         [
                             s
@@ -1408,7 +1406,9 @@ def main():
                             resets[(t, i)] = (episode.uid, episode.goal_text)
                             try:
                                 if supervisions is not None:
-                                    supervisions[i] = envs.clients[i].get_oracle_supervision()
+                                    supervisions[i] = envs.clients[i].get_oracle_supervision(
+                                        conditional_hints
+                                    )
                                     expert = NavigationAction(supervisions[i]["action"])
                                 else:
                                     expert = envs.clients[i].get_oracle_action()
@@ -1423,19 +1423,28 @@ def main():
                     )
                     phase_started = time.monotonic()
                     hint_config = cfg.get("object_hints", {})
-                    hint_tokens = [
-                        simulated_object_hint(
-                            s["perception"], random, **hint_config.get("noise", {})
-                        )
-                        if isinstance(s, dict)
-                        and episode_hint_enabled(
-                            states[i].episode_id,
-                            config["seed"],
-                            hint_config.get("episode_probability", 0.0),
-                        )
-                        else 0
-                        for i, s in enumerate(supervisions or [None] * len(states))
-                    ]
+                    if conditional_hints is not None:
+                        assert supervisions is not None
+                        hint_metadata = [s["hint"] for s in supervisions]
+                    else:
+                        hint_metadata = [{} for _ in states]
+                    hint_tokens = (
+                        [int(hint["token"]) for hint in hint_metadata]
+                        if conditional_hints is not None
+                        else [
+                            simulated_object_hint(
+                                s["perception"], random, **hint_config.get("noise", {})
+                            )
+                            if isinstance(s, dict)
+                            and episode_hint_enabled(
+                                states[i].episode_id,
+                                config["seed"],
+                                hint_config.get("episode_probability", 0.0),
+                            )
+                            else 0
+                            for i, s in enumerate(supervisions or [None] * len(states))
+                        ]
+                    )
                     features = (
                         policy.condition_features(prefetched_features, hint_tokens)
                         if prefetched_features is not None
@@ -1487,6 +1496,9 @@ def main():
                             {
                                 "features": feature.cpu(),
                                 "object_hint_token": feature.hint_token,
+                                "hint_goal_key": hint_metadata[i].get("goal_key"),
+                                "hint_route_active": hint_metadata[i].get("active", False),
+                                "hint_route_fallback": hint_metadata[i].get("fallback"),
                                 "tokens": tuple(
                                     x.cpu() for x in (step.apos, step.opos, step.action)
                                 ),
@@ -1500,6 +1512,8 @@ def main():
                                 "collision_before": bool(observations[i].get("collision", False)),
                                 "episode_id": state.episode_id,
                                 "conditional_greedy_action": int(step.action_logits.argmax()),
+                                "temporal_action_changed": dagger_stream
+                                and int(step.action) != int(step.action_logits.argmax()),
                                 "apos_greedy_token": int(
                                     decode_point_logits(
                                         step.apos_logits,
@@ -1544,7 +1558,7 @@ def main():
                             success=after["success"],
                             truncated=after["truncated"],
                         )
-                        states[i] = step.state
+                        states[i] = step.state.after_action(after["collision"])
                         if after["done"]:
                             metrics.append(
                                 {
@@ -1586,20 +1600,25 @@ def main():
                 if policy.supports_object_hints:
                     object_labels = list(
                         envs.executor.map(
-                            lambda client: client.get_object_supervision(), envs.clients
+                            lambda client: client.get_object_supervision(conditional_hints),
+                            envs.clients,
                         )
                     )
                     hint_config = cfg.get("object_hints", {})
-                    bootstrap_hints = [
-                        simulated_object_hint(label, random, **hint_config.get("noise", {}))
-                        if episode_hint_enabled(
-                            state.episode_id,
-                            config["seed"],
-                            hint_config.get("episode_probability", 0.0),
-                        )
-                        else 0
-                        for label, state in zip(object_labels, states, strict=True)
-                    ]
+                    bootstrap_hints = (
+                        [int(label["object_hint_token"]) for label in object_labels]
+                        if conditional_hints is not None
+                        else [
+                            simulated_object_hint(label, random, **hint_config.get("noise", {}))
+                            if episode_hint_enabled(
+                                state.episode_id,
+                                config["seed"],
+                                hint_config.get("episode_probability", 0.0),
+                            )
+                            else 0
+                            for label, state in zip(object_labels, states, strict=True)
+                        ]
+                    )
                 context = policy.begin_batch(
                     policy.navigation_features(
                         [o["rgb"] for o in observations], states, bootstrap_hints
@@ -1609,7 +1628,11 @@ def main():
                 last = list(policy.read_value(context.hidden).cpu().unbind())
                 rollout_timings["rollout_bootstrap_seconds"] += time.monotonic() - phase_started
             rollout_seconds = time.monotonic() - started
-            attach_future_actions(records, policy.future_action_steps)
+            attach_future_actions(
+                records,
+                policy.future_action_steps,
+                mode=cfg.get("future_action_supervision", "expert_only"),
+            )
             object_fractions = parallel.average_scalar(
                 torch.tensor(
                     [
@@ -1764,6 +1787,7 @@ def main():
                 **rollout_timings,
                 **summarize_rollout(records),
                 **summarize_object_predictions(records),
+                **summarize_hint_routes(records),
                 "update": update,
                 "schedule_update": schedule_update,
                 "ppo_coefficient": ppo_weight,
@@ -1771,6 +1795,10 @@ def main():
                 "num_expert_envs_per_rank": cfg.get("num_expert_envs", 0),
                 "num_dagger_envs_per_rank": cfg.get("num_dagger_envs", 0),
                 "imitation_weight_mean": mean_il_weight,
+                "temporal_action_changes": sum(
+                    r["temporal_action_changed"] for row in records for r in row
+                ),
+                "future_action_label_density": future_density,
                 **split_episode_metrics(metrics),
                 "transitions": tmax * count,
                 "elapsed_seconds": time.monotonic() - started,
@@ -1831,6 +1859,16 @@ def main():
                     num_expert_envs_per_rank=cfg.get("num_expert_envs", 0),
                     num_dagger_envs_per_rank=cfg.get("num_dagger_envs", 0),
                     imitation_weight_mean=mean_il_weight,
+                    temporal_action_changes=sum(m["temporal_action_changes"] for m in all_metrics),
+                    future_action_label_density=future_density,
+                    future_action_supervision=cfg.get("future_action_supervision", "expert_only"),
+                    hint_route_active_fraction=sum(
+                        m["hint_route_active_fraction"] for m in all_metrics
+                    )
+                    / len(all_metrics),
+                    hint_route_fallback_count=sum(
+                        m["hint_route_fallback_count"] for m in all_metrics
+                    ),
                     replay_log_prob_error_max=max(
                         m["replay_log_prob_error_max"] for m in all_metrics
                     ),

@@ -32,11 +32,50 @@ def test_future_labels_stop_at_terminal_and_never_supervise_student_future():
     rows[1][0]["tokens"] = (torch.tensor(0), torch.tensor(0), torch.tensor(2))
     with pytest.raises(ValueError, match="expert-executed"):
         attach_future_actions(rows)
+    with pytest.raises(ValueError, match="expert-executed"):
+        attach_future_actions(rows, mode="executed_prefix")
 
 
 def test_future_labels_do_not_cross_episode_or_rollout_boundary():
     rows = [[record(1)], [record(2, episode="b")]]
     attach_future_actions(rows)
+    assert rows[0][0]["future_actions"] == [1, -100, -100, -100]
+
+
+def test_future_labels_do_not_cross_hint_candidate_or_binding_change():
+    rows = [[record(1)], [record(2)], [record(3)], [record(1)]]
+    for row, key in zip(rows, ("hint:11:1", "hint:11:1", "global", "hint:22:2")):
+        row[0]["hint_goal_key"] = key
+    attach_future_actions(rows)
+    assert rows[0][0]["future_actions"] == [1, 2, -100, -100]
+    assert rows[1][0]["future_actions"] == [2, -100, -100, -100]
+    assert rows[2][0]["future_actions"] == [3, -100, -100, -100]
+
+
+def test_student_next_step_teacher_label_is_valid_after_actual_conditioning_action():
+    rows = [[record(a, expert=False)] for a in (2, 1, 3, 1)]
+    # At t=0 the student executes RIGHT while the teacher wanted LEFT. The
+    # planning head sees actual RIGHT, so teacher action at the next state is valid.
+    rows[0][0]["tokens"] = (torch.tensor(0), torch.tensor(0), torch.tensor(3))
+    rows[2][0]["tokens"] = (torch.tensor(0), torch.tensor(0), torch.tensor(2))
+    attach_future_actions(rows, mode="executed_prefix")
+    assert rows[0][0]["future_actions"] == [2, 1, 3, -100]
+    assert rows[1][0]["future_actions"] == [1, 3, -100, -100]
+    assert rows[2][0]["future_actions"] == [3, 1, -100, -100]
+
+
+def test_student_future_labels_stop_at_reset_stop_and_hint_binding_change():
+    rows = [
+        [record(1, expert=False)],
+        [record(0, expert=False, done=True)],
+        [record(2, expert=False, episode="b")],
+    ]
+    attach_future_actions(rows, mode="executed_prefix")
+    assert rows[0][0]["future_actions"] == [1, 0, -100, -100]
+    assert rows[1][0]["future_actions"] == [0, -100, -100, -100]
+    rows[1][0] = record(1, expert=False)
+    rows[1][0]["hint_goal_key"] = "new-candidate"
+    attach_future_actions(rows, mode="executed_prefix")
     assert rows[0][0]["future_actions"] == [1, -100, -100, -100]
 
 

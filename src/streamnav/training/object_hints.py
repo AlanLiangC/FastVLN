@@ -6,6 +6,34 @@ import random
 from streamnav.contracts.perception import GRID_HEIGHT, GRID_WIDTH
 
 
+def conditioned_hint_config(config):
+    """Explicit recipe fork only; legacy runs retain their original sampling path."""
+    hints = config["trainer"].get("object_hints", {})
+    condition = hints.get("conditioned_supervision", {})
+    if not condition.get("enabled", False):
+        return None
+    if not config["model"].get("object_hint_token", False):
+        raise ValueError("Hint-conditioned supervision requires the hint input token")
+    if (
+        not config["habitat"].get("oracle_success_stop", False)
+        or config["habitat"].get("object_label_source") != "semantic_instance"
+    ):
+        raise ValueError("Hint-conditioned supervision requires success-aligned instance labels")
+    memory = condition.get("memory_steps", 40)
+    if type(memory) is not int or memory < 0:
+        raise ValueError("Hint memory_steps must be a nonnegative integer")
+    return {**hints, "seed": config["seed"]}
+
+
+def summarize_hint_routes(records):
+    flat = [r for row in records for r in row]
+    return {
+        "hint_route_active_fraction": sum(r.get("hint_route_active", False) for r in flat)
+        / max(1, len(flat)),
+        "hint_route_fallback_count": sum(bool(r.get("hint_route_fallback")) for r in flat),
+    }
+
+
 def simulated_object_hint_packet(
     label, rng, *, dropout=0.2, jitter=1, false_positive=0.05, constrain_to_support=False
 ):

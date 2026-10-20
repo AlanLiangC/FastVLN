@@ -16,9 +16,18 @@ class StreamingState:
     instruction_hash: str
     step_index: int
     instruction: str
+    next_action_probabilities: torch.Tensor | None = None
 
-    def with_cache(self, cache):
-        return replace(self, kda_cache=cache, step_index=self.step_index + 1)
+    def with_cache(self, cache, *, next_action_probabilities=None):
+        return replace(
+            self,
+            kda_cache=cache,
+            step_index=self.step_index + 1,
+            next_action_probabilities=next_action_probabilities,
+        )
+
+    def after_action(self, collision=False):
+        return replace(self, next_action_probabilities=None) if collision else self
 
 
 @dataclass

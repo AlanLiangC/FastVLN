@@ -14,6 +14,7 @@ def clone_state(state: StreamingState, detach: bool = True) -> StreamingState:
     return replace(
         state,
         kda_cache=tuple(LayerState(copy(s.conv), copy(s.recurrent)) for s in state.kda_cache),
+        next_action_probabilities=copy(state.next_action_probabilities),
     )
 
 
@@ -23,6 +24,10 @@ def state_bytes(state: StreamingState) -> int:
         for s in state.kda_cache
         for t in (s.conv, s.recurrent)
         if t is not None
+    ) + (
+        state.next_action_probabilities.numel() * state.next_action_probabilities.element_size()
+        if state.next_action_probabilities is not None
+        else 0
     )
 
 
