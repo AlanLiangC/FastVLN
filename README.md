@@ -14,7 +14,7 @@
 | 活动导航训练 | `runs/qwen35_pointcot_temporal` |
 | 最新导航权重 / 续训入口 | `runs/qwen35_pointcot_temporal/checkpoints/latest` |
 | 评估选中的导航权重 | `runs/qwen35_pointcot_temporal/checkpoints/best` |
-| 动作融合对照与视频 | [288 条闭环对照](runs/temporal_policy_validation_20261020/index.html) |
+| FastVLN / OVSegDT 方法对照 | [各自原设置的任务对照](runs/native_method_comparison_20261021/index.html) |
 | Grounding 初始化权重 | `runs/pointcot_grounding_refined/checkpoints/best`，update 800 |
 | Grounding 最终恢复点 | `runs/pointcot_grounding_refined/checkpoints/latest`，update 2000 |
 | 验证样本 | `runtime/fixtures/navigation/`，与实验输出分开保存 |
@@ -54,6 +54,7 @@ make viewer
 - [训练、保存、恢复和评估](docs/training.md)
 - [数据、资产准备与防泄漏](docs/datasets.md)
 - [推理接口、延迟与视频](docs/deployment.md)
+- [OVSegDT 权重、环境与案例对照](docs/baselines.md)
 
 ```bash
 make check

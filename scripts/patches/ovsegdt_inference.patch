@@ -1,0 +1,28 @@
+diff --git a/habitat-lab/habitat-baselines/habitat_baselines/rl/ppo/segm_aux_loss.py b/habitat-lab/habitat-baselines/habitat_baselines/rl/ppo/segm_aux_loss.py
+index 5574137..a71f017 100755
+--- a/habitat-lab/habitat-baselines/habitat_baselines/rl/ppo/segm_aux_loss.py
++++ b/habitat-lab/habitat-baselines/habitat_baselines/rl/ppo/segm_aux_loss.py
+@@ -13,11 +13,6 @@ from habitat_baselines.common.baseline_registry import baseline_registry
+ from habitat_baselines.rl.models.action_embedding import ActionEmbedding
+ from habitat_baselines.rl.ppo.policy import Net
+ 
+-from detectron2.projects.point_rend.point_features import (
+-    get_uncertain_point_coords_with_randomness,
+-    point_sample,
+-)
+-
+ def dice_loss(
+         inputs: torch.Tensor,
+         targets: torch.Tensor,
+@@ -113,6 +108,11 @@ class SegmentationAuxiliary(nn.Module):
+         self.importance_sample_ratio = 0.75
+ 
+     def forward(self, aux_loss_state, batch):
++        # PointRend is used by the training loss, never by navigation inference.
++        from detectron2.projects.point_rend.point_features import (
++            get_uncertain_point_coords_with_randomness,
++            point_sample,
++        )
+ 
+         gt_segmentation = batch['observations']['semantic'].permute(0, 3, 1, 2).float()
+         #print(gt_segmentation.shape)

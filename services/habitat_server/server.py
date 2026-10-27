@@ -15,7 +15,13 @@ def main():
     args = parser.parse_args()
     if not (args.endpoint.startswith("ipc://") or args.endpoint.startswith("tcp://127.0.0.1:")):
         raise ValueError("Simulator RPC must bind to a local endpoint")
-    env = HabitatObjectNavEnv(json.loads(args.config))
+    config = json.loads(args.config)
+    if config.get("backend") == "ovsegdt_original":
+        from ovsegdt_eval_env import OVSegDTEvalEnv
+
+        env = OVSegDTEvalEnv(config)
+    else:
+        env = HabitatObjectNavEnv(config)
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     socket.linger = 0

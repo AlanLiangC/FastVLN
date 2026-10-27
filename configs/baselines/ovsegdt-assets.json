@@ -1,0 +1,68 @@
+{
+  "vendor_commit": "646a3d53e7eae5879a4ce28d3a4dbaacca52d2b7",
+  "assets": [
+    {
+      "path": "ckpt.5.pth",
+      "repo_id": "wingrune/OVSegDT",
+      "revision": "c67bff3caa7a2b5b751d7545dbedeffc5b4efe1a",
+      "filename": "ckpt.5.pth",
+      "bytes": 516824617,
+      "sha256": "9615be13e1a8a873e4997faa7b5dcf38eb5f5e4080fb8e99c12e0a4b0ed631cb"
+    },
+    {
+      "path": "yoloe-v8l-seg.pt",
+      "repo_id": "jameslahm/yoloe",
+      "revision": "b584da188a198a2e6aa0e013d3fef6d55b212603",
+      "filename": "yoloe-v8l-seg.pt",
+      "bytes": 107405586,
+      "sha256": "14e9c146f7f7efa0bfea8c5f82952c9f95fb1f9c3bf0f18b3727b76624f9d746"
+    },
+    {
+      "path": "siglip_text/open_clip_model.safetensors",
+      "repo_id": "timm/ViT-B-16-SigLIP-256",
+      "revision": "149fecaed17d2230c5b631c8b66f93cbfabcfcb9",
+      "filename": "open_clip_model.safetensors",
+      "bytes": 812842728,
+      "sha256": "2a45a604e8740e38ec61167cb0a7338bf2681ebe74085da8bedb1098ec7d83e4"
+    },
+    {
+      "path": "siglip_text/open_clip_config.json",
+      "repo_id": "timm/ViT-B-16-SigLIP-256",
+      "revision": "149fecaed17d2230c5b631c8b66f93cbfabcfcb9",
+      "filename": "open_clip_config.json",
+      "bytes": 885,
+      "sha256": "83bbad85cfeb8411df0d7acd26069a04fedb5d5165f11a92fe6a58e18d5fa898"
+    },
+    {
+      "path": "siglip_text/tokenizer.json",
+      "repo_id": "timm/ViT-B-16-SigLIP-256",
+      "revision": "149fecaed17d2230c5b631c8b66f93cbfabcfcb9",
+      "filename": "tokenizer.json",
+      "bytes": 2422934,
+      "sha256": "83051c8005acc696637fe0c62c711ecee4b59083b4cf07ff9ad5f637eb2a3d2a"
+    },
+    {
+      "path": "siglip_text/tokenizer_config.json",
+      "repo_id": "timm/ViT-B-16-SigLIP-256",
+      "revision": "149fecaed17d2230c5b631c8b66f93cbfabcfcb9",
+      "filename": "tokenizer_config.json",
+      "bytes": 20608,
+      "sha256": "8571e0cf70f7ae095c5c544ab94b7967e94c79262202d61604da10cbe426cecb"
+    },
+    {
+      "path": "siglip_text/special_tokens_map.json",
+      "repo_id": "timm/ViT-B-16-SigLIP-256",
+      "revision": "149fecaed17d2230c5b631c8b66f93cbfabcfcb9",
+      "filename": "special_tokens_map.json",
+      "bytes": 2200,
+      "sha256": "3a60d3bb0808e7e629845031c2d720d33c2aceee1a6c535255de15d45b9f1ac7"
+    },
+    {
+      "path": "mobileclip_blt.ts",
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/mobileclip_blt.ts",
+      "download_url": "https://api.github.com/repos/ultralytics/assets/releases/assets/249526430",
+      "bytes": 599764649,
+      "sha256": "a67804d1b0f07b8b9a20c1761ec0847f34660f5fa338ec70e8f3fce68ed95e54"
+    }
+  ]
+}

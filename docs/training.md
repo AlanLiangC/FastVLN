@@ -33,7 +33,9 @@ LoRA LR=1e-5，KDA / point LR=5e-5，action / critic LR=1.5e-4，planning LR=3e-
 
 一个环境 step 是一次当前帧决策及仿真动作；一个 update 汇集全部环境的 100 步转移后更新参数。100 不是 episode 长度：episode 最多 500 步，可跨 update 延续。KDA 只在反向 fragment 起点 detach，20 步内保留梯度。四 / 六 / 八卡每 update 分别为 1200 / 1800 / 2400 条转移，跨卡数比较使用累计 `frames`。脚本未指定卡数时默认八卡；缩减卡数时需显式设置并允许迁移。
 
-OVSegDT 的 [DAgger+PPO 配置](../third_party/OVSegDT/config/experiments/transformer_dagger_ppo_no_segm_loss.yaml) 使用 `total_num_steps=1000000000`、每环境 rollout 100 步；这是配置预算，不代表已核实其发布权重实际训练了十亿步。当前 update 10000 累计 20,038,920 条环境转移，其中从 9720 开始的 HINT 条件监督只有 672,000 条。保持八卡训练到 20000 将再采集 24,000,000 条，累计 44,038,920 条。近期训练约 34 秒 / update，新增预算约 94 小时，另加评估与保存时间。延长预算不重置 Adam、采样器或 PPO 计划；是否改善按固定评估案例的双设置成绩判断。
+OVSegDT 的 [DAgger+PPO 配置](../third_party/OVSegDT/config/experiments/transformer_dagger_ppo_no_segm_loss.yaml) 使用 `total_num_steps=1000000000`、每环境 rollout 100 步；这是配置预算。[论文 v3 的训练细节](https://arxiv.org/html/2508.11479v3#S5) 明确报告 200M 步真值分割训练，再进行 15M 步预测分割微调，使用两张 A100、40 个环境。比较训练量应使用累计环境转移 `frames`，并单列 grounding 与基座预训练；不同卡数和历史配方下的 update 编号不能直接相除。
+
+历史 update 10000 累计 20,038,920 条环境转移，其中从 9720 开始的 HINT 条件监督为 672,000 条。保持八卡训练到 20000，将从该节点再采集 24,000,000 条、累计 44,038,920 条。以约 34 秒 / update 估算，这段新增预算约 94 小时，另加评估与保存时间；剩余时间应按当前 update 重算。延长预算不重置 Adam、采样器或 PPO 计划；是否改善按固定评估案例的双设置成绩判断。
 
 动作 CE 对碰撞恢复、STOP 样本的加权在整个分布式 rollout 上归一化。PPO 使用实际 APOS、OPOS、当前动作的联合概率，专家覆盖动作与 greedy DAgger 不使用伪造的 on-policy 概率。四步规划采用下述因果监督，部署执行当前一步后重新观测规划。
 
