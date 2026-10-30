@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -48,6 +49,30 @@ def test_checkpoint_replacement_invalidates_old_recurrent_states():
     assert session not in manager.sessions
     fresh = manager.create("chair")
     assert manager.sessions[fresh].state.step_index == 0
+
+
+def test_serving_motion_feedback_uses_executed_override_and_prediction_fallback():
+    from streamnav.serving.batching import batch_steps
+
+    class FeedbackPolicy(TestPolicy):
+        def forward_batch(self, rgb, states):
+            return torch.zeros(len(states), 4), torch.zeros(len(states)), states
+
+    manager = SessionManager(FeedbackPolicy())
+    sid = manager.create("chair")
+    rgb = torch.zeros(2, 2, 3)
+    manager.sessions[sid].state = replace(manager.sessions[sid].state, predicted_action=2)
+    manager.step(sid, rgb)
+    assert manager.sessions[sid].state.previous_action == 2
+    manager.sessions[sid].state = replace(manager.sessions[sid].state, predicted_action=3)
+    batch_steps(manager, [(sid, rgb)])
+    assert manager.sessions[sid].state.alternating_steps == 2
+    # An external controller may execute another action than the model proposed.
+    batch_steps(manager, [(sid, rgb, None, False, 1)])
+    assert manager.sessions[sid].state.previous_action == 1
+    assert manager.sessions[sid].state.alternating_steps == 0
+    manager.step(sid, rgb, previous_action=2)
+    assert manager.sessions[sid].state.previous_action == 2
 
 
 def test_serving_uses_evaluation_autocast_for_prefill_step_reset_and_batch():

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-run_dir="${STREAMNAV_RUN_DIR:-${STREAMNAV_RUN_ROOT:-runs/qwen35_pointcot_temporal}}"
+run_dir="${STREAMNAV_RUN_DIR:-${STREAMNAV_RUN_ROOT:-runs/finetune_15300}}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 extra=()
 if [[ "${STREAMNAV_RESUME:-0}" == 1 ]]; then

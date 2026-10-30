@@ -1,7 +1,6 @@
 """Detach jobs with a new OS session, including non-interactive tool terminals."""
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -14,7 +13,6 @@ def main():
     parser.add_argument("--name", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--monitor", action="store_true")
-    parser.add_argument("--keepalive-gpu", type=int, action="append", default=[])
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     directory = Path(args.run_dir)
@@ -58,33 +56,6 @@ def main():
                 start_new_session=True,
             )
         (directory / "monitor.pid").write_text(str(monitor.pid) + "\n")
-    keepalive_pids = {}
-    for gpu in args.keepalive_gpu:
-        with open(directory / f"keepalive_gpu{gpu}.log", "a") as log:
-            keepalive = subprocess.Popen(
-                [
-                    sys.executable,
-                    "tools/gpu_keepalive.py",
-                    "--pid",
-                    str(process.pid),
-                    "--gpu",
-                    str(gpu),
-                    "--run-dir",
-                    str(directory),
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        keepalive_pids[gpu] = keepalive.pid
-        (directory / f"keepalive_gpu{gpu}.pid").write_text(str(keepalive.pid) + "\n")
-    if keepalive_pids:
-        (directory / "keepalive_pids.json").write_text(json.dumps(keepalive_pids))
-        if len(keepalive_pids) == 1:
-            (directory / "keepalive.pid").write_text(
-                str(next(iter(keepalive_pids.values()))) + "\n"
-            )
     print(f"{args.name} PID: {process.pid}\nLog: {log_path.resolve()}")
 
 

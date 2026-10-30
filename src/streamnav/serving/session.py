@@ -62,11 +62,13 @@ class SessionManager:
             return sid
 
     @torch.no_grad()
-    def step(self, session_id, rgb, object_hint=None, previous_collision=False):
+    def step(
+        self, session_id, rgb, object_hint=None, previous_collision=False, previous_action=None
+    ):
         with self.lock:
             self._expire()
             session = self.sessions[session_id]
-            session.state = session.state.after_action(previous_collision)
+            session.state = session.state.after_action(previous_collision, action=previous_action)
             hint = object_hint_token(
                 object_hint,
                 rgb.shape[1],

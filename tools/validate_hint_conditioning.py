@@ -20,7 +20,7 @@ from streamnav.training.object_hints import conditioned_hint_config
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/pointcot_hint_conditioned.yaml")
+    parser.add_argument("--config", default="configs/pointcot_15300.yaml")
     parser.add_argument("--episodes", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=120)
     parser.add_argument("--gpu", type=int, default=0)

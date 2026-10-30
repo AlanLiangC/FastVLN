@@ -1,89 +1,113 @@
-# OVSegDT 安装与方法对照
+# OVSegDT 与固定 300 例对照
 
-**各方法使用自身原本设置，只对齐任务**：相同目标、episode、起始位置 / 朝向、500 步上限、0.25 m 内 STOP 的成功判定，以及 SR / SPL。相机、机器人、滑动、记忆和动作选择各自保留，不把 OVSegDT 改成 FastVLN 的设置。
+结果入口为 `runs/comparison_300_15300/index.html`；`summary.json` 包含逐例结果、总指标和分 split 指标，`protocol.json` 记录 case 哈希、模型哈希、各方法机器人配置、解码和 seed。只保留 15300、12200 与 OVSegDT 的同任务证据。
 
-| 项目 | OVSegDT | FastVLN |
-|---|---|---|
-| 相机宽×高、HFOV | 360×640、42° | 480×270、120° |
-| 相机高 | 1.31 m | 0.88 m |
-| 机器人高 / 半径 | 1.41 / 0.17 m | 0.88 / 0.18 m |
-| 沿障碍滑动 | 禁用 | 启用 |
-| 场景仿真 | 原仓库指定 Habitat-Sim 0.2.3 | 当前训练的 0.3.3 |
-| 动作选择 | 原 `policy.act(deterministic=False)` 采样 | 当前默认 greedy |
-| 历史状态 | 原 100 步 KV cache、上一动作 / mask 状态 | 当前 KDA 状态 |
-| 感知输入 | YOLOE 目标 mask | 无提示；另列外接 YOLOE 单点 |
+## 配置与结果
 
-OVSegDT 参数取自原仓库 [评估配置](../third_party/OVSegDT/config/experiments/transformer_rl_segm_loss-validation.yaml)，缺省动作尺度取检查点保存值：前进 0.25 m，转向 / 抬头 / 低头 30°。其独立模型进程按原 trainer 开启 TF32，保留原 SigLIP、ResNet9、Transformer、动作头与采样。GT 点只保留为 FastVLN 可选诊断，不进入默认主对照。
+Seen / Synonyms / Unseen 各 100 个固定任务。FastVLN 使用 YOLOE-v8l-seg 的一个像素点、greedy 解码；OVSegDT 使用原方法 sampled 设置，seed=100/101/102，共 900 条轨迹，按三 seed 均值汇总。各方法保留自身相机、机器人和滑动设置，最大 500 步，成功为 <0.25 m 且 STOP。
 
-## 权重与独立环境
+| 模型 | Seen SR / SPL | Synonyms SR / SPL | Unseen SR / SPL | 总 SR / SPL |
+|---|---:|---:|---:|---:|
+| FastVLN 15300 | 52.00 / 26.80 | 53.00 / 30.33 | 42.00 / 22.92 | 49.00 / 26.68 |
+| FastVLN 12200 | 62.00 / 29.77 | 50.00 / 26.84 | 36.00 / 17.63 | 49.33 / 24.74 |
+| OVSegDT | 54.33 / 23.34 | 37.33 / 16.54 | 41.33 / 19.33 | 44.33 / 19.74 |
 
-| 内容 | 位置 |
-|---|---|
-| 官方导航权重 | `checkpoints/ovsegdt/ckpt.5.pth` |
-| YOLOE 与文本编码器 | `checkpoints/ovsegdt/yoloe-v8l-seg.pt`、`mobileclip_blt.ts` |
-| SigLIP 目标编码器 / tokenizer | `checkpoints/ovsegdt/siglip_text/` |
-| 类别文本缓存 | `checkpoints/ovsegdt/siglip.pkl`，379 类、768 维 |
-| 固定来源、revision、SHA-256 | [资产清单](../configs/baselines/ovsegdt-assets.json) |
-| 模型解释器 | `runtime/ovsegdt-env/bin/python` |
-| 原版场景仿真解释器 | `runtime/ovsegdt-sim-env/bin/python` |
+数值单位为百分比。15300 不是所有指标都优于 12200：Seen 更低，总 SR 只差 1 例；保留它作为当前版本是基于更高 SPL 和同义词 / 陌生类别表现。与 OVSegDT 的 Unseen SR 接近，不应夸大 0.67 个百分点的差异。
 
-导航权重由原仓库 README 指向的 [wingrune/OVSegDT](https://huggingface.co/wingrune/OVSegDT) 下载，revision 为 `c67bff3caa7a2b5b751d7545dbedeffc5b4efe1a`，516,824,617 字节，SHA-256 为 `9615be13e1a8a873e4997faa7b5dcf38eb5f5e4080fb8e99c12e0a4b0ed631cb`。含 278 个状态张量、129,151,438 个元素，已有完整 SigLIP 视觉编码器，与 FastVLN 的 Qwen / adapter 无关。`extra_state.step=15,011,232` 是该阶段计数，原配置另存为 `checkpoints/ovsegdt/resolved_config.json`。
+这是固定任务子集、各自原设置的方法对照，不是统一机器人 / 相机的受控模块比较，也不是论文全量 split。独立测试集没有加入训练；不能把模拟提示或训练期小验证集的成绩与这张表混比。
 
-模型环境使用 Python 3.9、PyTorch 2.2.1、Transformers 4.31.0、timm 1.0.15、Ultralytics 8.3.161，见 [模型依赖](../configs/baselines/ovsegdt-requirements.txt)。场景仿真单独使用 Python 3.8.20 / Habitat-Sim 0.2.3，见 [仿真环境锁定](../configs/baselines/ovsegdt-simulator-explicit.txt)。进程通过本地 IPC 通信，不修改 FastVLN 环境或训练进程。原仓库未锁定所有模型依赖，因此记录本机版本，不声称逐比特复现作者机器。
+## 可复用资源
 
-原作者的 `modeling_llama.py` 仅复制到独立模型环境。[导入补丁](../scripts/patches/ovsegdt_inference.patch) 只延后训练分割 loss 的 Detectron2 导入；导航前向使用原代码。通过 `torch.nn.Module.load_state_dict(..., strict=True)` 校验完整参数，避免原策略内部 `strict=False` 漏报。
+- OVSegDT 导航权重：`checkpoints/ovsegdt/ckpt.5.pth`。
+- YOLOE-v8l-seg：`checkpoints/ovsegdt/yoloe-v8l-seg.pt`，同时用于 FastVLN 的真实点来源。
+- 环境：`runtime/ovsegdt-env`、`runtime/ovsegdt-sim-env` 与 `runtime/habitat-env`。
+- 资产和依赖记录：`configs/baselines/`。
+- 工具：`tools/compare_navigation_baselines.py` 与 `tools/ovsegdt_runtime.py`，参考实现保留于 `third_party/OVSegDT`。
 
-```bash
-CUDA_VISIBLE_DEVICES=1 bash scripts/setup_ovsegdt.sh
-bash scripts/setup_ovsegdt_simulator.sh
-source scripts/ovsegdt_env.sh
-CUDA_VISIBLE_DEVICES=1 "$OVSEGDT_PYTHON" tools/validate_ovsegdt_install.py --detector
-```
+页面仅对已录制的案例显示视频；未录视频的任务仍保留 trace 和指标，避免把视频子集当作全部样本。重测时使用新的输出目录，不覆盖保留结果。
 
-安装检查覆盖严格加载、原 `policy.act()` 一致性、105 步缓存窗口、episode 重置、空 / 非空 mask 和外接 / 内部分割通路等价性。闭环短测另外验证了原版 0.2.3 与 FastVLN 自身仿真能分别运行。
+## 全量 HM3D ObjectNav V2 验证
 
-## 原策略与检测逻辑
+入口为 `runs/evaluation_v2_full_15300/index.html`。本轮只测 FastVLN 15300 + YOLOE 单点，不运行 OVSegDT 导航模型。完整 V2 val 为 36 场景、1,000 例：bed 165、chair 195、plant 152、sofa 187、toilet 166、tv_monitor 135；它与上面的 OVON 300 例不是同一个测试集。
 
-SigLIP 文本缓存按原脚本重建：直接编码类别字符串，64 token，不加导航 prompt，不额外归一化。原仓库 `data/text_embeddings/siglip.pkl` 链接到统一资产目录。
+原 0.10 m 攀爬设置已完成 1,000/1,000：635 例成功，SR **63.50%**、SPL **33.52%**，平均 177.83 步。完整逐例结果及分类指标见该目录 `summary.json`。
 
-YOLOE 使用作者提供的各 split 完整校准词表、逐类别阈值、原 224×224 Resize 和 `conf=0.01`。词表会合并冗余词，故查询词按原实现与 SigLIP 类别向量做 **L1 最近邻匹配**，再选对应类别和阈值；例如 `flower vase` 匹配 `vase`，不能要求字符串完全相同。seen 使用作者的 `cats_val_seen.json` 补齐原源码缺失的 `yolo_val_seen` 初始化分支。
+保持 FastVLN 自身相机、机器人、允许滑动和逐步 greedy 推理，最大 500 动作，STOP 且距离 <0.25 m 才算成功。YOLOE 权重、224×224 预处理、单点提取及阈值沿用现有工具；固定词表采用完整 `val_seen`，再加入 `plant` 及 `val_unseen` 中的 plant 阈值 0.1，不按当前目标裁减词表。检测类别 `sofa→couch`、`tv_monitor→tv`；导航指令只把内部类别代码 `tv_monitor` 改写为自然词 `tv`。不使用真值点或 oracle 动作。
 
-同一帧的 YOLOE mask 送入原策略张量通路。内部 `segmentation_source="gt"` 只表示直接接收 mask，实际来源是 YOLOE，无 GT 标签进入 OVSegDT。每个 episode 重置 KV cache、上一动作及 mask 状态；每步调用原 `act()`，实际动作写入下一状态，不加动作覆盖或防抖后处理。
+V2 的原始 episode ID 在各场景的各类别中重新计数，所以评测 UID 加上类别，并在 metadata 保存原始 ID。清单包含全部 1,000 个不同的场景／类别／ID 组合，不按原始 ID 去重。每卡 125 例，可断点续测；预选每类 3 例，共 18 例录制视频，所有案例保存逐步 trace。根目录 `summary.json` 只汇总已完成的案例；`progress.json` 为进度，完成前的 SR 不是最终成绩。
 
-[原版仿真后端](../services/habitat_server/ovsegdt_eval_env.py) 按 OVONSim 重建 navmesh，使用 0.2.3 默认几何，不复用 0.3.3 缓存。旧 API 的 `include_static_objects=False` 通过重建函数参数传入；旧 API 的路径终点用于兼容环境辅助字段。测距始终是原生多目标 geodesic 到官方 viewpoints，目标集合包含 episode 子类别，成功及 SPL 公式与原指标口径一致。
+### 并发评测
 
-## 当前对照入口
+每卡默认运行 4 个独立进程，共 32 路。每路保留 batch=1、独立模型／检测器／模拟器／KDA 状态，通过独立的 CUDA MPS 服务重叠计算。没有更改动作解码、数值精度、500 步上限或成功判据。283 条已完成的串行结果保留于原目录，其余 717 条按 `execution.json` 固定分配给 `shards/gpu_*/lane_*`；汇总递归读取两层目录并拒绝重复案例。
 
-[当前播放页](../runs/native_method_comparison_20261021/index.html)。默认从三个当前验证 manifest 按 seed 2025 分层选取每 split 12 条，共 36 个固定 episode；完整内容写入 `cases.json`，不依赖历史实验目录。
+2026-10-29 的 64.4 秒稳定窗口：八卡合计约 270 动作/秒，平均 GPU 利用率 91.5%；串行版本在排除启动和 GPU 0 并发测试干扰后，七卡测得每卡 11.25–13.39 动作/秒，折合八卡约 102，窗口吞吐提升约 2.65 倍。并发版本显存约每卡 29–30 GB。该窗口包含 GPU 0 上额外的轨迹一致性复跑，属于实际评测流水线吞吐，不是单机器人延迟。不同案例长度和最后少量任务的负载不均会影响全程耗时，不能把窗口倍率直接视作整轮加速比。
 
-| 设置 | 运行方式 | 次数 |
-|---|---|---|
-| ovsegdt_native_sampled | 原相机 / 机器人 / 仿真、YOLOE mask、采样 | 100 / 101 / 102 三个 seed |
-| fastvln_no_hint | FastVLN 自身配置、NULL、greedy | 一次 |
-| fastvln_yoloe_point | FastVLN 自身配置、外接 YOLOE 单点、greedy | 一次 |
+测量和一致性记录在 `runtime/reports/v2_eval_parallel_benchmark/`：`throughput.json`、`mps_samples.json`、`parity.json`、`mps_parity.json`。非 MPS 四路并发的 18 条复跑、2,349 步，以及 MPS 下六类目标各一例的 6 条复跑、783 步，均已逐步核对动作、HINT、APOS、OPOS 与串行结果完全一致；MPS 复跑的初始 RGB 哈希和终局指标也完全一致。
 
-默认共 180 条轨迹。每个采样 seed 与 episode UID 确定该例 RNG seed，写入结果以便断点重跑；不保证与作者多环境运行的随机数序列相同。SR / SPL 按 seed 汇总，另报告 seed 间标准差。
-
-FastVLN 的单点优先取 mask 最大连通区域，选择离边界较深、且网格中心仍在 mask 内的 48×27 token；没有可支持网格点则输入 NULL，不用 GT 修正检测器。默认仅保存每 split 第一个案例的视频，其余保存 trace，以控制空间。
+启动或续测：
 
 ```bash
 source scripts/env.sh
-CUDA_VISIBLE_DEVICES=1 python tools/compare_navigation_baselines.py \
-  --output runs/native_method_comparison_20261021
+# 仅在本项目私有 MPS 服务尚未启动时执行；不要启动第二份。
+mkdir -p "$STREAMNAV_RUNTIME/logs/mps-v2"
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  CUDA_MPS_PIPE_DIRECTORY=/tmp/fastvln-v2-mps \
+  CUDA_MPS_LOG_DIRECTORY="$STREAMNAV_RUNTIME/logs/mps-v2" nvidia-cuda-mps-control -d
+python tools/launch_job.py --name evaluation --run-dir runs/evaluation_v2_full_15300 -- \
+  tools/evaluate_hm3d_v2.py --gpus 0 1 2 3 4 5 6 7 --workers-per-gpu 4 \
+  --mps-pipe-directory /tmp/fastvln-v2-mps
 ```
 
-脚本固定启动时的 FastVLN best adapter、manifest 和配置，后续训练切换 best 不影响对照。只对齐任务，不要求不同方法 RGB 相同；同一方法重复实验核验起点一致。已完成项可断点续测，协议不匹配则拒绝混合结果。
+先检查该目录 `evaluation.pid` 对应的进程已退出，避免同时启动两份；控制器额外使用文件锁防止重复调度。固定清单、类别映射、权重哈希及分卡分配保存在 `protocol.json`，改变科学评测协议时必须换输出目录；并发方式单独记入 `execution.json`。续测保持原有 lane 分配。
 
-`index.html` 是播放页，`summary.json` 包含方法汇总、逐 seed 汇总和逐例指标，`progress.json` 记录进度或异常。结果包含实际机器人、仿真版本、初始距离、动作、碰撞、误停及最长连续左右交替。青色是 YOLOE mask，橙色是输入点，绿 / 洋红是 FastVLN APOS / OPOS。与训练共享 GPU，时间不作为独占延迟结果。
+## 统一通行参数的全量 V1、V2 与 OVON 队列
 
-共享相机或将 OVSegDT 改为 greedy 的旧诊断不进入本次主对照。当前是固定验证子集，完整论文基准结论仍需全量验证。
+入口为 `runs/evaluation_full_15300_hm3d/index.html`，只测同一份 FastVLN 15300 + YOLOE 单点：
 
-## 论文指标与复现状态
+| Benchmark | Episodes | Scenes |
+|---|---:|---:|
+| HM3D V1 val | 2,000 | 20 |
+| HM3D V2 val（统一参数重测） | 1,000 | 36 |
+| OVON val_seen | 3,000 | 36 |
+| OVON val_seen_synonyms | 3,000 | 36 |
+| OVON val_unseen | 3,000 | 36 |
+| 合计 | 12,000 | 场景存在重叠，不相加 |
 
-当前属于使用原策略和原设置的适配测试，**尚未验证复现论文指标**。[论文表 1](https://arxiv.org/html/2508.11479v3) 使用经过 predicted-mask 微调和置信度校准的 YOLOE，报告 seen / synonyms / unseen 的 SR 为 43.6% / 40.1% / 44.7%，SPL 为 20.1% / 17.9% / 20.6%。不能用“论文使用 GT 分割”解释与当前测试的差距。
+相机、机器人尺寸、滑动、500 步上限、0.25 m STOP 成功判据、精度和逐步 greedy 推理均沿用 V2。评测专用的最大攀爬高度从 0.10 m 改为 0.20 m，navmesh 垂直栅格高度从 0.05 m 改为 0.20 m，所有五个 benchmark 使用同一设置。原始 0.10 m navmesh 在 V1 中切断楼梯并使部分起点无效：实测案例原地转向导致 1.45 m 位移；两项均改为 0.20 m 后约为 0.9 mm，且恢复有限路径。五个问题案例的起始测距与原数据集 geodesic_distance 在浮点误差范围内一致；仅修改攀爬高度而保留 0.05 m 垂直栅格仍有任务不连通。测距回退不能解决起点移动，因此未采用；严格测距与机器人运动共用同一 navmesh。模型权重、训练配置和推理逻辑未改。此前 0.10 m 的 V2 和 OVON 300 例结果保留为历史口径，不能把与新结果的差异全部归因于模型能力。V1 使用与 V2 相同的固定六类目标检测映射；OVON 保留各 split 自己的校准词表和阈值，以及原实现的 SigLIP 最近类别映射。OVON 的目标文本和 episode UID 不变，便于与保留的 300 例对照。
 
-原先每 split 12 例由与 FastVLN 定期验证相同的选择器和 seed 产生，与 checkpoint 选择使用的验证集重合；三个 OVSegDT seed 只是重复这些案例，不能视为三倍的独立样本。这个集合适合回放诊断，不能独立支撑总体方法优劣结论。
+V1 的原始 ID 在同一场景、同一类别内也可能重复，因此额外加入完整清单中的索引来区分缓存状态；完整 2,000 条起点／目标记录均保留，不按原始 ID 去重。`cases_index.json` 记录独立 UID、原始 ID、场景、类别和原始起始位姿。
 
-2026-10-21 已启动[独立扩样验证](../runs/ovsegdt_replication_20261021/index.html)：每 split 从 episode 中均匀无放回抽取 100 例，排除定期验证固定的前 48 例，覆盖各 split 的全部 36 个场景。OVSegDT 仍使用三个 seed，共 900 条轨迹；`selection.json` 记录采样范围和 seed。这仍是小规模验证，完整基准每 split 有 3000 个 episode。
+工具 `tools/evaluate_navigation_full.py` 将 12,000 例拆成 377 个至多 32 例的固定块。每卡最多 4 个独立 batch=1 进程，通过 MPS 并行；某个块完成后，该卡从全局队列领取下一块，减少固定分卡的尾段空闲。块首次领取时记录 GPU，异常退出在同一 GPU 断点重试，避免改变该块的协议。导航权重只固定复制一份，所有块共享读取，不重复保存 377 份权重。结果逐例原子写入，协议和每块案例哈希在运行和恢复时校验。
 
-已补充两个真实案例各 150 帧的回放核查，含非空检测 mask 及超过 100 步缓存窗口：外接 mask 通路与作者 inline YOLOE 通路的 mask、动作分布、价值和 KV cache 全部相同。核查记录为 `runtime/reports/ovsegdt_adapter_replay_audit_20261021.json`。已完成案例的初始 geodesic 另与原数据元信息核对。这些检查未覆盖完整原生 Habitat-Lab evaluator，不能代替论文复现结果。
+每个 benchmark 预选 18 个案例保存视频，共 90 个，其余同样保存完整 trace。`summary.json` 的 `by_split` 分开报告五组 SR/SPL，`by_category` 提供组内分类指标；完成前的指标只对应已经结束的案例，不代表最终成绩。
+
+在本项目私有 MPS 服务已经运行、该输出目录没有控制器占用时启动／续测：
+
+```bash
+source scripts/env.sh
+python tools/launch_job.py --name evaluation --run-dir runs/evaluation_full_15300_hm3d -- \
+  tools/evaluate_navigation_full.py --gpus 0 1 2 3 4 5 6 7 --workers-per-gpu 4 \
+  --chunk-size 32 --navmesh-max-climb 0.2 --navmesh-cell-height 0.2 --mps-pipe-directory /tmp/fastvln-v2-mps
+```
+
+0.10 m 的 V1 初始尝试因任务不可达而中止，原始异常和部分结果仅保留在 `runtime/reports/full_v1_ovon_preflight/robot_climb01_attempt/` 作为诊断，不混入新成绩。climb=0.20/cell_height=0.05 的中间验证也仅作为诊断，存于同级 `robot_climb02_cell005_attempt/`。最终闭环记录为同级 `raster_02_validation.json`。
+
+## 12200 / 15300 与 YOLOE 开关的配对复核
+
+本次为五个 benchmark 各随机固定 300 例（seed=20261030），同一案例比较四组，共 6,000 条轨迹：1,500 条复用完整 15300+YOLOE 结果，其余 4,500 条新增。所有起点、朝向、目标、相机、机器人、climb/cell_height=0.20 m、500 步和 STOP 距离 <0.25 m 一致，greedy、batch=1。每个四元组的初始 RGB 哈希和 episode UID 已核对；no_hint 的 HINT 帧数全部为零。
+
+| Split | 12200 无提示 SR / SPL | 12200 YOLOE SR / SPL | 15300 无提示 SR / SPL | 15300 YOLOE SR / SPL |
+|---|---:|---:|---:|---:|
+| hm3d_v1_val | 58.00 / 25.35 | 56.33 / 29.19 | 59.00 / 31.12 | 55.33 / 31.49 |
+| hm3d_v2_val | 65.67 / 28.61 | 67.33 / 34.26 | 69.33 / 32.94 | 65.00 / 33.03 |
+| hm3d_ovon_val_seen | 51.33 / 23.52 | 48.67 / 26.80 | 48.00 / 25.30 | 46.33 / 26.40 |
+| hm3d_ovon_val_seen_synonyms | 48.67 / 24.62 | 48.00 / 25.27 | 47.00 / 27.02 | 48.67 / 29.90 |
+| hm3d_ovon_val_unseen | 39.00 / 14.94 | 39.33 / 18.73 | 35.00 / 15.47 | 37.33 / 17.37 |
+
+表中是同一固定子集的百分比，不能当作旧权重／无提示模式的全量指标。OVON 三组共 900 例：12200 无提示 SR 46.33%、SPL 21.02%；15300+YOLOE SR 44.11%、SPL 24.56%。15300 在 V1/V2 的无提示模式表现更高，在 OVON 三组的无提示模式则低于 12200；不能称为全面升级。对 15300，YOLOE 在 V1/V2/Seen 的 SR 点估计为负收益，在 Synonyms/Unseen 为正收益。
+
+20 个既定 SR 对比经 Holm 校正后均未达到 p<0.05（最小校正 p=0.8657）；多数差异较小，点估计排名不代表稳定胜出。配对 bootstrap 区间、精确 McNemar 检验、完整逐例结果见 `runs/hint_ablation_12200_15300/analysis.json` 与 `summary.json`。
+
+结论与案例入口：`runs/hint_ablation_12200_15300/analysis.html`；四组保存动作重放视频：`diagnostics/index.html`。视频案例有意选择用于机制说明，不作为全量误检率。模型、权重和默认配置没有因本次分析改写。
+
+可复用入口：`tools/compare_hint_ablations.py`。无提示仍预测 APOS/OPOS，只将外部 HINT 设为 NULL；15300 的运动适配分支仍生效，因此不能把“15300 无提示”当成“恢复 12200”。

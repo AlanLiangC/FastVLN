@@ -1,39 +1,23 @@
-# 架构
+# 架构与缓存
 
-唯一活动模型族为 `qwen35_pointcot`，实现见 [policy.py](../src/streamnav/models/point_cot/policy.py)，配置见 [pointcot_temporal.yaml](../configs/pointcot_temporal.yaml)。它直接加载固定 revision 的官方多模态 [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)。
+固定版本为 update 15300。模型是官方 Qwen3.5-0.8B 加 rank-8 LoRA、六层跨帧 KDA、APOS / OPOS 点头、六动作头、四步动作计划、value / arrival / HINT 质量辅助头。总参数 862,234,753，可训练参数 9,248,833；官方基座冻结。
 
-## 当前帧与历史
+每步输入当前 RGB、目标文本、一个可选 HINT 和 episode 状态。Habitat RGB 为 480×270，网络图像设置为 256×448；坐标接口对应原始 RGB，转换到固定 48×27 网格。输出按 APOS → OPOS → 当前动作产生，另给出四步计划、辅助预测和下一状态。
 
-24 层语言网络保留原有 18 层 Gated DeltaNet、6 层 gated attention、MLP、norm 和多模态位置编码。视觉编码器冻结，沿用官方 processor。图像保持比例缩放、不裁切；点坐标定义在原始图像的归一化坐标中。
+当前帧内部保留 Qwen 原生局部计算，跨帧历史由 KDA 承接。KDA 启用层为 6，跨帧张量约 12 MiB，不累计历史整帧或无限增长的视觉 token。episode 切换或加载新权重时清空状态；训练中在 fragment 起点 detach，20 步内保留梯度。
 
-所有原生 token mixer 的状态只用于一次决策。当前帧和目标文本构成前缀，随后自回归生成 APOS、OPOS、action。原生 GDN 的卷积与矩阵状态、attention 的 KV 在这一块内延续，下一帧清空。
+## 单点条件与运动反馈
 
-6 层 attention 另加 KDA 分支，使用共享 Q/K/V/O 和小门控参数。它使用未施加当前帧 RoPE 的 Q/K，按 token 顺序更新跨帧矩阵。残差系数从零初始化，保留基座的单帧计算。跨帧只保留六个矩阵，不保留历史 RGB、历史 KV 或逐帧特征列表。
+原 HINT embedding 与 OPOS 的空间 rows 共享，并有独立可学习 NULL。15300 另加二维坐标 MLP 和 12 维运动反馈 MLP，融合到同一个 token 位置，不增加输入 token 数。NULL 时空间残差为 0，运动残差继续生效。
 
-每个 episode 的长期缓存为 6 × 8 × 256 × 256 个 FP32 元素，共 **12 MiB**，不会随轨迹长度增长。新 episode 必须通过 `start_episode` 重置缓存。最终 action token 也进入记忆，使后续帧可以利用执行过的动作。
+反馈来自上一实际动作、相邻 RGB 8×8 缩略图差异、视觉静止与交替转向计数。状态只额外保存缩略统计与少量计数。碰撞、真实位移和真值距离可供训练奖励 / 诊断使用，不进入该反馈向量。
 
-## 可训练参数
+HINT 质量头是单输出线性层，仅辅助学习和诊断，不直接门控点或替换动作。模型没有语义分割分支，也不读取深度、语义图、地图或真值位姿。
 
-默认 LoRA rank=8、alpha=16，覆盖 attention/GDN 投影与 MLP。新增低秩 KDA 门控、两组 tied point 输入/输出表、六动作表与 critic 均训练，原始视觉与语言参数冻结。
+## 执行与冻结边界
 
-当前总参数 861,967,488，可训练参数 **8,981,568（约 1.04%）**。四步规划分支为 529,536 个参数，可选目标点输入为 2048 个参数，到达辅助头为 3075 个参数。APOS/OPOS 是可训练 token，需要 grounding 和导航实例监督。
+原生动作词表是 STOP、MOVE_FORWARD、TURN_LEFT、TURN_RIGHT、LOOK_UP、LOOK_DOWN。预测四步计划，每步只执行当前动作再观测；规划融合与 arrival STOP 融合权重均为 0。不将规划中的未来 STOP 排队执行。
 
-到达头从当前 RGB / 文本 / KDA 前缀的 hidden state 预测 FAR、NEAR、READY，读取位置在 APOS 之前，不能通过教师强制的 APOS_STOP 复制答案。标签使用真实任务的目标视点测地距离；距离不进入策略输入。到达头仅提供辅助训练和诊断，不硬性屏蔽动作，也不改变 PPO 的 token 概率定义。
+只更新 LoRA、KDA、任务头和 adaptation 参数，不更新官方 Qwen 基础参数。加载时校验基座 revision、trainable 参数名 / 形状和 tensor-content 哈希。12200 的配置关闭 adaptation，用同一加载器可作为参考模型读取；不是将新参数强行加载进旧权重。
 
-每帧前缀末尾固定追加一个目标点提示 token。有点时复用 OPOS 坐标表并加输入来源向量；没有信息时使用独立可学习 NULL，不复用输出端表示不可见的 OPOS_0。该 token 不增加视觉编码或输出解码次数，参与当前帧 prefill 和 KDA，必须随实际帧保存在 rollout 中并原样回放。NULL 不提供目标可见性的真值。
-
-基座、视觉与新增表以 FP32 保存，语言 / KDA 使用 FP32 并启用 TF32 high；视觉前向遵循调用处的 autocast，导航外层为 BF16 autocast。参数 dtype 不等同于每个算子的执行 dtype。批量视觉编码与逐图编码保持同一图像、空间位置和 prompt，并用工程验收检查数值一致性。最大视觉像素预算 114,688，输入保留比例且不裁切。无梯度批量策略使用 CUDA Graph 减少调度，训练回放保留完整梯度，见 [训练文档](training.md)。吞吐报告区分单卡优化测试和多卡实际训练，不使用缓存后决策延迟替代训练 FPS。
-
-## 训练时的打包
-
-原生 mixer 将独立帧放在 batch 维，KDA 则把每条 fragment 的有效 token 按时间拼接。padding 不写入长期记忆；episode 边界通过 `cu_seqlens` 分段。默认 100 步 rollout，20 步反向 fragment，更新一次优化器前检查所有 fragment 的概率一致性。实际点前缀与教师点前缀分支依次前向、反向，累加梯度后才执行同一次参数更新，避免同时保留两套时序激活。
-
-PPO 和导航 point CE 使用 rollout 实际生成的两个点与动作历史；动作 IL 另混入标注点前缀的 teacher forcing，不能替换 PPO 前缀，也不能覆盖行为概率。APOS 先按 NONE/POINT/LEFT/RIGHT/STOP 的概率总量选择类别，再在 POINT 内选位置；OPOS 先判定 NONE/POINT，再选择像素位置。两个阶段共同确定真正送入动作预测和缓存的 token。坐标未知的前进样本只约束 APOS 为 NONE 或 POINT 的兼容意图，不生成像素真值。grounding 的每张静态图像都从空缓存开始，不影响导航缓存。
-
-四步计划的第一步是原动作头。追加实际动作 token 后，将其 hidden state 输入 LayerNorm → 128 维瓶颈 → 三个 1024 维残差特征，并共享动作输出表，预测后续三步。该分支没有再次调用语言模型，不追加未来 token，不修改 episode cache。它借鉴 Uni-NaVid 的四动作监督，但采用小型并行预测分支，保持当前帧与 KDA 缓存的接口。
-
-当前 `executed_prefix` 监督覆盖专家、greedy DAgger 和随机 PPO 三路：规划头已读实际执行的 a_t，因此实际下一状态的教师 a*_(t+1) 可用于监督第二步；第三、四步只在中间执行动作与对应教师动作一致时有效。遇到 STOP、episode 终止、候选目标绑定变化或 rollout 末尾即屏蔽后续标签。监督密度在完整分布式 rollout 上归一化，不因扩大覆盖自动放大未来动作 loss 系数。
-
-可选的无参数动作选择器融合当前动作的运动概率与上一帧对本时刻的预测，继续每步读取新 RGB。它只用于 greedy DAgger、评估和部署，随机 PPO 与概率回放始终使用同一原始当前动作分布。实际选中动作先写入 KDA，再生成下一时刻预测。额外状态仅为六个 FP32 概率（24 字节），碰撞时清除，episode 重置时与 KDA 一起重置。可用 `temporal_action_requires_hint` 限制连续非空提示帧；该开关不读取真值可见性。
-
-融合保持当前 STOP 概率，并在 STOP 概率 ≥1/6 时旁路，因此同一观测上的 greedy STOP 判定不变；未来 STOP 不作为待执行命令。可选 `arrival_stop_weight` 将当前 STOP 与当前 READY 概率混合，若启用则采样、训练和回放统一采用该分布。update 10380 的闭环回归未通过，当前两项权重均为 0，到达头继续只做辅助监督与诊断。
+实现见 `src/streamnav/models/point_cot/`、`src/streamnav/contracts/state.py`；相对 12200 的逐项变化见 [版本差异](changes_from_12200.md)。

@@ -71,6 +71,16 @@ def episode_hint_enabled(episode_id, seed, probability=0.5):
     return value < probability
 
 
+def episode_hint_mode(episode_id, seed, config):
+    if not episode_hint_enabled(episode_id, seed, config.get("episode_probability", 0.5)):
+        return "null"
+    return (
+        "real"
+        if episode_hint_enabled(episode_id + ":real", seed, config.get("real_probability", 0.0))
+        else "simulated"
+    )
+
+
 def evaluation_object_hint(label, episode_id, frame_id, seed, config):
     return evaluation_object_hint_packet(label, episode_id, frame_id, seed, config)["token"]
 

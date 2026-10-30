@@ -53,6 +53,7 @@ from streamnav.training.arrival_supervision import (
     arrival_losses,
     prepare_arrival_supervision,
 )
+from streamnav.training.detector_hints import TrainingDetectorHints
 from streamnav.training.diagnostics import (
     merge_diagnostics,
     observation_distance,
@@ -65,7 +66,12 @@ from streamnav.training.expert_stream import (
     student_rl_weights,
     validate_expert_streams,
 )
-from streamnav.training.navigation_selection import best_setting, ensure_best_setting, update_best
+from streamnav.training.navigation_selection import (
+    best_setting,
+    ensure_best_setting,
+    update_best,
+    update_real_hint_best,
+)
 from streamnav.training.object_hints import (
     conditioned_hint_config,
     episode_hint_enabled,
@@ -127,6 +133,9 @@ def stack_steps(steps):
         else None,
         torch.stack([s.arrival_logits for s in steps])
         if steps[0].arrival_logits is not None
+        else None,
+        hint_quality_logits=torch.stack([s.hint_quality_logits for s in steps])
+        if steps[0].hint_quality_logits is not None
         else None,
     )
 
@@ -310,9 +319,22 @@ def replay_losses(
         * weights
     )
     arrival_loss, arrival_metrics = arrival_losses(step, records, cfg)
+    quality_loss = step.action_logits.sum(-1) * 0
+    if cfg.get("hint_quality_loss_coef", 0):
+        if step.hint_quality_logits is None:
+            raise ValueError("Hint quality supervision requires generalization adapters")
+        targets = quality_loss.new_tensor([r.get("hint_quality_target", 0) for r in records])
+        weights = quality_loss.new_tensor([r.get("hint_quality_weight", 0) for r in records])
+        quality_loss = (
+            F.binary_cross_entropy_with_logits(
+                step.hint_quality_logits.float(), targets, reduction="none"
+            )
+            * weights
+        )
     loss = (
         il
         + arrival_loss
+        + cfg.get("hint_quality_loss_coef", 0) * quality_loss
         + cfg["point_il_coef"]
         * (
             apos
@@ -329,6 +351,7 @@ def replay_losses(
         loss,
         {
             **arrival_metrics,
+            "hint_quality_loss": quality_loss,
             "il_loss": il,
             "apos_loss": apos,
             "apos_type_loss": apos_type,
@@ -652,13 +675,24 @@ def optimize_rollout(
             write_progress(root, update, "optimization", completed, len(fragments), started)
         if batch == 0:
             differentiable_error = validate_errors("differentiable")
-        auxiliary, metrics, _ = grounding_loss(
-            policy,
-            grounding.sample(cfg["grounding_batch_size"]),
-            **grounding_loss_options(ground_cfg),
-        )
-        (cfg["grounding_coef"] * auxiliary).backward()
-        auxiliary_metrics.append((float(auxiliary.detach()), metrics["opos_loss"]))
+        grounding_steps = cfg.get("grounding_accumulation_steps", 1)
+        if type(grounding_steps) is not int or grounding_steps < 1:
+            raise ValueError("grounding_accumulation_steps must be a positive integer")
+        for _ in range(grounding_steps):
+            auxiliary, metrics, auxiliary_step = grounding_loss(
+                policy,
+                grounding.sample(cfg["grounding_batch_size"]),
+                **grounding_loss_options(ground_cfg),
+            )
+            (cfg["grounding_coef"] * auxiliary / grounding_steps).backward()
+            auxiliary_metrics.append(
+                {
+                    "grounding_loss": float(auxiliary.detach()),
+                    "grounding_opos_loss": metrics["opos_loss"],
+                    **{"grounding_" + k: v for k, v in metrics.items() if k.startswith("hint_")},
+                }
+            )
+            del auxiliary, auxiliary_step
         invalid = not bool(
             torch.stack(
                 [torch.isfinite(p.grad).all() for p in policy._all_trainable if p.grad is not None]
@@ -677,8 +711,10 @@ def optimize_rollout(
         arrival_norms.append(float(head.weight.grad.norm()) if head is not None else 0.0)
     return {
         **totals,
-        "grounding_loss": sum(x[0] for x in auxiliary_metrics) / batches,
-        "grounding_opos_loss": sum(x[1] for x in auxiliary_metrics) / batches,
+        **{
+            k: sum(x[k] for x in auxiliary_metrics) / len(auxiliary_metrics)
+            for k in auxiliary_metrics[0]
+        },
         "grad_norm": max(norms),
         "apos_parameter_gradient_norm": max(apos_norms),
         "opos_parameter_gradient_norm": max(opos_norms),
@@ -833,7 +869,12 @@ def save(policy, optimizer, source, config, update, frames=0, rank_payload=None)
         initial_update = config.get("fork_origin", {}).get("update", 0)
         initial_name = f"update_{initial_update:07d}"
         for old in candidates[:-keep]:
-            if old.resolve() != best and old.name not in ("update_0000000", initial_name):
+            real_best = root / "checkpoints" / "best_real_hint"
+            if (
+                old.resolve() != best
+                and (not real_best.exists() or old.resolve() != real_best.resolve())
+                and old.name not in ("update_0000000", initial_name)
+            ):
                 shutil.rmtree(old)
     parallel.barrier()
 
@@ -859,7 +900,8 @@ def load_adapters(policy, folder, *, allow_new_plan=False):
         and not (
             allow_new_plan
             and all(
-                name.startswith(("future_plan.", "object_hint.", "arrival_head.")) for name in added
+                name.startswith(("future_plan.", "object_hint.", "arrival_head.", "adaptation."))
+                for name in added
             )
         )
     ):
@@ -922,6 +964,11 @@ def fork_signature(config):
     recipe["model"].pop("temporal_action_weight", None)
     recipe["model"].pop("temporal_action_requires_hint", None)
     recipe["model"].pop("arrival_stop_weight", None)
+    recipe["model"].pop("generalization_adapters", None)
+    recipe["grounding"] = dict(recipe["grounding"])
+    recipe["grounding"].pop("source_weights", None)
+    for key in ("absence_probability", "hint_training", "hint_opos_coef", "hint_quality_coef"):
+        recipe["grounding"].pop(key, None)
     # Start-pose sampling changes only in an explicit training recipe fork.
     recipe.pop("curriculum")
     recipe["data"] = dict(recipe["data"])
@@ -929,6 +976,10 @@ def fork_signature(config):
     recipe["habitat"].pop("reward", None)
     # Dynamics may change in an explicit recipe fork, never an exact resume.
     recipe["habitat"].pop("allow_sliding", None)
+    # Explicitly record the corrected navigation mesh in the fork. Exact
+    # resumes must still match both raster height and climb through resume_recipe.
+    recipe["habitat"].pop("navmesh_agent_max_climb", None)
+    recipe["habitat"].pop("navmesh_cell_height", None)
     # These sensors/labels are used only by the training annotation service.
     # RGB camera and robot geometry must still match the parent checkpoint.
     recipe["habitat"].pop("perception_labels", None)
@@ -984,12 +1035,22 @@ def synchronized_optimizer_step(parameters, optimizer, max_grad_norm):
 def record_best(config, update, results):
     if parallel.rank() == 0:
         update_best(config["run_dir"], update, results, best_setting(config))
+        summary = (
+            Path(config["run_dir"])
+            / "evaluation"
+            / f"update_{update:07d}"
+            / "settings_summary.json"
+        )
+        if summary.exists():
+            settings = json.loads(summary.read_text())
+            if "yoloe_point" in settings:
+                update_real_hint_best(config["run_dir"], update, settings["yoloe_point"])
     parallel.barrier()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/pointcot_temporal.yaml")
+    parser.add_argument("--config", default="configs/pointcot_15300.yaml")
     parser.add_argument("--run-dir")
     parser.add_argument(
         "--initialize-from", help="Grounding adapters; fresh navigation optimizer and sampler"
@@ -1145,11 +1206,14 @@ def main():
         "planning": [],
         "hint": [],
         "arrival": [],
+        "adaptation": [],
     }
     for name, parameter in policy.named_parameters():
         if parameter.requires_grad:
             group = (
-                "arrival"
+                "adaptation"
+                if name.startswith("adaptation.")
+                else "arrival"
                 if name.startswith("arrival_head.")
                 else "hint"
                 if name.startswith("object_hint.")
@@ -1320,6 +1384,7 @@ def main():
     episodes = [source.sample_episode() for _ in range(cfg["num_envs"])]
     observations = envs.reset(episodes)
     states = [policy.start_episode(e.uid, e.goal_text) for e in episodes]
+    detector_hints = TrainingDetectorHints(config, root / "detector_logs")
     try:
         while update < cfg["num_updates"]:
             if parallel.any_rank(stop[0], policy.device):
@@ -1355,8 +1420,9 @@ def main():
                     phase_started = time.monotonic()
                     supervisions: list[Any] | None
                     prefetched_features, prefetch_seconds = None, 0.0
+                    delivered = detector_hints.packets(observations, states)
                     if geometry and cfg.get("overlap_perception_oracle", False):
-                        pending = envs.submit_oracle_supervisions(conditional_hints)
+                        pending = envs.submit_oracle_supervisions(conditional_hints, delivered)
                         prefetch_started = time.monotonic()
                         try:
                             # Vision and prompt encoding do not depend on the
@@ -1372,7 +1438,9 @@ def main():
                         supervisions = [future.result() for future in pending]
                     else:
                         supervisions = (
-                            envs.get_oracle_supervisions(conditional_hints) if geometry else None
+                            envs.get_oracle_supervisions(conditional_hints, delivered)
+                            if geometry
+                            else None
                         )
                     experts = (
                         [
@@ -1407,7 +1475,11 @@ def main():
                             try:
                                 if supervisions is not None:
                                     supervisions[i] = envs.clients[i].get_oracle_supervision(
-                                        conditional_hints
+                                        conditional_hints,
+                                        (
+                                            detector_hints.packets([observations[i]], [states[i]])
+                                            or [None]
+                                        )[0],
                                     )
                                     expert = NavigationAction(supervisions[i]["action"])
                                 else:
@@ -1499,6 +1571,11 @@ def main():
                                 "hint_goal_key": hint_metadata[i].get("goal_key"),
                                 "hint_route_active": hint_metadata[i].get("active", False),
                                 "hint_route_fallback": hint_metadata[i].get("fallback"),
+                                "hint_quality_target": hint_metadata[i].get("quality_target", 0),
+                                "hint_quality_valid": hint_metadata[i].get("quality_valid", False),
+                                "hint_source": hint_metadata[i].get("source"),
+                                "stationary_steps": state.stationary_steps,
+                                "alternating_steps": state.alternating_steps,
                                 "tokens": tuple(
                                     x.cpu() for x in (step.apos, step.opos, step.action)
                                 ),
@@ -1558,7 +1635,11 @@ def main():
                             success=after["success"],
                             truncated=after["truncated"],
                         )
-                        states[i] = step.state.after_action(after["collision"])
+                        states[i] = step.state.after_action(
+                            after["collision"],
+                            action=int(step.action),
+                            displacement=after["displacement"],
+                        )
                         if after["done"]:
                             metrics.append(
                                 {
@@ -1598,10 +1679,13 @@ def main():
                 phase_started = time.monotonic()
                 bootstrap_hints = None
                 if policy.supports_object_hints:
+                    bootstrap_packets = detector_hints.packets(observations, states)
                     object_labels = list(
                         envs.executor.map(
-                            lambda client: client.get_object_supervision(conditional_hints),
-                            envs.clients,
+                            lambda pair: pair[0].get_object_supervision(conditional_hints, pair[1]),
+                            zip(
+                                envs.clients, bootstrap_packets or [None] * len(states), strict=True
+                            ),
                         )
                     )
                     hint_config = cfg.get("object_hints", {})
@@ -1694,6 +1778,29 @@ def main():
             for row in records:
                 for record in row:
                     record["il_weight"] = imitation_weight(record, cfg) / mean_il_weight
+            quality_fractions = parallel.average_scalar(
+                torch.tensor(
+                    [
+                        sum(
+                            r.get("hint_quality_valid", False)
+                            and r.get("hint_quality_target", 0) == value
+                            for row in records
+                            for r in row
+                        )
+                        / (tmax * count)
+                        for value in (1, 0)
+                    ],
+                    device=policy.device,
+                )
+            ).tolist()
+            quality_weights = object_loss_weights(*quality_fractions, balanced=True, power=0.5)
+            for row in records:
+                for record in row:
+                    record["hint_quality_weight"] = (
+                        quality_weights[0 if record.get("hint_quality_target", 0) else 1]
+                        if record.get("hint_quality_valid", False)
+                        else 0.0
+                    )
             if config["model"].get("arrival_head", False):
                 prepare_arrival_supervision(
                     records,
@@ -1721,6 +1828,7 @@ def main():
                 k: 0.0
                 for k in (
                     *ARRIVAL_METRICS,
+                    "hint_quality_loss",
                     "il_loss",
                     "apos_loss",
                     "apos_type_loss",
@@ -1788,6 +1896,22 @@ def main():
                 **summarize_rollout(records),
                 **summarize_object_predictions(records),
                 **summarize_hint_routes(records),
+                "hint_quality_label_fraction": sum(
+                    r.get("hint_quality_valid", False) for row in records for r in row
+                )
+                / (tmax * count),
+                "real_hint_fraction": sum(
+                    str(r.get("hint_source", "")).startswith("yoloe")
+                    for row in records
+                    for r in row
+                )
+                / (tmax * count),
+                "stagnation_fraction": sum(
+                    r.get("alternating_steps", 0) >= 4 or r.get("stationary_steps", 0) >= 8
+                    for row in records
+                    for r in row
+                )
+                / (tmax * count),
                 "update": update,
                 "schedule_update": schedule_update,
                 "ppo_coefficient": ppo_weight,
@@ -1845,9 +1969,11 @@ def main():
                 }
                 combined_metrics.update(merge_diagnostics(all_metrics))
                 combined_metrics.update(
-                    grounding_loss=sum(m["grounding_loss"] for m in all_metrics) / len(all_metrics),
-                    grounding_opos_loss=sum(m["grounding_opos_loss"] for m in all_metrics)
-                    / len(all_metrics),
+                    **{
+                        k: sum(m[k] for m in all_metrics) / len(all_metrics)
+                        for k in all_metrics[0]
+                        if k.startswith("grounding_")
+                    },
                     update=update,
                     schedule_update=schedule_update,
                     frames=frames,
@@ -1869,6 +1995,14 @@ def main():
                     hint_route_fallback_count=sum(
                         m["hint_route_fallback_count"] for m in all_metrics
                     ),
+                    real_hint_fraction=sum(m["real_hint_fraction"] for m in all_metrics)
+                    / len(all_metrics),
+                    hint_quality_label_fraction=sum(
+                        m["hint_quality_label_fraction"] for m in all_metrics
+                    )
+                    / len(all_metrics),
+                    stagnation_fraction=sum(m["stagnation_fraction"] for m in all_metrics)
+                    / len(all_metrics),
                     replay_log_prob_error_max=max(
                         m["replay_log_prob_error_max"] for m in all_metrics
                     ),
@@ -2000,6 +2134,7 @@ def main():
         traceback.print_exc()
         raise
     finally:
+        detector_hints.close()
         envs.close()
         if sys.exc_info()[0] is None and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()

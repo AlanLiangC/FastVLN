@@ -48,6 +48,10 @@ def imitation_weight(record, config):
     weight = config.get("stop_il_weight", 1.0) if record["expert"] == 0 else 1.0
     if record.get("collision_before", False) and record["expert"] != 1:
         weight *= config.get("recovery_il_weight", 1.0)
+    if record.get("stationary_steps", 0) >= 8 or record.get("alternating_steps", 0) >= 4:
+        weight *= config.get("stagnation_il_weight", 1.0)
+    if record.get("hint_quality_valid", False) and not record.get("hint_quality_target", 0):
+        weight *= config.get("wrong_hint_il_weight", 1.0)
     return weight
 
 

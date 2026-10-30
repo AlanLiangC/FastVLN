@@ -18,7 +18,11 @@ from perception_labels import PerceptionLabeler
 
 from streamnav.contracts.action import NavigationAction as A
 from streamnav.contracts.perception import GRID_HEIGHT, GRID_WIDTH
-from streamnav.training.object_hints import episode_hint_enabled, simulated_object_hint_packet
+from streamnav.training.object_hints import (
+    episode_hint_enabled,
+    episode_hint_mode,
+    simulated_object_hint_packet,
+)
 
 
 class HintConditionedSupervision:
@@ -37,28 +41,116 @@ class HintConditionedSupervision:
         self.packet_frame, self.packet_cache = -1, None
         self.result_frame, self.result_cache = -1, None
         self.goals = {}
+        self.distractor_id, self.distractor_until = None, -1
         for goal in env.episode["goals"]:
             identity = int(str(goal["object_id"]).rsplit("_", 1)[-1])
             self.goals.setdefault(identity, []).extend(
                 view["agent_state"]["position"] for view in goal["view_points"]
             )
 
-    def object_supervision(self):
+    def object_supervision(self, delivered_hint=None):
         """Pure, repeatable hint query for value bootstrap; it never binds a goal."""
+        if (
+            delivered_hint is None
+            and episode_hint_mode(self.env.uid, self.config.get("seed", 2025), self.config)
+            == "real"
+        ):
+            raise ValueError("Real-hint episode requires an actual detector packet")
+        if delivered_hint is not None:
+            if (
+                delivered_hint.get("episode_id") != self.env.uid
+                or delivered_hint.get("frame_id") != self.env.steps
+            ):
+                raise ValueError("Delivered hint belongs to a different episode/frame")
+            if (
+                self.packet_frame == self.env.steps
+                and delivered_hint.get("token") != self.packet_cache["hint"]["token"]
+            ):
+                raise ValueError("Delivered hint changed within the same frame")
         if self.packet_frame != self.env.steps:
             label = PerceptionLabeler(self.env).object_labels()
             seed = self.config.get("seed", 2025)
-            if episode_hint_enabled(
+            if delivered_hint is not None:
+                if (
+                    delivered_hint.get("episode_id") != self.env.uid
+                    or delivered_hint.get("frame_id") != self.env.steps
+                ):
+                    raise ValueError("Delivered hint belongs to a different episode/frame")
+                if (
+                    type(delivered_hint.get("token")) is not int
+                    or not 0 <= delivered_hint["token"] <= GRID_WIDTH * GRID_HEIGHT
+                ):
+                    raise ValueError("Invalid delivered hint token")
+                packet = dict(delivered_hint)
+            elif episode_hint_enabled(
                 self.env.uid, seed, self.config.get("episode_probability", 0.5)
             ):
                 key = f"{seed}:{self.env.uid}:{self.env.steps}:training_hint"
                 rng = random.Random(int(hashlib.sha256(key.encode()).hexdigest()[:16], 16))
                 packet = simulated_object_hint_packet(label, rng, **self.config.get("noise", {}))
+                packet = self._distractor_packet(packet, rng)
             else:
                 packet = {"token": 0, "source": "episode_null"}
             self.packet_cache = {**label, "object_hint_token": packet["token"], "hint": packet}
             self.packet_frame = self.env.steps
         return self.packet_cache
+
+    def _distractor_packet(self, packet, rng):
+        probability = self.config.get("distractor_probability", 0.0)
+        if not probability:
+            return packet
+        semantic = self.env._sensor_observations()["perception_semantic"]
+        height, width = semantic.shape
+        ys = ((np.arange(GRID_HEIGHT) + 0.5) / GRID_HEIGHT * height).astype(int)
+        xs = ((np.arange(GRID_WIDTH) + 0.5) / GRID_WIDTH * width).astype(int)
+        grid = semantic[ys[:, None], xs[None, :]]
+        if self.env.steps > self.distractor_until:
+            self.distractor_id = None
+            if rng.random() < probability:
+                identities, counts = np.unique(grid, return_counts=True)
+                choices = [
+                    int(i)
+                    for i, n in zip(identities, counts)
+                    if i in self.env.semantic_known_ids and i not in self.goals and n >= 2
+                ]
+                if choices:
+                    self.distractor_id = rng.choice(choices)
+                    self.distractor_until = (
+                        self.env.steps + self.config.get("distractor_steps", 6) - 1
+                    )
+        cells = np.flatnonzero(grid == self.distractor_id) if self.distractor_id is not None else []
+        if len(cells):
+            return {"token": 1 + int(cells[len(cells) // 2]), "source": "distractor_instance"}
+        return packet
+
+    def _hint_quality(self, token):
+        if not token or not self.config.get("quality_supervision", False):
+            return {"quality_target": 0, "quality_valid": False}
+        semantic = self.env._sensor_observations()["perception_semantic"]
+        y, x = divmod(token - 1, GRID_WIDTH)
+        h, w = semantic.shape
+        identity = int(
+            semantic[
+                min(int((y + 0.5) / GRID_HEIGHT * h), h - 1),
+                min(int((x + 0.5) / GRID_WIDTH * w), w - 1),
+            ]
+        )
+        if not set(self.goals) <= self.env.semantic_known_ids:
+            return {"quality_target": 0, "quality_valid": False}
+        objects = {
+            int(o.semantic_id): o for o in self.env.sim.semantic_scene.objects if o is not None
+        }
+
+        def name(i):
+            obj = objects.get(i)
+            return obj.category.name() if obj is not None and obj.category is not None else None
+
+        # Same-class non-goal instances are not hard visual-semantic negatives.
+        ambiguous = identity not in self.goals and name(identity) in {name(i) for i in self.goals}
+        return {
+            "quality_target": int(identity in self.goals),
+            "quality_valid": identity in self.env.semantic_known_ids and not ambiguous,
+        }
 
     def _candidate(self, token):
         if not token:
@@ -86,11 +178,11 @@ class HintConditionedSupervision:
         if self.navigator is not None:
             self.navigator.follower.reset()
 
-    def supervision(self):
+    def supervision(self, delivered_hint=None):
         env = self.env
+        packet = self.object_supervision(delivered_hint)["hint"]
         if self.result_frame == env.steps:
             return self.result_cache
-        packet = self.object_supervision()["hint"]
         candidate = self._candidate(packet["token"])
         fallback = None
         if self.goal_id is not None and env.steps - self.last_hint_frame > self.memory_steps:
@@ -135,6 +227,7 @@ class HintConditionedSupervision:
             "perception": labels,
             "hint": {
                 **packet,
+                **self._hint_quality(packet["token"]),
                 "bound_goal_id": self.goal_id,
                 "active": self.goal_id is not None,
                 "goal_key": (

@@ -30,6 +30,7 @@ from streamnav.contracts.episode import NavigationEpisode
 from streamnav.data.schema import HabitatEpisodeSource
 from streamnav.envs.habitat_client import HabitatClient
 from streamnav.evaluation.baseline_profiles import method_profiles
+from streamnav.evaluation.detector_client import DetectorClient
 from streamnav.evaluation.detector_points import detector_point
 from streamnav.evaluation.perception_records import perception_records
 from streamnav.evaluation.runner import video_frame
@@ -47,6 +48,31 @@ SETTINGS = [
     "fastvln_simulated_hint",
 ]
 DEFAULT_SETTINGS = ["ovsegdt_native_sampled", "fastvln_no_hint", "fastvln_yoloe_point"]
+
+
+class YOLOEPointClient:
+    """Detector-only bridge; never loads or evaluates the OVSegDT policy."""
+
+    def __init__(self, output, vocabulary=None):
+        self.detector = DetectorClient(output / "detector_logs")
+        self.vocabulary = vocabulary
+        self.report = {"model": "yoloe-v8l-seg", "navigation_policy_loaded": False}
+
+    def request(self, command, rgb=None, **fields):
+        if command == "RESET":
+            self.split = self.vocabulary or fields["split"]
+            self.category = fields["category"]
+            aliases = {"sofa": "couch", "tv_monitor": "tv"} if self.split == "hm3d_v2_val" else {}
+            return {"detector_category": aliases.get(self.category, self.category)}, None
+        if command == "DETECT":
+            masks = self.detector.request(
+                "DETECT", images=[rgb], categories=[self.category], split=self.split
+            )
+            return {}, masks[0].astype(bool)
+        raise ValueError("Detector-only client cannot run navigation actions: " + command)
+
+    def close(self):
+        self.detector.close()
 
 
 class OVSegDTClient:
@@ -242,9 +268,8 @@ def write_summary(output, results, protocol):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--checkpoint", type=Path, default=ROOT / "runs/qwen35_pointcot_temporal/checkpoints/best"
-    )
+    parser.add_argument("--checkpoint", type=Path, default=ROOT / "checkpoints/fastvln_15300")
+    parser.add_argument("--shared-checkpoint", action="store_true", help="Read an immutable pinned checkpoint without duplicating its files")
     parser.add_argument(
         "--cases",
         type=Path,
@@ -264,6 +289,9 @@ def main():
         default=["val_seen_0000", "val_seen_synonyms_0000", "val_unseen_0000"],
     )
     parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument("--detector-vocabulary", choices=["hm3d_v2_val"], default=None)
+    parser.add_argument("--navmesh-max-climb", type=float, default=None)
+    parser.add_argument("--navmesh-cell-height", type=float, default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     torch.set_num_threads(2)
@@ -271,8 +299,9 @@ def main():
         raise ValueError("max-steps must be 1..500")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    snapshot = output / "checkpoint"
-    pin_checkpoint(args.checkpoint, snapshot)
+    snapshot = args.checkpoint.resolve() if args.shared_checkpoint else output / "checkpoint"
+    if not args.shared_checkpoint:
+        pin_checkpoint(args.checkpoint, snapshot)
     manifest = json.loads((snapshot / "manifest.json").read_text())
     config = yaml.safe_load((snapshot / "resolved_config.yaml").read_text())
     config["device"] = "cuda:0"
@@ -284,6 +313,14 @@ def main():
     profiles = method_profiles(
         config, saved_ovsegdt, official, seed=config["seed"], max_steps=args.max_steps
     )
+    if args.navmesh_max_climb is not None:
+        if not 0 < args.navmesh_max_climb <= 0.5:
+            raise ValueError("navmesh-max-climb must be in (0, 0.5]")
+        profiles["fastvln"]["navmesh_agent_max_climb"] = args.navmesh_max_climb
+    if args.navmesh_cell_height is not None:
+        if not 0 < args.navmesh_cell_height <= 0.3:
+            raise ValueError("navmesh-cell-height must be in (0, 0.3]")
+        profiles["fastvln"]["navmesh_cell_height"] = args.navmesh_cell_height
     if args.cases is not None:
         all_cases = {case["key"]: case for case in json.loads(args.cases.read_text())}
     else:
@@ -325,6 +362,7 @@ def main():
         "point_selection": "Largest supported component; deepest 48x27 grid-center point; no GT.",
         "decoding": "OVSegDT: sampled; FastVLN: greedy, following each original method.",
         "fastvln_graph_cache_entries": 8,
+        "detector_vocabulary_override": args.detector_vocabulary,
         "scope": __doc__,
     }
     protocol_path = output / "protocol.json"
@@ -349,8 +387,14 @@ def main():
     seed_everything(config["seed"])
     worker, env, profile = None, None, None
     try:
-        worker = OVSegDTClient(output)
-        (output / "ovsegdt_load.json").write_text(json.dumps(worker.report, indent=2) + "\n")
+        has_ovsegdt = "ovsegdt_native_sampled" in args.settings
+        worker = (
+            OVSegDTClient(output)
+            if has_ovsegdt
+            else YOLOEPointClient(output, args.detector_vocabulary)
+        )
+        report_name = "ovsegdt_load.json" if has_ovsegdt else "detector_load.json"
+        (output / report_name).write_text(json.dumps(worker.report, indent=2) + "\n")
         policy = None
         if any(setting.startswith("fastvln") for setting in args.settings):
             policy = Qwen35PointCoTPolicy(config).eval()
@@ -539,7 +583,11 @@ def main():
                         trace.write(json.dumps(row) + "\n")
                         traces.append(row)
                         if is_fast:
-                            state = prediction.state.after_action(after["collision"])
+                            state = prediction.state.after_action(
+                                after["collision"],
+                                action=action,
+                                displacement=after["displacement"],
+                            )
                         observation = after
                         if frame % 20 == 0 or after["done"]:
                             trace.flush()
@@ -594,7 +642,9 @@ def main():
                     "trace": trace_path.name,
                     "result_file": result_path.name,
                 }
-                result_path.write_text(json.dumps(result, indent=2) + "\n")
+                temporary_result = result_path.with_suffix(".json.tmp")
+                temporary_result.write_text(json.dumps(result, indent=2) + "\n")
+                temporary_result.replace(result_path)
                 results.append(result)
                 write_summary(output, results, protocol)
                 print(

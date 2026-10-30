@@ -1,6 +1,7 @@
+# Explicit fork of 15300; baseline files remain frozen.
 seed: 2025
 device: cuda:0
-run_dir: runs/qwen35_pointcot_temporal
+run_dir: runs/finetune_15300_grounded_hints
 model:
   family: qwen35_pointcot
   checkpoint: checkpoints/qwen35_0p8b_base
@@ -25,11 +26,10 @@ model:
   cache_frame_templates: true
   inference_mode: frame_local_native_plus_kda
   vision_compute_dtype: float32
-  # Frozen-checkpoint validation rejected all motion-fusion candidates.
-  # Train causal plans first; retain the original current-frame selector.
   temporal_action_weight: 0.0
   temporal_action_requires_hint: false
   arrival_stop_weight: 0.0
+  generalization_adapters: true
 data:
   iterator_options:
     max_scene_repeat_steps: 2000
@@ -38,7 +38,7 @@ data:
   - manifest: runtime/data/manifests/hm3d_ovon_train.json
     weight: 1.0
 trainer:
-  num_updates: 20000
+  num_updates: 22000
   num_envs: 3
   num_expert_envs: 1
   num_dagger_envs: 1
@@ -49,16 +49,17 @@ trainer:
   overlap_perception_oracle: true
   ppo_num_mini_batches: 2
   learning_rates:
-    lora: 1.0e-05
-    memory: 5.0e-05
+    lora: 2.5e-06
+    memory: 2.5e-05
     point: 5.0e-05
-    action: 0.00015
-    critic: 0.00015
-    planning: 0.0003
-    hint: 0.0001
-    arrival: 0.0001
+    action: 7.5e-05
+    critic: 7.5e-05
+    planning: 0.00015
+    hint: 5.0e-05
+    arrival: 5.0e-05
+    adaptation: 5.0e-05
   object_hints:
-    episode_probability: 0.5
+    episode_probability: 0.6
     noise:
       dropout: 0.2
       jitter: 1
@@ -67,6 +68,10 @@ trainer:
     conditioned_supervision:
       enabled: true
       memory_steps: 40
+    real_probability: 0.6666666666666666
+    distractor_probability: 0.08
+    distractor_steps: 6
+    quality_supervision: true
   warmup_updates: 50
   schedule_from_fork: true
   expert_warmup_probability: 0.0
@@ -82,12 +87,12 @@ trainer:
   entropy_coef: 0.005
   max_grad_norm: 1.0
   replay_tolerance: 0.05
-  checkpoint_interval: 5
-  eval_interval: 100
-  keep_checkpoints: 2
+  checkpoint_interval: 25
+  eval_interval: 200
+  keep_checkpoints: 3
   supervision:
     stale_seconds: 3600
-    min_updates: 200
+    min_updates: 1000
     zero_sr_patience: 5
     stop_on_failure: true
   point_il_coef: 0.25
@@ -105,17 +110,22 @@ trainer:
   ppo_clip: 0.2
   teacher_action_mix: 0.5
   future_action_supervision: executed_prefix
+  hint_quality_loss_coef: 0.1
+  stagnation_il_weight: 2.0
+  wrong_hint_il_weight: 1.5
+  grounding_accumulation_steps: 2
 eval:
   manifests:
   - runtime/data/manifests/hm3d_ovon_val_seen.json
   - runtime/data/manifests/hm3d_ovon_val_seen_synonyms.json
   - runtime/data/manifests/hm3d_ovon_val_unseen.json
-  episodes: 12
-  full_episodes: 48
-  full_eval_interval: 500
+  episodes: 32
+  full_episodes: 100
+  full_eval_interval: 1000
   settings:
   - no_hint
   - simulated_hint
+  - yoloe_point
   best_setting: simulated_hint
   hint_noise:
     dropout: 0.0
@@ -140,8 +150,8 @@ habitat:
   hfov: 120
   agent_height: 0.88
   agent_radius: 0.18
-  navmesh_agent_max_climb: 0.1
-  navmesh_cell_height: 0.05
+  navmesh_agent_max_climb: 0.2
+  navmesh_cell_height: 0.2
   navmesh_cache: runtime/cache/navmesh
   forward_step: 0.25
   turn_angle: 30
@@ -206,19 +216,22 @@ grounding:
   keep_checkpoints: 2
   pretrain_epochs: 3.0
   source_weights:
-    coco-instance: 0.38
-    referring: 0.48
-    scannet-instance: 0.11
-    imagenet-loc: 0.02
-    pixmo-points: 0.01
+    coco-instance: 0.2
+    referring: 0.35
+    scannet-instance: 0.2
+    imagenet-loc: 0.15
+    pixmo-points: 0.1
   gradient_checkpointing: false
-  absence_probability: 0.025
+  absence_probability: 0.1
   anchor_weight: 0.2
   point_radius: 0.025
   best_metric: macro_visible_grounding_accuracy
   best_min_absence_accuracy: 0.85
   warmup_updates: 25
   min_lr_ratio: 0.1
+  hint_training: true
+  hint_opos_coef: 0.5
+  hint_quality_coef: 0.1
 checkpoint: null
 serving:
   host: 127.0.0.1

@@ -21,6 +21,11 @@ def perception_records(predictions, *, hierarchical=False):
     if "object_hint_tokens" in predictions:
         for record, token in zip(records, predictions["object_hint_tokens"], strict=True):
             record["object_hint_token"] = int(token)
+    if "hint_quality" in predictions:
+        for record, probability in zip(
+            records, predictions["hint_quality"].float().sigmoid().tolist(), strict=True
+        ):
+            record["hint_quality_probability"] = probability
     if "current_action_logits" in predictions:
         probabilities = predictions["current_action_logits"].softmax(-1).tolist()
         tokens = predictions["selected_action_tokens"].tolist()

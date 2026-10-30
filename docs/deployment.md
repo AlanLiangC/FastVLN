@@ -1,58 +1,32 @@
-# 推理、延迟与视频
+# 加载、单步接口与视频
 
-模型配置为 [pointcot_temporal.yaml](../configs/pointcot_temporal.yaml)，检查点格式为 `qwen35-pointcot-adapters-v1`。部署需要官方基座 `checkpoints/qwen35_0p8b_base` 和导航 adapter；加载时校验基座 revision、参数名称、形状和权重校验和。导航模型入口为 `runs/qwen35_pointcot_temporal/checkpoints/{latest,best}`：`latest` 是最近保存的训练状态，`best` 是 simulated_hint 固定验证集选中的候选，两者的 update 以各自 `manifest.json` 为准。父分支 `runs/qwen35_pointcot_hint_conditioned/checkpoints/update_0010380` 保留作回退；新分支候选需同时检查有／无提示成绩。Grounding 权重用于导航初始化，不作为训练完成的导航模型。
-
-## 单步接口
-
-每个 episode 调用 `start_episode(uid, instruction)`，随后每步输入当前 uint8 RGB 和该 episode 的状态，输出 APOS、OPOS、六动作 logits、value、四步计划和下一状态。加载新权重或切换 episode 后重置缓存。当前执行一步后重新观测，不排队执行未来 STOP。
-
-动作融合为可选实验开关，当前配置权重为 0。启用时还保存上一帧对本时刻的六动作概率（24 字节）；`action_logits` 是实际 greedy 选择分数，`current_action_logits` 是原始当前动作分数，`selected_action_tokens` 与已写入 KDA 的动作一致。单步或 batch API 可传 `previous_collision=true` 表示上一动作碰撞，在处理当前帧前清空旧规划概率而保留 KDA。内置 Habitat、训练和评估已自动反馈碰撞。`temporal_action_requires_hint=true` 时仅连续非空提示帧融合，NULL 和随机 PPO 不参与该选择器。
-
-`forward_batch(..., hint_tokens=[k,...])` 每帧只接受一个可选提示：1–1296 表示图像 48×27 网格的坐标，0 表示独立可学习输入 NULL；NULL 不等于输出端表示不可见的 OPOS_0。模型不依赖历史图片、深度、语义图、地图、真值距离或教师。
-
-HTTP `/sessions/{session_id}/step` 和 `/batch_step` 的 `object_hint` 可省略或为 null。一个点可写为 `{"frame_id":0,"xy_px":[300,120]}`，坐标对应原始 RGB；或写为 `{"frame_id":0,"token":649}`，两者只能选一个。帧号从 session 的 0 开始，帧号、可选 episode_id 不匹配或坐标越界时退化为 NULL。响应包含实际使用的 `object_hint_token` 与预测感知信息。
-
-## 计时口径
-
-RTX 4090、当前参数 / 计算配置下，已记录的单卡推理延迟如下。每张卡独立运行模型，不需要八卡共同完成一次动作。
-
-| 评估 | 单卡活跃轨迹 | 按动作数加权的平均延迟 |
-|---|---:|---:|
-| update 5100，无提示 | 1–2 | 63.8 ms，约 15.7 Hz |
-| update 5100，有提示 | 1–2 | 58.0 ms，约 17.3 Hz |
-| update 5000，无提示 | 1–8 | 119.1 ms |
-| update 5000，有提示 | 1–8 | 119.7 ms |
-
-计时从当前 RGB 的策略调用开始，到 GPU 同步后的预测输出及少量诊断结束，包括图像预处理、视觉编码、文本 / KDA、APOS → OPOS → action 和规划分支；不含外部检测器、仿真 STEP、视频和场景加载。提示与无提示访问轨迹不同，实际 batch 和缓存热身不同，耗时差不能解释为提示本身提速。
-
-`decision_hz = 1 / mean(step_latency)`；平均毫秒数可用 `1000 / decision_hz` 还原。`latency_p50_ms` 是中位数，`policy_decisions_per_second` 是所有 rank 的总吞吐；批次中的每条轨迹都要等待整轮决策完成。较大评估包含冷图捕获等长尾，P99 约 1.1 秒。上述结果不是严格独占 GPU 的 batch=1 部署基准。
-
-单卡基准工具读取当前权重和保留的 RGB 样本，预热后记录均值和 P50/P95/P99，并连续更新 KDA。使用空闲 GPU 运行，避免混入训练争用：
+默认配置 `configs/pointcot.yaml` 固定加载 `checkpoints/fastvln_15300`；需要官方冻结基座 `checkpoints/qwen35_0p8b_base`。checkpoint 内保存 trainable adapters，不是另一份完整 Qwen 基座。加载器校验官方 revision、参数名 / 形状和 tensor-content 哈希。
 
 ```bash
 source scripts/env.sh
-CUDA_VISIBLE_DEVICES=0 python tools/benchmark_hint_eval.py \
-  --checkpoint runs/qwen35_pointcot_temporal/checkpoints/best \
-  --batch 1 --warmup 8 --iterations 40
-```
-
-这是重复真实帧的工程计时，不是导航性能评估。输入样本位于 `runtime/fixtures/navigation/rgb_inputs.pt`，输出位于 `runtime/reports/`。
-
-## 查看视频与独立评估
-
-```bash
+# 交互服务，默认 15300
+STREAMNAV_VIEWER_GPU=0 bash scripts/start_viewer.sh
+# 独立评估输出
+python -m streamnav.evaluation.runner checkpoint=checkpoints/fastvln_15300 run_dir=runs/manual_eval_15300
+# 静态结果与视频
 make viewer
-# http://127.0.0.1:8765/evaluation/
-# 独立评估写入新目录，保留训练原始记录
-python -m streamnav.evaluation.runner \
-  checkpoint=runs/qwen35_pointcot_temporal/checkpoints/best \
-  run_dir=runs/manual_navigation_eval
+# http://127.0.0.1:8765/
 ```
 
-视频目录为 `RUN_DIR/evaluation/update_XXXXXXX/{no_hint,simulated_hint}/`，包含 MP4、逐步 trace、播放页和 split 汇总。APOS 荧光绿、预测 OPOS 洋红、外部提示橙色，均加白边并与当前帧对齐。HINT 方框是单点标记，尺寸不表示目标边界。NONE、LEFT/RIGHT、STOP 等特殊 token 不伪造像素点；四步计划在预测 STOP 处截断。
+## 输入输出
 
-实验性融合改变本帧动作时，视频显示亮青色 `PLAN FUSION`，trace 记录 `temporal_action_changed` 与原始当前动作概率。该标记只说明控制器改变了选择，不表示动作正确。
+每个 episode 调用 `start_episode(uid, instruction)`，随后输入当前 uint8 RGB、可选目标点及缓存。输出 APOS、OPOS、六动作 logits、四步动作计划、value 和下一状态；推理执行当前一步再观测。切换 episode 或权重时重置缓存。
 
-画面与 trace 的 GT-O、hint 来源用于诊断，不进入无提示输入。没有洋红点时先看 `opos`：0 表示实际预测 NONE，导航成功不要求输出位置点。`simulated_hint` 使用干净的实例内部点，只反映理想点提示，不代表真实检测器。可用 `tools/audit_eval_pointing.py --run-dir RUN_DIR --update UPDATE` 重放保存动作核验标记对齐。
+HTTP `/sessions/{session_id}/step` 与 `/batch_step` 的 `object_hint` 可省略或为 null。一个点可写成 `{"frame_id":0,"xy_px":[300,120]}` 或 `{"frame_id":0,"token":649}`，二者不能同时给；坐标对应输入原始 RGB，token 为 48×27 网格。帧号从 0 开始，帧号 / episode 不匹配或坐标越界退化为 NULL。
 
-`make viewer` 优先显示活动导航评估；可用 `VIEWER_RUN_DIR=runs/pointcot_grounding_refined` 查看 grounding。远程访问可转发 8765，静态播放不占用推理 GPU。交互推理使用 `scripts/start_viewer.sh CHECKPOINT`，GPU 由 `STREAMNAV_VIEWER_GPU` 设置，机器人参数与训练一致。
+`previous_action`（0–5）回传上一实际执行动作，外部 agent 覆盖动作时应提供；省略则按上一模型建议更新。RGB 缩略统计和动作反馈进入单个 HINT 位置的适配层。碰撞、真实位移和目标距离不进入该反馈输入。输出的质量概率为诊断量，不直接作为门控。
+
+不需要历史图片、深度、语义图、地图或教师。独立 Python 调用可使用 `load_policy(config).eval()`，checkpoint 字段指定固定目录；旧 12200 使用 `checkpoints/reference_12200`，其保存配置会关闭新增适配层。
+
+## 视频与口径
+
+`runs/comparison_300_15300` 保存同 300 个任务的 15300 / 12200 / OVSegDT 指标、trace 和已录制视频。`runs/evaluation_15300/evaluation/update_0015300` 保存训练期三设置样例，每设置 24 例，不用于替代 300 例排名。
+
+APOS 为绿色、OPOS 为品红色、实际 HINT 为橙色。NONE / TURN / STOP 等特殊 token 不伪造像素位置；没有品红点时查看 OPOS 是否预测 0。模拟提示来自干净目标实例，只代表理想提示能力。
+
+策略延迟含 RGB 预处理、视觉编码、Qwen / KDA、点与动作生成及 GPU 同步，不含外部检测器、仿真 STEP、场景加载或视频。每卡独立推理，不需要八卡合做一个动作。工程计时可用 `tools/benchmark_hint_eval.py --checkpoint checkpoints/fastvln_15300 --batch 1 --warmup 8 --iterations 40`，使用保留真实 RGB 重复帧；该计时不等于导航性能或完整机器人端到端延迟。

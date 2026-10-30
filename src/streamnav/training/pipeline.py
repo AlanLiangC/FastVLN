@@ -41,10 +41,10 @@ def completed_grounding(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/pointcot_temporal.yaml")
+    parser.add_argument("--config", default="configs/pointcot_15300.yaml")
     parser.add_argument("--run-dir", default="runs/pointcot_pipeline")
     parser.add_argument("--grounding-run", default="runs/pointcot_grounding_refined")
-    parser.add_argument("--navigation-run", default="runs/qwen35_pointcot_temporal")
+    parser.add_argument("--navigation-run", default="runs/finetune_15300")
     parser.add_argument("--world-size", type=int, default=1)
     args = parser.parse_args()
     root, grounding, navigation = map(Path, (args.run_dir, args.grounding_run, args.navigation_run))

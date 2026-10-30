@@ -1,7 +1,9 @@
 """Retain existing Adam states when an explicit fork adds planning or hint parameters."""
 
 
-def load_optimizer_with_added_groups(optimizer, saved, allowed_new=("planning", "hint", "arrival")):
+def load_optimizer_with_added_groups(
+    optimizer, saved, allowed_new=("planning", "hint", "arrival", "adaptation")
+):
     current = optimizer.state_dict()
     old_groups = {g["name"]: g for g in saved["param_groups"]}
     if not set(old_groups).issubset({g["name"] for g in current["param_groups"]}):

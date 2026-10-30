@@ -9,7 +9,7 @@ from pathlib import Path
 
 def best_setting(config):
     setting = config.get("eval", {}).get("best_setting", "no_hint")
-    if setting not in ("no_hint", "simulated_hint"):
+    if setting not in ("no_hint", "simulated_hint", "yoloe_point"):
         raise ValueError("Unknown navigation best setting")
     return setting
 
@@ -62,7 +62,7 @@ def make_record(update, results, setting):
     return record
 
 
-def write_best(root, record):
+def write_best(root, record, *, link_name="best", record_name="best_evaluation.json"):
     root = Path(root)
     folder = root / "checkpoints" / f"update_{record['update']:07d}"
     if not all(
@@ -72,13 +72,23 @@ def write_best(root, record):
         raise RuntimeError("Best evaluation must refer to a complete saved checkpoint")
     if json.loads((folder / "manifest.json").read_text())["update"] != record["update"]:
         raise ValueError("Best checkpoint update disagrees with evaluation")
-    temp = root / ".best-evaluation-new.json"
+    temp = root / ("." + record_name + ".new")
     temp.write_text(json.dumps(record, indent=2) + "\n")
-    link = folder.parent / ".best-new"
+    link = folder.parent / ("." + link_name + "-new")
     link.unlink(missing_ok=True)
     link.symlink_to(folder.name)
-    link.replace(folder.parent / "best")
-    temp.replace(root / "best_evaluation.json")
+    link.replace(folder.parent / link_name)
+    temp.replace(root / record_name)
+
+
+def update_real_hint_best(root, update, results):
+    path = Path(root) / "best_real_hint_evaluation.json"
+    previous = json.loads(path.read_text()) if path.exists() else None
+    candidate = make_record(update, results, "yoloe_point")
+    if previous is None or anchor_score(results) > anchor_score(previous["results"]):
+        write_best(root, candidate, link_name="best_real_hint", record_name=path.name)
+        return True
+    return False
 
 
 def reselect_best(root, setting):

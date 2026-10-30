@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
-VIEWER_RUN_DIR ?= $(if $(wildcard runs/qwen35_pointcot_temporal/evaluation),runs/qwen35_pointcot_temporal,$(if $(wildcard runs/qwen35_pointcot_hint_conditioned/evaluation),runs/qwen35_pointcot_hint_conditioned,$(if $(wildcard runs/qwen35_pointcot_opos_hint/evaluation),runs/qwen35_pointcot_opos_hint,runs/pointcot_grounding_refined)))
+VIEWER_RUN_DIR ?= runs
 .PHONY: check unit gpu integration smoke grounding train pipeline viewer
 check:
 	source scripts/env.sh
@@ -21,9 +21,9 @@ grounding:
 	bash scripts/start_grounding_training.sh
 smoke:
 	source scripts/env.sh
-	python -m streamnav.training.pointcot_trainer --run-dir runs/pointcot_smoke_$$(date -u +%Y%m%d_%H%M%S) --initialize-from runs/pointcot_grounding_refined/checkpoints/best --updates 2 --rollout-steps 4 --sequence-length 2 --eval-episodes 3 --eval-max-steps 8 --skip-initial-eval
+	python -m streamnav.training.pointcot_trainer --config configs/pointcot_15300.yaml --run-dir runs/smoke_15300_$$(date -u +%Y%m%d_%H%M%S) --fork-from checkpoints/fastvln_15300 --keep-schedule --allow-world-size-change --updates 15301 --rollout-steps 4 --sequence-length 2 --eval-episodes 3 --eval-max-steps 8 --skip-initial-eval
 train:
-	bash scripts/start_pointcot_training.sh
+	bash scripts/start_grounded_hint_training.sh
 pipeline:
 	bash scripts/start_training_pipeline.sh
 viewer:

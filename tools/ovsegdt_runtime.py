@@ -171,9 +171,19 @@ class ObjectMaskDetector:
     def __init__(self, split="val_unseen"):
         from ultralytics import YOLOE
 
-        if split not in ("train", "val_seen", "val_seen_synonyms", "val_unseen"):
+        if split not in ("train", "val_seen", "val_seen_synonyms", "val_unseen", "hm3d_v2_val"):
             raise ValueError("Unknown OVON split: " + split)
-        settings = json.loads((VENDOR / ("cats_" + split + ".json")).read_text())
+        vocabulary_split = "val_seen" if split == "hm3d_v2_val" else split
+        settings = json.loads((VENDOR / ("cats_" + vocabulary_split + ".json")).read_text())
+        self.category_aliases = {}
+        if split == "hm3d_v2_val":
+            # Fixed, episode-independent vocabulary: keep all Seen distractors,
+            # and add the remaining V2 category with its calibrated threshold.
+            unseen = json.loads((VENDOR / "cats_val_unseen.json").read_text())
+            if "plant" not in settings["cats_text"]:
+                settings["cats_text"].append("plant")
+            settings["conf_per_cat"]["plant"] = unseen["conf_per_cat"]["plant"]
+            self.category_aliases = {"sofa": "couch", "tv_monitor": "tv"}
         self.categories = settings["cats_text"]
         self.thresholds = settings["conf_per_cat"]
         with (ASSETS / "siglip.pkl").open("rb") as handle:
@@ -190,8 +200,35 @@ class ObjectMaskDetector:
     def target_class(self, category):
         # The calibrated vocabulary removes redundant synonyms. Match the
         # author's L1-nearest SigLIP goal lookup, including nonliteral aliases.
+        category = self.category_aliases.get(category, category)
         goal = torch.from_numpy(self.goal_embeddings[category]).cuda()
         return int(torch.sum(torch.abs(self.goal_values - goal), dim=1).argmin().item())
+
+    @torch.inference_mode()
+    def predict_batch(self, rgbs, categories):
+        from ovon.obs_transformers.resize import Resize
+
+        observation = {"rgb": torch.as_tensor(np.stack(rgbs), device="cuda")}
+        images = Resize((224, 224))(observation)["rgb"].permute(0, 3, 1, 2) / 255
+        results = self.model.predict(
+            images, save=False, imgsz=224, device="cuda", conf=0.01, verbose=False
+        )
+        masks = []
+        if len(results) != len(categories):
+            raise ValueError("Detector batch size differs from category count")
+        for result, category in zip(results, categories):
+            mask = torch.zeros((224, 224), device="cuda", dtype=torch.bool)
+            target = self.target_class(category)
+            if result.masks is not None:
+                selected = result.boxes.cls.long() == target
+                threshold = self.thresholds.get(self.categories[target])
+                if threshold is not None:
+                    selected &= result.boxes.conf > threshold
+                choices = result.masks.data[selected]
+                if len(choices):
+                    mask = choices.any(dim=0)
+            masks.append(mask)
+        return torch.stack(masks)
 
     @torch.inference_mode()
     def predict(self, rgb, category):

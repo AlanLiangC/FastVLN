@@ -21,6 +21,7 @@ from streamnav.models.point_cot.action_selection import (
 )
 from streamnav.models.point_cot.adapters import KDAMemory, LoRALinear
 from streamnav.models.point_cot.delta import StreamingGatedDeltaNet
+from streamnav.models.point_cot.generalization import GeneralizationAdapters
 from streamnav.models.point_cot.inference_graphs import InferenceGraphs
 from streamnav.models.point_cot.object_hint import ObjectHintToken
 from streamnav.models.point_cot.planning import FutureActionPlan
@@ -35,6 +36,8 @@ class FrameFeatures:
     deepstack: tuple[torch.Tensor, ...]
     hint_token: int = 0
     has_hint_slot: bool = False
+    feedback: tuple[float, ...] | None = None
+    frame_signature: tuple[float, ...] | None = None
 
     def cpu(self):
         return FrameFeatures(
@@ -44,6 +47,8 @@ class FrameFeatures:
             tuple(x.cpu() for x in self.deepstack),
             self.hint_token,
             self.has_hint_slot,
+            self.feedback,
+            self.frame_signature,
         )
 
 
@@ -80,6 +85,7 @@ class TokenStep:
     action_plan_logits: torch.Tensor | None = None
     arrival_logits: torch.Tensor | None = None
     decision_logits: torch.Tensor | None = None
+    hint_quality_logits: torch.Tensor | None = None
 
     @property
     def log_prob(self):
@@ -249,6 +255,11 @@ class Qwen35PointCoTPolicy(nn.Module):
             else None
         )
         self.supports_object_hints = self.object_hint is not None
+        self.adaptation = (
+            GeneralizationAdapters(layout.hidden_size).to(device=device, dtype=torch.float32)
+            if self.settings.get("generalization_adapters", False)
+            else None
+        )
         self.loaded_checkpoint = self.base_path
         self.inference_compute_dtype = torch.bfloat16
         self.batch_chat_body = False
@@ -425,6 +436,8 @@ class Qwen35PointCoTPolicy(nn.Module):
                         feature.deepstack,
                         token,
                         True,
+                        feature.feedback,
+                        feature.frame_signature,
                     )
                 )
         return conditioned
@@ -435,7 +448,13 @@ class Qwen35PointCoTPolicy(nn.Module):
         rows = torch.arange(len(features), device=x.device)
         positions = torch.tensor([f.ids.shape[-1] - 1 for f in features], device=x.device)
         tokens = torch.tensor([f.hint_token for f in features], device=x.device)
-        return x.index_put((rows, positions), self.object_hint(tokens, self.opos_rows).to(x.dtype))
+        embedded = self.object_hint(tokens, self.opos_rows)
+        adaptation = getattr(self, "adaptation", None)
+        if adaptation is not None:
+            feedback = embedded.new_tensor([f.feedback or (0.0,) * 12 for f in features])
+            with torch.autocast(self.device.type, enabled=False):
+                embedded = embedded + adaptation(tokens, feedback)
+        return x.index_put((rows, positions), embedded.to(x.dtype))
 
     def start_episode(self, episode_id, instruction):
         return StreamingState(
@@ -768,6 +787,7 @@ class Qwen35PointCoTPolicy(nn.Module):
         context = self.begin_batch(features, states)
         value = self.read_value(context.hidden)
         arrival = self.read_arrival(context.hidden)
+        quality = self.read_hint_quality(context.hidden)
         apos_logits = self.output_projection(context.hidden, self.apos_rows)
         apos = choose(apos_logits, 0)
         context = self.append_batch(context, self.apos_rows[apos])
@@ -790,20 +810,27 @@ class Qwen35PointCoTPolicy(nn.Module):
                 opos_logits[i],
                 action_logits[i],
                 value[i],
-                states[i].with_cache(
-                    tuple(
-                        LayerState(None, s.recurrent[i : i + 1]) if s.recurrent is not None else s
-                        for s in context.memory
+                self.feedback_state(
+                    states[i].with_cache(
+                        tuple(
+                            LayerState(None, s.recurrent[i : i + 1])
+                            if s.recurrent is not None
+                            else s
+                            for s in context.memory
+                        ),
+                        next_action_probabilities=plans[i, 1].softmax(-1).detach()
+                        if self.temporal_action_weight
+                        and plans is not None
+                        and (not self.temporal_action_requires_hint or features[i].hint_token > 0)
+                        else None,
                     ),
-                    next_action_probabilities=plans[i, 1].softmax(-1).detach()
-                    if self.temporal_action_weight
-                    and plans is not None
-                    and (not self.temporal_action_requires_hint or features[i].hint_token > 0)
-                    else None,
+                    features[i],
+                    actions[i],
                 ),
                 plans[i] if plans is not None else None,
                 arrival[i] if arrival is not None else None,
                 decision_logits[i],
+                quality[i] if quality is not None else None,
             )
             for i in range(count)
         ]
@@ -815,7 +842,45 @@ class Qwen35PointCoTPolicy(nn.Module):
             [Image.fromarray(frame.cpu().numpy()) for frame in rgb],
             [s.instruction for s in states],
         )
+        if self.adaptation is not None:
+            enriched = []
+            for feature, state, frame in zip(features, states, rgb, strict=True):
+                signature = (
+                    F.adaptive_avg_pool2d(frame.float().permute(2, 0, 1).unsqueeze(0), (8, 8))
+                    .flatten()
+                    .div(255)
+                )
+                change = (
+                    float((signature - signature.new_tensor(state.frame_signature)).abs().mean())
+                    if state.frame_signature is not None
+                    else None
+                )
+                enriched.append(
+                    replace(
+                        feature,
+                        feedback=state.motion_feedback(change),
+                        frame_signature=tuple(signature.tolist()),
+                    )
+                )
+            features = enriched
         return self.condition_features(features, hint_tokens)
+
+    @staticmethod
+    def feedback_state(state, feature, action=None):
+        if feature.feedback is None:
+            return state
+        return replace(
+            state,
+            frame_signature=feature.frame_signature,
+            visual_stationary_steps=round(feature.feedback[-2] * 32),
+            predicted_action=int(action) if action is not None else state.predicted_action,
+        )
+
+    def read_hint_quality(self, hidden):
+        adaptation = getattr(self, "adaptation", None)
+        if adaptation is None:
+            return None
+        return adaptation.quality(hidden.float()).squeeze(-1)
 
     def point_logits(self, context, name):
         rows = getattr(self, name + "_rows")
@@ -963,6 +1028,7 @@ class Qwen35PointCoTPolicy(nn.Module):
         apos_logits = self.output_projection(context.hidden[:, 0], self.apos_rows)
         opos_logits = self.output_projection(context.hidden[:, 1], self.opos_rows)
         arrival = self.read_arrival(context.hidden[:, 0])
+        quality = self.read_hint_quality(context.hidden[:, 0])
         action_logits = self.project_actions(context.hidden[:, 2], arrival)
         value = self.read_value(context.hidden[:, 0])
         final = state
@@ -999,6 +1065,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             final,
             plans,
             arrival,
+            hint_quality_logits=quality,
         )
 
     def action_logits(self, context, arrival=None):
@@ -1008,6 +1075,7 @@ class Qwen35PointCoTPolicy(nn.Module):
         context = self.begin(feature, state)
         value = self.read_value(context.hidden).squeeze()
         arrival = self.read_arrival(context.hidden)
+        quality = self.read_hint_quality(context.hidden)
         apos_logits = self.point_logits(context, "apos")
         apos = (
             tokens[0]
@@ -1055,17 +1123,22 @@ class Qwen35PointCoTPolicy(nn.Module):
             opos_logits,
             logits,
             value,
-            state.with_cache(
-                context.memory,
-                next_action_probabilities=plans[1].softmax(-1).detach()
-                if self.temporal_action_weight
-                and plans is not None
-                and (not self.temporal_action_requires_hint or feature.hint_token > 0)
-                else None,
+            self.feedback_state(
+                state.with_cache(
+                    context.memory,
+                    next_action_probabilities=plans[1].softmax(-1).detach()
+                    if self.temporal_action_weight
+                    and plans is not None
+                    and (not self.temporal_action_requires_hint or feature.hint_token > 0)
+                    else None,
+                ),
+                feature,
+                action,
             ),
             plans,
             arrival.squeeze(0) if arrival is not None else None,
             decision_logits,
+            hint_quality_logits=quality.squeeze(0) if quality is not None else None,
         )
 
     @contextmanager
@@ -1103,6 +1176,11 @@ class Qwen35PointCoTPolicy(nn.Module):
                     "apos_tokens": torch.stack([s.apos for s in steps]),
                     "opos_tokens": torch.stack([s.opos for s in steps]),
                     "point_cot": True,
+                    **(
+                        {"hint_quality": torch.stack([s.hint_quality_logits for s in steps])}
+                        if self.adaptation is not None
+                        else {}
+                    ),
                     "current_action_logits": torch.stack([s.action_logits for s in steps]),
                     "selected_action_tokens": torch.stack([s.action for s in steps]),
                     **(
@@ -1161,6 +1239,7 @@ class Qwen35PointCoTPolicy(nn.Module):
             "arrival_stop_weight": self.arrival_stop_weight,
             "future_action_steps": self.future_action_steps,
             "object_hint_token": self.supports_object_hints,
+            "generalization_adapters": self.adaptation is not None,
             "arrival_head": self.arrival_head is not None,
             "action_token_strings": self.action_token_strings,
             "source_revision": json.loads(Path(self.base_path, "source_revision.json").read_text()),

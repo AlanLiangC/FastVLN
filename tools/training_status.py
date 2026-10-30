@@ -22,7 +22,7 @@ def rows(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default="runs/qwen35_pointcot_temporal")
+    parser.add_argument("--root", default="runs/finetune_15300")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     reports = []
@@ -38,6 +38,7 @@ def main():
         train = rows(directory / "train_metrics.jsonl")
         evaluations = rows(directory / "eval_metrics.jsonl")
         hint_evaluations = rows(directory / "eval_hint_metrics.jsonl")
+        real_hint_evaluations = rows(directory / "eval_real_hint_metrics.jsonl")
         grounding_evaluations = rows(directory / "grounding_eval.jsonl")
         health = current_health(directory)
         last = train[-1] if train else {}
@@ -99,6 +100,10 @@ def main():
                         "object_hint_fraction",
                         "hint_route_active_fraction",
                         "hint_route_fallback_count",
+                        "real_hint_fraction",
+                        "hint_quality_label_fraction",
+                        "hint_quality_loss",
+                        "stagnation_fraction",
                     )
                 }
                 if "apos_geometry_labels" in last
@@ -108,6 +113,12 @@ def main():
                 else None,
                 "autonomous_evaluation": latest,
                 "hint_evaluation": hint_evaluations[-3:],
+                "real_hint_evaluation": real_hint_evaluations[-3:],
+                "best_real_hint_evaluation": json.loads(
+                    (directory / "best_real_hint_evaluation.json").read_text()
+                )
+                if (directory / "best_real_hint_evaluation.json").exists()
+                else None,
                 "best_evaluation": best,
                 "health_age_seconds": round(time.time() - health.get("time", 0), 1),
                 "health": health,
@@ -167,6 +178,18 @@ def main():
                 for key in ("update", "episodes", "success", "spl", "hint_source", "hint_noise")
             }
             print(f"  simulated_hint/{evaluation['split']}: {json.dumps(fields)}")
+        for evaluation in report["real_hint_evaluation"]:
+            fields = {
+                key: evaluation.get(key)
+                for key in ("update", "episodes", "success", "spl", "hint_source")
+            }
+            print(f"  yoloe_point/{evaluation['split']}: {json.dumps(fields)}")
+        real_best = report["best_real_hint_evaluation"]
+        if real_best:
+            print(
+                f"  best_real_hint: update={real_best['update']} "
+                f"anchor_macro_SR={real_best['success']:.4f}"
+            )
     subprocess.run(
         ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used", "--format=csv,noheader"],
         check=True,

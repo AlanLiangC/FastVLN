@@ -88,17 +88,21 @@ class HabitatClient:
     def get_oracle_action(self):
         return NavigationAction(self.request("GET_ORACLE_ACTION")["action"])
 
-    def get_oracle_supervision(self, hint_config=None):
+    def get_oracle_supervision(self, hint_config=None, delivered_hint=None):
         result = self.request(
-            "GET_ORACLE_SUPERVISION", **({"hint_config": hint_config} if hint_config else {})
+            "GET_ORACLE_SUPERVISION",
+            **({"hint_config": hint_config} if hint_config else {}),
+            **({"delivered_hint": delivered_hint} if delivered_hint is not None else {}),
         )
         if result["perception"]["episode_id"] != self.episode_id:
             raise EpisodeMismatchError("Perception labels belong to another episode")
         return result
 
-    def get_object_supervision(self, hint_config=None):
+    def get_object_supervision(self, hint_config=None, delivered_hint=None):
         result = self.request(
-            "GET_OBJECT_SUPERVISION", **({"hint_config": hint_config} if hint_config else {})
+            "GET_OBJECT_SUPERVISION",
+            **({"hint_config": hint_config} if hint_config else {}),
+            **({"delivered_hint": delivered_hint} if delivered_hint is not None else {}),
         )
         if result.get("episode_id") != self.episode_id:
             raise EpisodeMismatchError("Object labels belong to a different episode")
@@ -167,23 +171,33 @@ class VectorHabitatEnvs:
 
         return list(self.executor.map(oracle, self.clients))
 
-    def get_oracle_supervisions(self, hint_config=None):
-        return [future.result() for future in self.submit_oracle_supervisions(hint_config)]
+    def get_oracle_supervisions(self, hint_config=None, delivered_hints=None):
+        return [
+            future.result()
+            for future in self.submit_oracle_supervisions(hint_config, delivered_hints)
+        ]
 
-    def submit_oracle_supervisions(self, hint_config=None):
+    def submit_oracle_supervisions(self, hint_config=None, delivered_hints=None):
         """One request per socket; caller must finish these before step/reset."""
 
-        def oracle(client):
+        def oracle(client, packet):
             try:
                 return (
-                    client.get_oracle_supervision(hint_config)
+                    client.get_oracle_supervision(
+                        hint_config, **({"delivered_hint": packet} if packet is not None else {})
+                    )
                     if hint_config is not None
                     else client.get_oracle_supervision()
                 )
             except OracleUnavailableError as exc:
                 return exc
 
-        return [self.executor.submit(oracle, client) for client in self.clients]
+        return [
+            self.executor.submit(oracle, client, packet)
+            for client, packet in zip(
+                self.clients, delivered_hints or [None] * len(self.clients), strict=True
+            )
+        ]
 
     def close(self):
         for client in self.clients:

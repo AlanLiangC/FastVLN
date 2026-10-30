@@ -318,23 +318,23 @@ class HabitatObjectNavEnv:
             raise ValueError("Hint supervision configuration changed within an episode")
         return self.hint_conditioner
 
-    def oracle_supervision(self, hint_config=None):
+    def oracle_supervision(self, hint_config=None, delivered_hint=None):
         if not self.config.get("perception_labels", False) or self.episode["split"] != "train":
             raise ValueError("Perception labels require opt-in training episodes")
         from perception_labels import PerceptionLabeler
 
         if hint_config is not None:
-            return self._hint_supervision(hint_config).supervision()
+            return self._hint_supervision(hint_config).supervision(delivered_hint)
         action = self.oracle()
         return {"action": int(action), "perception": PerceptionLabeler(self).labels(action)}
 
-    def object_supervision(self, hint_config=None):
+    def object_supervision(self, hint_config=None, delivered_hint=None):
         # Evaluation labels are used by diagnostics and the explicitly named
         # simulated-hint setting, never by no-hint policy inputs.
         from perception_labels import PerceptionLabeler
 
         if hint_config is not None:
-            return self._hint_supervision(hint_config).object_supervision()
+            return self._hint_supervision(hint_config).object_supervision(delivered_hint)
         return PerceptionLabeler(self).object_labels()
 
     def oracle(self):

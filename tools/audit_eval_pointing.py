@@ -45,7 +45,7 @@ def save_diagnostic(rgb, label, prediction, packet, path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", default="runs/qwen35_pointcot_opos_hint")
+    parser.add_argument("--run-dir", default="runs/evaluation_15300")
     parser.add_argument("--update", type=int, required=True)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--output", default="runtime/reports/eval_pointing_audit")

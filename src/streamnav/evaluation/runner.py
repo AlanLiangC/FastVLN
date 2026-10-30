@@ -17,6 +17,7 @@ from streamnav.contracts.cache import state_bytes
 from streamnav.contracts.perception import APOS_LEFT, APOS_RIGHT, APOS_STOP
 from streamnav.data.schema import HabitatEpisodeSource
 from streamnav.envs.habitat_client import VectorHabitatEnvs
+from streamnav.evaluation.detector_client import DetectorClient
 from streamnav.evaluation.latency_metrics import latency_summary
 from streamnav.evaluation.navigation_metrics import aggregate_metrics
 from streamnav.evaluation.perception_records import perception_records as make_perception_records
@@ -146,7 +147,7 @@ def evaluate(policy, config, update=0, episodes=None, max_steps=None, video=Fals
         raise ValueError("Best setting must be included in evaluation settings")
     results = {}
     for setting in settings:
-        if setting not in ("no_hint", "simulated_hint"):
+        if setting not in ("no_hint", "simulated_hint", "yoloe_point"):
             raise ValueError("Unknown evaluation hint setting")
         selected = deepcopy(config)
         selected["eval"]["selection_episodes"] = selected["eval"]["episodes"]
@@ -223,6 +224,7 @@ def _evaluate_setting(
         )
 
     progress("evaluation_starting", 0, 0)
+    detector = DetectorClient(output / "detector_logs") if setting == "yoloe_point" else None
     envs = VectorHabitatEnvs(env_config, count)
     try:
         for manifest in config["eval"]["manifests"]:
@@ -325,6 +327,13 @@ def _evaluate_setting(
                             for i, label in zip(active, labels, strict=True)
                         ]
                         hint_tokens = [packet["token"] for packet in hint_packets]
+                        if detector is not None:
+                            hint_packets = detector.predict(
+                                [observations[i]["rgb"] for i in active],
+                                [batch[i][1].object_category for i in active],
+                                batch[0][1].split,
+                            )
+                            hint_tokens = [packet["token"] for packet in hint_packets]
                         torch.cuda.synchronize(device)
                         start = time.perf_counter()
                         with torch.autocast(
@@ -484,7 +493,11 @@ def _evaluate_setting(
                         ):
                             before = observations[i]
                             states[i], observations[i] = (
-                                state.after_action(observation.get("collision", False)),
+                                state.after_action(
+                                    observation.get("collision", False),
+                                    action=int(action),
+                                    displacement=observation.get("displacement"),
+                                ),
                                 observation,
                             )
                             cache_bytes = state_bytes(state)
@@ -622,6 +635,8 @@ def _evaluate_setting(
                 "setting": setting or "no_hint",
                 "hint_source": "simulated_instance_labels"
                 if setting == "simulated_hint"
+                else "yoloe"
+                if setting == "yoloe_point"
                 else "none",
                 "hint_noise": hint_noise if setting == "simulated_hint" else None,
                 "split": split,
@@ -693,7 +708,9 @@ def _evaluate_setting(
             results[split] = result
             if parallel.rank() == 0:
                 name = (
-                    "eval_hint_metrics.jsonl"
+                    "eval_real_hint_metrics.jsonl"
+                    if setting == "yoloe_point"
+                    else "eval_hint_metrics.jsonl"
                     if setting == "simulated_hint"
                     else "eval_metrics.jsonl"
                 )
@@ -705,6 +722,8 @@ def _evaluate_setting(
                 write_video_index(output, cases_by_split, update)
         return results
     finally:
+        if detector is not None:
+            detector.close()
         envs.close()
         policy.train(was_training)
         torch.cuda.empty_cache()

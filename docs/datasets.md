@@ -1,6 +1,6 @@
 # 数据与下载
 
-导航使用 HM3D-OVON train；评估使用 val_seen、val_seen_synonyms、val_unseen。清单位于 `runtime/data/manifests/`，实际配置见 [pointcot.yaml](../configs/pointcot.yaml)。train 共 6,911,470 episodes，三个验证 split 各 3,000。日常评估每 split 固定分层选择 12 条，每 500 update 扩至 48 条；较大评估保留相同的前 12 条 anchor。
+导航使用 HM3D-OVON train；评估使用 val_seen、val_seen_synonyms、val_unseen。清单位于 `runtime/data/manifests/`，实际配置见 [pointcot.yaml](../configs/pointcot.yaml)。train 共 6,911,470 episodes，三个验证 split 各 3,000。15300 配方日常每 split 分层选择 8 条，完整评估设置为每 split 32 条；独立对比固定每 split 100 条，三种口径分别记录。
 
 场景解析实际 `.basis.glb`，目标读取 `goals_by_category` 及 children categories 的视点。教师、奖励和成功判断可以读目标元数据，学生不能读。场景、episode、已安装环境和授权凭据均保留。凭据不进入日志或源码快照。
 
@@ -40,7 +40,7 @@ Grounding 与导航调用相同的 `frame_features_batch` 聊天模板和系统�
 
 JSONL 字段包括 `image_id`、`image`、`instruction`、`source`、`apos_targets`、`opos_targets`、`supervision`。`opos_support` 是 48×27 实例归属 bitmap，按 little-endian bit order 打包后 base64 保存，每个 bitmap 为 162 字节；在采样时解码，避免常驻完整候选 token 列表。约 498,739 条训练和 174,956 条验证查询包含此字段。原始 canonical 点、来源顺序、图像和 split 固定并记录在准备清单中。空列表表示未知、不计 loss；`[0]` 只表示明确无可见目标。多点使用等价目标的联合概率。区域记录使用归一化 `opos_boxes`，采样时才展开框内网格集合，避免把几十万张图的全部候选网格常驻内存。区域 loss 权重为 0.25，区域命中与真实点命中分开评估。
 
-每个样本先以 2.5% 概率从明确缺失记录采样；其余正样本按 COCO:referring:ScanNet:ImageNet:PixMo = 38:48:11:2:1 选择来源，减少小数据源和重复缺失查询的过采样。训练随机状态、各来源顺序和游标随检查点保存。未标注某类别不能推出该对象不存在；外部图片不提供 APOS 或导航动作标签。掩码只用于离线生成点和实例有效网格，模型不增加分割预测分支。
+每个样本先以 2.5% 概率从明确缺失记录采样；其余正样本按 COCO:referring:ScanNet:ImageNet:PixMo = 25:30:30:10:5 选择来源，减少小数据源和重复缺失查询的过采样。训练随机状态、各来源顺序和游标随检查点保存。未标注某类别不能推出该对象不存在；外部图片不提供 APOS 或导航动作标签。掩码只用于离线生成点和实例有效网格，模型不增加分割预测分支。
 
 准备清单应生成在新目录或停训后重新生成，不能覆写正在运行的 manifest。恢复会校验数据哈希及采样配方。公共原始数据审计与 GT 样例保存在 `runtime/reports/public_grounding_audit.json` 和 `public_grounding_samples/`；当前转换数量以 `public_v2/preparation.json` 为准。
 

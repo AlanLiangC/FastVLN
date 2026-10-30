@@ -1,66 +1,56 @@
-# FastVLN
+# FastVLN · update 15300
 
-当前模型为 **Qwen3.5-0.8B + 跨帧 KDA + APOS → OPOS → 当前动作 + 四步动作计划**，使用 grounding 和专家 / DAgger / PPO 混合训练，并增加轻量到达辅助头。基座冻结，可训练参数约 898.2 万，占总参数 1.04%。
-
-每步输入目标文本、当前 RGB、一个可选目标点 token 和该 episode 的缓存；输出两个点、六动作 logits、四步计划、value 和下一状态。模型不输入历史 RGB、深度、语义图、地图或真值位姿，也没有分割分支。跨帧缓存为固定 12 MiB。
-
-## 当前入口
+当前固定版本为 **Qwen3.5-0.8B + KDA + Point CoT + 单点 HINT**，以 Grounding 和专家 / DAgger / PPO 混合训练。默认加载 update **15300**。后续实验分支、权重及其代码改动已移除；训练处于停止状态。
 
 | 内容 | 路径 |
 |---|---|
-| 当前训练配置 | [configs/pointcot_temporal.yaml](configs/pointcot_temporal.yaml) |
-| 本次分支父权重 | `runs/qwen35_pointcot_hint_conditioned/checkpoints/update_0010380`，保留完整训练状态 |
-| 官方 Qwen 基础权重 | `checkpoints/qwen35_0p8b_base`，原始参数冻结 |
-| 活动导航训练 | `runs/qwen35_pointcot_temporal` |
-| 最新导航权重 / 续训入口 | `runs/qwen35_pointcot_temporal/checkpoints/latest` |
-| 评估选中的导航权重 | `runs/qwen35_pointcot_temporal/checkpoints/best` |
-| FastVLN / OVSegDT 方法对照 | [各自原设置的任务对照](runs/native_method_comparison_20261021/index.html) |
-| Grounding 初始化权重 | `runs/pointcot_grounding_refined/checkpoints/best`，update 800 |
-| Grounding 最终恢复点 | `runs/pointcot_grounding_refined/checkpoints/latest`，update 2000 |
-| 验证样本 | `runtime/fixtures/navigation/`，与实验输出分开保存 |
+| 当前模型 | `checkpoints/fastvln_15300`，含 adapter、完整八卡 Adam / RNG / sampler 状态 |
+| 12200 参考基线 | `checkpoints/reference_12200`，仅推理对比，无优化器 |
+| 官方冻结基座 | `checkpoints/qwen35_0p8b_base` |
+| 当前训练配方 | [configs/pointcot_15300.yaml](configs/pointcot_15300.yaml) |
+| 默认推理配置 | [configs/pointcot.yaml](configs/pointcot.yaml) |
+| 相对 12200 的变化 | [版本差异](docs/changes_from_12200.md) |
+| 300 例对照与视频 | [15300 / 12200 / OVSegDT](runs/comparison_300_15300/index.html) |
 
-导航模型由官方基座和训练检查点内的 `adapters.safetensors` 共同组成；后者包含 LoRA、KDA 和任务头参数。`latest` 随训练保存更新，`best` 按 simulated_hint 的固定验证集成功率选择；对应 update 以各自 `manifest.json` 为准。检查点还包含 Adam、各 rank 的 RNG / 采样状态及配置，源码快照保存在运行目录的 `source/`。
+模型由官方 Qwen 基座与当前 checkpoint 的 `adapters.safetensors` 共同组成。基座冻结，训练 LoRA、KDA、点 / 动作头和适配层，共 **9,248,833** 个可训练参数。15300 的 tensor-content SHA256 为 `7daf959f45addcd10a2807495c7696df8f150f549861d93f59555755ecb01290`；校验方式是按参数名排序后累计名称与 tensor 原始字节，不是整个 safetensors 文件的哈希。
 
-## 恢复训练与查看结果
+## 已测性能
+
+同一批 300 个任务，各 split 100 例；FastVLN 使用 YOLOE 单点和 greedy，OVSegDT 使用各自原配置及 sampled 三 seed 均值。
+
+| 模型 | Seen SR | Synonyms SR | Unseen SR | 总 SR | SPL |
+|---|---:|---:|---:|---:|---:|
+| FastVLN 15300 | 52.00% | 53.00% | 42.00% | 49.00% | 26.68% |
+| FastVLN 12200 | 62.00% | 50.00% | 36.00% | 49.33% | 24.74% |
+| OVSegDT | 54.33% | 37.33% | 41.33% | 44.33% | 19.74% |
+
+15300 与 12200 总成功数相差 1/300；15300 的 SPL 与同义词表现更好，Seen 较低。这是固定样本的同任务对照，方法之间保留各自相机、机器人、滑动与解码设置，不等于论文全量基准，也不是单模块消融。
+
+## 使用
 
 ```bash
 source scripts/env.sh
-# 当前八卡训练的恢复入口；运行中的任务无需重复启动
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 STREAMNAV_WORLD_SIZE=8 \
-  bash scripts/start_pointcot_training.sh \
-  --resume runs/qwen35_pointcot_temporal/checkpoints/latest --skip-initial-eval
-python tools/training_status.py --root runs/qwen35_pointcot_temporal
-# 保存一个完整 update 后暂停
-bash scripts/stop_training.sh runs/qwen35_pointcot_temporal
-# 静态视频查看，不占用推理 GPU
+# 静态结果与视频，不占推理 GPU
 make viewer
-# http://127.0.0.1:8765/evaluation/
+# http://127.0.0.1:8765/
+# 启动交互推理，默认固定到 15300
+STREAMNAV_VIEWER_GPU=0 bash scripts/start_viewer.sh
+# 独立评估，不覆盖保留结果
+python -m streamnav.evaluation.runner checkpoint=checkpoints/fastvln_15300 run_dir=runs/manual_eval_15300
 ```
 
-当前分支从 update 10380 延续 Adam、采样器和 PPO 计划，启用学生轨迹的因果未来动作监督，保留原有 HINT 条件监督。使用 GPU 0–7，每卡 3 个环境，rollout=100、反向 fragment=20，每 update 共 2400 条转移和两次同步 optimizer step。每 5 update 保存，每 100 update 双设置评估；日常每 split 12 条，每 500 update 扩至 48 条，每次保存 12 个视频。换卡数时显式使用 `--allow-world-size-change`，详见训练文档。
+需要继续训练时才运行 `make train`：默认从完整 15300 状态恢复，输出至 `runs/finetune_15300`，不会修改固定发布权重。当前没有导航训练在运行。按此前资源保留要求，独立 GPU 守护留在 `runtime/operations/`，不属于模型版本；仅释放保留负载可执行 `touch runtime/operations/gpu_reservation/release.flag`。
 
-当前仍逐帧执行一步。冻结 update 10380 的四组闭环对照显示，融合旧规划虽减少摇摆，却未同时通过有／无 HINT 的成功率、SPL 和误停回归标准，因此动作融合与到达概率校准默认关闭。先补齐学生状态上的规划监督，再用同组案例验证是否适合启用，不能把少摇摆直接当作导航提升。
+## 文档
 
-## 结果口径
+- [相对 12200 的准确变化](docs/changes_from_12200.md)
+- [架构、输入与缓存](docs/architecture.md)
+- [APOS / OPOS、HINT 与监督](docs/perception.md)
+- [15300 训练配方与恢复](docs/training.md)
+- [数据与运行环境](docs/datasets.md)
+- [部署接口与视频](docs/deployment.md)
+- [OVSegDT 与对照口径](docs/baselines.md)
 
-以 0.25 m 内执行 STOP 为成功。当前最佳权重及其成绩见运行目录的 `best_evaluation.json`；各轮结果和视频见 `evaluation/update_XXXXXXX/`。best 按 simulated_hint 的固定 36 条 anchor 选择，同分保留原 best，不能与 144 条评估直接混比。
+`make check` 运行 lint、格式和类型检查，`make unit` 运行单元 / 回归测试。数据、安装环境、官方基座、YOLOE、OVSegDT 和必要缓存保留；`.config/` 是本地凭据目录，不进入版本源码快照。原始 15300 源码快照保存在当前 checkpoint 的 `source/`，模型与训练计算按该快照恢复，默认路径和文档已整理到固定版本。
 
-历史评估示例：update 5000 共 144 条，无提示 SR **33.3%**、SPL **18.4%**；模拟干净实例点提示 SR **34.0%**、SPL **19.7%**。这些数值仅属于当时的权重，分析见 `runtime/reports/success_rate_5100_analysis.json`。推理计时口径见 [部署文档](docs/deployment.md)。
-
-## 文档与检查
-
-- [架构与缓存](docs/architecture.md)
-- [Point CoT、提示与 loss](docs/perception.md)
-- [训练、保存、恢复和评估](docs/training.md)
-- [数据、资产准备与防泄漏](docs/datasets.md)
-- [推理接口、延迟与视频](docs/deployment.md)
-- [OVSegDT 权重、环境与案例对照](docs/baselines.md)
-
-```bash
-make check
-make unit
-```
-
-环境安装入口为 `scripts/setup.sh`，基座下载入口为 `tools/download_qwen_weights.py`。公开数据从 `/inspire/hdd/global_public/public_datas` 读取，当前 grounding 共 1,025,912 条训练查询；数据、安装环境、navmesh 和 Triton 缓存均保留。凭据位于 `.config/`，不进入版本快照。
-
-参考实现保留在 `third_party/LightNav-0`、`third_party/OVSegDT` 和 `third_party/Uni-NaVid`。Qwen 基座固定为官方 revision，见数据文档。
+当前改进训练分支：`runs/finetune_15300_grounded_hints`，八卡使用 `make train`。冻结 15300 的默认部署路径不变；改动和评估约束见 [训练文档](docs/training.md#从-15300-继续grounding-与-hint-鲁棒性)。

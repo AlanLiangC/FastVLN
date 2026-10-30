@@ -33,6 +33,7 @@ class FrameRequest(BaseModel):
     rgb_base64: str = Field(max_length=6_000_000)
     object_hint: dict[str, Any] | None = None
     previous_collision: bool = False
+    previous_action: int | None = Field(default=None, ge=0, le=5)
 
 
 class BatchItem(FrameRequest):
@@ -152,6 +153,7 @@ def create_app(policy, config):
             decode_rgb(request.rgb_base64),
             request.object_hint,
             request.previous_collision,
+            request.previous_action,
         )
 
     @app.post("/sessions/{session_id}/reset")
@@ -169,7 +171,13 @@ def create_app(policy, config):
         return batch_steps(
             manager,
             [
-                (r.session_id, decode_rgb(r.rgb_base64), r.object_hint, r.previous_collision)
+                (
+                    r.session_id,
+                    decode_rgb(r.rgb_base64),
+                    r.object_hint,
+                    r.previous_collision,
+                    r.previous_action,
+                )
                 for r in requests
             ],
             serving["max_batch_size"],
@@ -216,6 +224,7 @@ def create_app(policy, config):
             observation = demo["env"].reset(episode)
             demo["session"] = manager.create(episode.goal_text)
             demo["observation"] = observation
+            demo["previous_action"] = None
             return {
                 "rgb_base64": encode_rgb(observation["rgb"]),
                 "instruction": episode.goal_text,
@@ -269,12 +278,14 @@ def create_app(policy, config):
                 demo["session"],
                 demo["observation"]["rgb"],
                 previous_collision=demo["observation"].get("collision", False),
+                previous_action=demo.get("previous_action"),
             )
             action = NavigationAction(
                 prediction["action"] if request.action is None else request.action
             )
             observation = demo["env"].step(action)
             demo["observation"] = observation
+            demo["previous_action"] = int(action)
             return {
                 **prediction,
                 "executed_action": action.name,

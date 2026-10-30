@@ -216,3 +216,36 @@ def test_conditioning_is_opt_in_and_requires_compatible_inputs_and_stop_labels()
     config["model"]["object_hint_token"] = False
     with pytest.raises(ValueError, match="hint input token"):
         conditioned_hint_config(config)
+
+
+def test_real_packet_is_required_and_never_substituted_with_truth(rig):
+    rig.teacher.config["real_probability"] = 1
+    with pytest.raises(ValueError, match="actual detector"):
+        rig.teacher.object_supervision()
+    packet = {"token": 622, "source": "yoloe_point", "episode_id": rig.env.uid, "frame_id": 0}
+    pure = rig.teacher.object_supervision(packet)
+    assert pure["object_hint_token"] == 622 and rig.teacher.goal_id is None
+    assert rig.teacher.supervision(packet)["hint"]["bound_goal_id"] == 22
+
+
+def test_external_packets_reject_stale_frames_and_changes_within_frame(rig):
+    packet = {"token": 622, "source": "yoloe_point", "episode_id": rig.env.uid, "frame_id": 1}
+    with pytest.raises(ValueError, match="episode/frame"):
+        rig.teacher.supervision(packet)
+    packet["frame_id"] = 0
+    rig.teacher.supervision(packet)
+    with pytest.raises(ValueError, match="changed"):
+        rig.teacher.supervision({**packet, "token": 582})
+
+
+def test_same_class_non_goal_is_not_a_strong_semantic_negative(rig):
+    rig.teacher.config["quality_supervision"] = True
+    objects = [
+        SimpleNamespace(semantic_id=i, category=SimpleNamespace(name=lambda: "chair"))
+        for i in (11, 22, 33)
+    ]
+    rig.env.sim.semantic_scene = SimpleNamespace(objects=objects)
+    rig.env.semantic_known_ids.add(33)
+    rig.semantic[0, 0] = 33
+    assert rig.teacher._hint_quality(1) == {"quality_target": 0, "quality_valid": False}
+    assert rig.teacher._hint_quality(582) == {"quality_target": 1, "quality_valid": True}

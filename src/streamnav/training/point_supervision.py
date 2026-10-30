@@ -1,5 +1,7 @@
 """Separate teacher-forced point CoT from on-policy PPO token replay."""
 
+import math
+
 import torch
 from torch.nn import functional as F
 
@@ -95,15 +97,32 @@ def grounding_loss_options(config):
     return {
         "anchor_weight": config.get("anchor_weight", 1.0),
         "point_radius": config.get("point_radius", 0.0),
+        "hint_training": config.get("hint_training", False),
+        "hint_opos_coef": config.get("hint_opos_coef", 0.5),
+        "hint_quality_coef": config.get("hint_quality_coef", 0.1),
     }
 
 
-def grounding_loss(policy, rows, *, anchor_weight=1.0, point_radius=0.0):
+def grounding_loss(
+    policy,
+    rows,
+    *,
+    anchor_weight=1.0,
+    point_radius=0.0,
+    hint_training=False,
+    hint_opos_coef=0.5,
+    hint_quality_coef=0.1,
+):
     # Each still image is an independent episode: grounding never writes into
     # a navigation cache or assumes a navigation action / STOP label.
     from streamnav.data.grounding import GroundingSource
 
+    if any(not math.isfinite(v) or v < 0 for v in (hint_opos_coef, hint_quality_coef)):
+        raise ValueError("Hint grounding coefficients must be finite and nonnegative")
     features = GroundingSource.features_many(policy, rows)
+    if hint_training:
+        # Match the actual navigation input even when the detector is absent.
+        features = policy.condition_features(features, [0] * len(rows))
     state = policy.start_episode(rows[0]["image_id"], rows[0]["instruction"])
     resets = {i: (r["image_id"], r["instruction"]) for i, r in enumerate(rows)}
     zero = torch.zeros((), device=policy.device, dtype=torch.long)
@@ -124,9 +143,24 @@ def grounding_loss(policy, rows, *, anchor_weight=1.0, point_radius=0.0):
     )
     weights = torch.tensor([r.get("loss_weight", 1.0) for r in rows], device=policy.device)
     active = sum(bool(r.get("apos_targets")) + bool(r.get("opos_targets")) for r in rows)
+    loss = ((apos + opos) * weights).sum() / active
+    hint_metrics = {}
+    if hint_training:
+        from streamnav.training.hint_grounding import hint_grounding_loss
+
+        hinted, hint_metrics = hint_grounding_loss(
+            policy,
+            features,
+            rows,
+            prefix_tokens,
+            anchor_weight=anchor_weight,
+            point_radius=point_radius,
+        )
+        loss = loss + hint_opos_coef * hinted[0] + hint_quality_coef * hinted[1]
     return (
-        ((apos + opos) * weights).sum() / active,
+        loss,
         {
+            **hint_metrics,
             "apos_loss": float(apos.detach().sum())
             / max(1, sum(bool(r.get("apos_targets")) for r in rows)),
             "opos_loss": float(opos.detach().sum())

@@ -41,9 +41,13 @@ def main():
                 elif command == "GET_ORACLE_ACTION":
                     info = {"action": int(env.oracle())}
                 elif command == "GET_ORACLE_SUPERVISION":
-                    info = env.oracle_supervision(request.get("hint_config"))
+                    info = env.oracle_supervision(
+                        request.get("hint_config"), request.get("delivered_hint")
+                    )
                 elif command == "GET_OBJECT_SUPERVISION":
-                    info = env.object_supervision(request.get("hint_config"))
+                    info = env.object_supervision(
+                        request.get("hint_config"), request.get("delivered_hint")
+                    )
                 elif command == "CLOSE":
                     info = {"closed": True}
                 else:

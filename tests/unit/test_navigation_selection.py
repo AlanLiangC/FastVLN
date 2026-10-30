@@ -8,6 +8,7 @@ from streamnav.training.navigation_selection import (
     make_record,
     reselect_best,
     update_best,
+    update_real_hint_best,
     write_best,
 )
 
@@ -49,6 +50,20 @@ def test_equal_integer_counts_do_not_replace_best_due_to_float_tail(tmp_path):
         json.loads((tmp_path / "best_evaluation.json").read_text())["selection_setting"]
         == "simulated_hint"
     )
+
+
+def test_real_hint_best_is_independent_and_keeps_the_first_exact_tie(tmp_path):
+    checkpoint(tmp_path, 1)
+    checkpoint(tmp_path, 2)
+    assert update_best(tmp_path, 1, results([6, 6, 6]), "simulated_hint")
+    assert update_real_hint_best(tmp_path, 1, results([3, 3, 3], "yoloe_point"))
+    assert update_real_hint_best(tmp_path, 2, results([5, 4, 3], "yoloe_point"))
+    assert not update_real_hint_best(tmp_path, 1, results([4, 4, 4], "yoloe_point"))
+    assert (tmp_path / "checkpoints/best").resolve().name == "update_0000001"
+    assert (tmp_path / "checkpoints/best_real_hint").resolve().name == "update_0000002"
+    record = json.loads((tmp_path / "best_real_hint_evaluation.json").read_text())
+    assert record["selection_setting"] == "yoloe_point"
+    assert record["success"] == pytest.approx(1 / 3)
 
 
 def test_setting_migration_excludes_deleted_weights_and_never_compares_against_old_setting(
